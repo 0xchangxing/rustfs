@@ -40,6 +40,7 @@
 //!     config.admin_project.clone(),
 //!     config.get_admin_domain(),
 //!     config.verify_ssl,
+//!     config.get_timeout(),
 //! );
 //!
 //! let auth_provider = KeystoneAuthProvider::new(
@@ -68,12 +69,12 @@ pub mod error;
 pub mod identity;
 pub mod middleware;
 
-pub use auth::KeystoneAuthProvider;
+pub use auth::{KeystoneAuthProvider, ValidatedKeystoneToken};
 pub use client::KeystoneClient;
 pub use config::{KeystoneConfig, RoleMapping};
 pub use error::{KeystoneError, Result};
 pub use identity::KeystoneIdentityMapper;
-pub use middleware::{KEYSTONE_CREDENTIALS, KeystoneAuthLayer};
+pub use middleware::{KEYSTONE_CREDENTIALS, KeystoneAuthLayer, KeystoneRequestIdentity, KeystoneRequestNotValidated};
 
 /// Keystone API version
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,21 +140,6 @@ pub struct EC2Credential {
     pub project_id: Option<String>,
     /// Trust ID (for delegated credentials)
     pub trust_id: Option<String>,
-}
-
-impl EC2Credential {
-    /// Parse access key to extract user_id and project_id
-    ///
-    /// Format: "user_id:project_id" or "user_id"
-    pub fn parse_access_key(access_key: &str) -> Option<(String, Option<String>)> {
-        if access_key.contains(':') {
-            let parts: Vec<&str> = access_key.split(':').collect();
-            if parts.len() == 2 {
-                return Some((parts[0].to_string(), Some(parts[1].to_string())));
-            }
-        }
-        Some((access_key.to_string(), None))
-    }
 }
 
 /// Token cache for performance optimization

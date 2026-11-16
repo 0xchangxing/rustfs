@@ -15,7 +15,7 @@
 //! Comprehensive integration tests for the complete audit system
 
 use rustfs_audit::*;
-use rustfs_ecstore::config::{Config, KVS};
+use rustfs_config::server_config::{Config, KVS};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,27 +29,21 @@ async fn test_complete_audit_system_lifecycle() {
     assert_eq!(system.get_state().await, system::AuditSystemState::Stopped);
     assert!(!system.is_running().await);
 
-    // 2. Start with empty config (will fail due to no server storage in test)
+    // 2. Start with empty config. The current implementation returns Ok(())
+    // but keeps the system stopped when no audit targets are enabled.
     let config = Config(HashMap::new());
     let start_result = system.start(config).await;
 
-    // Should fail in test environment but state handling should work
+    // State handling should remain consistent for both empty-config success and
+    // storage-unavailable failure paths.
     match start_result {
         Err(AuditError::StorageNotAvailable(_)) => {
             // Expected in test environment
             assert_eq!(system.get_state().await, system::AuditSystemState::Stopped);
         }
         Ok(_) => {
-            // If it somehow succeeds, verify running state
-            assert_eq!(system.get_state().await, system::AuditSystemState::Running);
-            assert!(system.is_running().await);
-
-            // Test pause/resume
-            system.pause().await.expect("Should pause successfully");
-            assert_eq!(system.get_state().await, system::AuditSystemState::Paused);
-
-            system.resume().await.expect("Should resume successfully");
-            assert_eq!(system.get_state().await, system::AuditSystemState::Running);
+            assert_eq!(system.get_state().await, system::AuditSystemState::Stopped);
+            assert!(!system.is_running().await);
         }
         Err(e) => {
             panic!("Unexpected error: {e}");
@@ -270,7 +264,7 @@ fn create_sample_audit_entry() -> AuditEntry {
 }
 
 fn create_sample_audit_entry_with_id(id: u32) -> AuditEntry {
-    use chrono::Utc;
+    use jiff::Timestamp;
     use rustfs_targets::EventName;
     use serde_json::json;
 
@@ -307,7 +301,7 @@ fn create_sample_audit_entry_with_id(id: u32) -> AuditEntry {
         version: "1".to_string(),
         deployment_id: Some(format!("test-deployment-{id}")),
         site_name: Some("test-site".to_string()),
-        time: Utc::now(),
+        time: Timestamp::now(),
         event: EventName::ObjectCreatedPut,
         entry_type: Some("object".to_string()),
         trigger: "api".to_string(),

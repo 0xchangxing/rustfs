@@ -12,18 +12,28 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use crate::config::{KV, KVS};
+use super::target_defaults::{amqp_kvs, kafka_kvs, mysql_kvs, nats_kvs, postgres_kvs, pulsar_kvs, redis_kvs};
+use rustfs_config::audit::AUDIT_REDIS_DEFAULT_CHANNEL;
+use rustfs_config::server_config::{KV, KVS};
 use rustfs_config::{
     COMMENT_KEY, DEFAULT_LIMIT, ENABLE_KEY, EVENT_DEFAULT_DIR, EnableState, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD,
-    MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TOPIC, MQTT_USERNAME, WEBHOOK_AUTH_TOKEN,
-    WEBHOOK_BATCH_SIZE, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_HTTP_TIMEOUT, WEBHOOK_MAX_RETRY,
-    WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT, WEBHOOK_RETRY_INTERVAL,
+    MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TLS_CA, MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY,
+    MQTT_TLS_POLICY, MQTT_TLS_TRUST_LEAF_AS_CA, MQTT_TOPIC, MQTT_USERNAME, MQTT_WS_PATH_ALLOWLIST, WEBHOOK_AUTH_TOKEN,
+    WEBHOOK_BATCH_SIZE, WEBHOOK_CLIENT_CA, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_HTTP_TIMEOUT,
+    WEBHOOK_MAX_RETRY, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT, WEBHOOK_RETRY_INTERVAL, WEBHOOK_SKIP_TLS_VERIFY,
 };
 use std::sync::LazyLock;
 
-#[allow(dead_code)]
 #[allow(clippy::declare_interior_mutable_const)]
 /// Default KVS for audit webhook settings.
+///
+/// `WEBHOOK_BATCH_SIZE`/`WEBHOOK_MAX_RETRY`/`WEBHOOK_RETRY_INTERVAL`/`WEBHOOK_HTTP_TIMEOUT`
+/// exist here but not in [`crate::config::notify::DEFAULT_NOTIFY_WEBHOOK_KVS`]. This mirrors
+/// MinIO upstream: `internal/logger/config.go`'s `DefaultAuditWebhookKVS` carries the same
+/// four keys with the same defaults (`"1"`/`"0"`/`"3s"`/`"5s"`), while
+/// `internal/config/notify/parse.go`'s `DefaultWebhookKVS` (bucket event notifications) does
+/// not — the notify webhook delivery path never supported them. Not a copy/paste gap
+/// (backlog#2054).
 pub static DEFAULT_AUDIT_WEBHOOK_KVS: LazyLock<KVS> = LazyLock::new(|| {
     KVS(vec![
         KV {
@@ -39,7 +49,7 @@ pub static DEFAULT_AUDIT_WEBHOOK_KVS: LazyLock<KVS> = LazyLock::new(|| {
         KV {
             key: WEBHOOK_AUTH_TOKEN.to_owned(),
             value: "".to_owned(),
-            hidden_if_empty: false,
+            hidden_if_empty: true, // Sensitive field; matches notify's webhook auth_token (backlog#2054)
         },
         KV {
             key: WEBHOOK_CLIENT_CERT.to_owned(),
@@ -49,6 +59,16 @@ pub static DEFAULT_AUDIT_WEBHOOK_KVS: LazyLock<KVS> = LazyLock::new(|| {
         KV {
             key: WEBHOOK_CLIENT_KEY.to_owned(),
             value: "".to_owned(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: WEBHOOK_CLIENT_CA.to_owned(),
+            value: "".to_owned(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: WEBHOOK_SKIP_TLS_VERIFY.to_owned(),
+            value: EnableState::Off.to_string(),
             hidden_if_empty: false,
         },
         KV {
@@ -81,12 +101,25 @@ pub static DEFAULT_AUDIT_WEBHOOK_KVS: LazyLock<KVS> = LazyLock::new(|| {
             value: "5s".to_owned(),
             hidden_if_empty: false,
         },
+        KV {
+            key: COMMENT_KEY.to_owned(),
+            value: "".to_owned(),
+            hidden_if_empty: false,
+        },
     ])
 });
 
-#[allow(dead_code)]
 #[allow(clippy::declare_interior_mutable_const)]
 /// Default KVS for audit MQTT settings.
+///
+/// `MQTT_QOS`/`MQTT_KEEP_ALIVE_INTERVAL`/`MQTT_RECONNECT_INTERVAL` default to a stronger
+/// delivery posture here (`"1"`/`"60s"`/`"5s"`) than
+/// [`crate::config::notify::DEFAULT_NOTIFY_MQTT_KVS`] (`"0"`/`"0s"`/`"0s"`, which matches
+/// MinIO's own `DefaultMQTTKVS` in `internal/config/notify/parse.go` byte-for-byte). MinIO has
+/// no MQTT audit target to compare against — audit-over-MQTT is a RustFS-original addition —
+/// so this divergence cannot be checked against upstream; it is intentional (audit favors
+/// at-least-once delivery and faster reconnect over notify's opt-in defaults), not a
+/// copy/paste gap (backlog#2054).
 pub static DEFAULT_AUDIT_MQTT_KVS: LazyLock<KVS> = LazyLock::new(|| {
     KVS(vec![
         KV {
@@ -140,9 +173,55 @@ pub static DEFAULT_AUDIT_MQTT_KVS: LazyLock<KVS> = LazyLock::new(|| {
             hidden_if_empty: false,
         },
         KV {
+            key: MQTT_TLS_POLICY.to_owned(),
+            value: "".to_owned(),
+            hidden_if_empty: true,
+        },
+        KV {
+            key: MQTT_TLS_CA.to_owned(),
+            value: "".to_owned(),
+            hidden_if_empty: true,
+        },
+        KV {
+            key: MQTT_TLS_CLIENT_CERT.to_owned(),
+            value: "".to_owned(),
+            hidden_if_empty: true,
+        },
+        KV {
+            key: MQTT_TLS_CLIENT_KEY.to_owned(),
+            value: "".to_owned(),
+            hidden_if_empty: true,
+        },
+        KV {
+            key: MQTT_TLS_TRUST_LEAF_AS_CA.to_owned(),
+            value: "".to_owned(),
+            hidden_if_empty: true,
+        },
+        KV {
+            key: MQTT_WS_PATH_ALLOWLIST.to_owned(),
+            value: "".to_owned(),
+            hidden_if_empty: true,
+        },
+        KV {
             key: COMMENT_KEY.to_owned(),
             value: "".to_owned(),
             hidden_if_empty: false,
         },
     ])
 });
+
+// The remaining targets declare the same defaults as notify, so both sides build them from
+// `target_defaults`. Redis and mysql pass in the single default that audit and notify disagree on.
+pub static DEFAULT_AUDIT_AMQP_KVS: LazyLock<KVS> = LazyLock::new(amqp_kvs);
+
+pub static DEFAULT_AUDIT_NATS_KVS: LazyLock<KVS> = LazyLock::new(nats_kvs);
+
+pub static DEFAULT_AUDIT_PULSAR_KVS: LazyLock<KVS> = LazyLock::new(pulsar_kvs);
+
+pub static DEFAULT_AUDIT_REDIS_KVS: LazyLock<KVS> = LazyLock::new(|| redis_kvs(AUDIT_REDIS_DEFAULT_CHANNEL));
+
+pub static DEFAULT_AUDIT_POSTGRES_KVS: LazyLock<KVS> = LazyLock::new(postgres_kvs);
+
+pub static DEFAULT_AUDIT_KAFKA_KVS: LazyLock<KVS> = LazyLock::new(kafka_kvs);
+
+pub static DEFAULT_AUDIT_MYSQL_KVS: LazyLock<KVS> = LazyLock::new(|| mysql_kvs("rustfs_audit_logs"));

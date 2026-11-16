@@ -16,20 +16,13 @@
 //!
 //! provides tools for system and service monitoring
 //!
-//! ## feature mark
-//! - `default`: default monitoring function
-//! - `gpu`: gpu monitoring function
-//! - `full`: includes all functions
+//! ## Features
 //!
-//! to enable gpu monitoring add in cargo toml
-//!
-//! ```toml
-//! # using gpu monitoring
-//! rustfs-obs = { version = "0.1.0", features = ["gpu"] }
-//!
-//! # use all functions
-//! rustfs-obs = { version = "0.1.0", features = ["full"] }
-//! ```
+//! This crate provides observability tools for RustFS:
+//! - Logging with tracing
+//! - Metrics collection
+//! - Distributed tracing
+//! - Tokio runtime telemetry (via dial9)
 //!
 //! ## Usage
 //!
@@ -38,7 +31,7 @@
 //!
 //! # #[tokio::main]
 //! # async fn main() {
-//! #   let _guard = match init_obs(None).await {
+//! #   let _guard = match init_obs(None, None).await {
 //! #         Ok(g) => g,
 //! #         Err(e) => {
 //! #             panic!("Failed to initialize observability: {:?}", e);
@@ -53,16 +46,41 @@
 //! #   // Guard will be dropped here, flushing telemetry data
 //! # }
 //! ```
+//!
+//! ## Metrics Runtime
+//!
+//! Start metrics scheduling with `rustfs_obs::init_metrics_runtime()`.
+//!
+//! ```ignore
+//! use tokio_util::sync::CancellationToken;
+//! use rustfs_obs::init_metrics_runtime;
+//!
+//! let token = CancellationToken::new();
+//! init_metrics_runtime(token.clone());
+//! ```
 mod cleaner;
 mod config;
 mod error;
 mod global;
-mod system;
+mod logging;
+pub mod metrics;
+mod node_identity;
 mod telemetry;
 
 pub use cleaner::*;
 pub use config::*;
 pub use error::*;
 pub use global::*;
-pub use system::SystemObserver;
-pub use telemetry::{OtelGuard, Recorder};
+pub use logging::*;
+pub use metrics::schema::*;
+pub use metrics::{
+    MetricsRuntimeCancellationSource, MetricsRuntimeController, MetricsRuntimeControllerSnapshot, MetricsRuntimeDesiredSnapshot,
+    MetricsRuntimeDesiredState, MetricsRuntimeIntervalsSnapshot, MetricsRuntimeReconcilePlan, MetricsRuntimeServiceState,
+    MetricsRuntimeShutdownHandle, MetricsRuntimeStatusSnapshot, MetricsRuntimeWorkerMutation, init_metrics_runtime,
+    metrics_runtime_controller_snapshot, metrics_runtime_status_snapshot,
+};
+pub use telemetry::{HTTP_SERVER_LOG_TARGET, OtelGuard, Recorder};
+
+// Dial9 Tokio runtime telemetry
+// Re-export dial9 types at crate root level for easier access
+pub use telemetry::dial9;

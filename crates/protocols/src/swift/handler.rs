@@ -20,22 +20,48 @@
 
 use super::container;
 use super::dlo;
+use super::metadata_update::MetadataUpdate;
 use super::object;
 use super::slo;
 use super::tempurl;
 use super::{SwiftError, SwiftRoute, SwiftRouter};
 use axum::http::{Method, Request, Response, StatusCode};
 use futures::Future;
+use http_body_util::combinators::UnsyncBoxBody;
 use rustfs_credentials::Credentials;
 use rustfs_keystone::KEYSTONE_CREDENTIALS;
-use s3s::Body;
+use rustfs_s3_types::{Body, StdError};
+use rustfs_trusted_proxies::ClientInfo;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio_util::io::StreamReader;
 use tower::Service;
 use tracing::{debug, instrument};
 
-/// Swift-aware service that routes to Swift handlers or S3 service
+const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
+const LOG_SUBSYSTEM_SWIFT_HANDLER: &str = "swift_handler";
+const EVENT_SWIFT_ROUTE_STATE: &str = "swift_route_state";
+const EVENT_SWIFT_TEMPURL_STATE: &str = "swift_tempurl_state";
+
+fn trusted_client_ip<B>(req: &Request<B>) -> Option<IpAddr> {
+    req.extensions()
+        .get::<ClientInfo>()
+        .map(|info| info.real_ip)
+        .or_else(|| req.extensions().get::<SocketAddr>().map(SocketAddr::ip))
+        .filter(|ip| !ip.is_unspecified())
+}
+
+/// The request body as the Swift handlers read it: the body the server hands
+/// over, boxed without a `Sync` bound because the handlers only consume it and
+/// never pass it on.
+pub type SwiftRequestBody = UnsyncBoxBody<bytes::Bytes, StdError>;
+
+/// Swift-aware service that routes to Swift handlers or S3 service.
+///
+/// Swift responses are built as [`Body`] and converted into the wrapped S3
+/// service's response body type, so the two kinds of response leave this
+/// service as one type.
 #[derive(Clone)]
 pub struct SwiftService<S> {
     /// Swift router for URL parsing
@@ -52,15 +78,16 @@ impl<S> SwiftService<S> {
     }
 }
 
-impl<S, B> Service<Request<B>> for SwiftService<S>
+impl<S, B, ResBody> Service<Request<B>> for SwiftService<S>
 where
-    S: Service<Request<B>, Response = Response<Body>> + Clone + Send + 'static,
+    S: Service<Request<B>, Response = Response<ResBody>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     B: axum::body::HttpBody<Data = bytes::Bytes> + Send + 'static,
     B::Error: std::error::Error + Send + Sync + 'static,
+    ResBody: From<Body> + Send + 'static,
 {
-    type Response = Response<Body>;
+    type Response = Response<ResBody>;
     type Error = Box<dyn std::error::Error + Send + Sync>;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
@@ -75,30 +102,42 @@ where
         let uri = req.uri();
 
         if let Some(route) = self.router.route(uri, method.clone()) {
-            debug!("Swift route matched: {:?}", route);
+            debug!(
+                event = EVENT_SWIFT_ROUTE_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_SWIFT_HANDLER,
+                state = "matched",
+                route = ?route,
+                "swift route state changed"
+            );
 
             // Extract credentials from Keystone task-local storage (if available)
             // This is consistent with how S3 auth handler retrieves Keystone credentials
             let credentials = KEYSTONE_CREDENTIALS.try_with(|creds| creds.clone()).ok().flatten();
 
-            // Convert Request<B> to Request<Body> for Swift handler
-            let req_body = req.map(|b| Body::http_body_unsync(b));
+            // Convert Request<B> to Request<SwiftRequestBody> for Swift handler
+            let req_body = req.map(|b| UnsyncBoxBody::new(http_body_util::BodyExt::map_err(b, StdError::from)));
 
             // Handle Swift operations with full request
             let response_future = handle_swift_request(req_body, route, credentials);
             return Box::pin(async move {
-                match response_future.await {
-                    Ok(response) => Ok(response),
-                    Err(swift_error) => {
-                        // Convert SwiftError to Response
-                        Ok(swift_error_to_response(swift_error))
-                    }
-                }
+                let response = match response_future.await {
+                    Ok(response) => response,
+                    // Convert SwiftError to Response
+                    Err(swift_error) => swift_error_to_response(swift_error),
+                };
+                Ok(response.map(ResBody::from))
             });
         }
 
         // Not a Swift request, delegate to S3 service
-        debug!("No Swift route matched, delegating to S3 service");
+        debug!(
+            event = EVENT_SWIFT_ROUTE_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_SWIFT_HANDLER,
+            state = "delegated_to_s3",
+            "swift route state changed"
+        );
         let mut s3_service = self.s3_service.clone();
         Box::pin(async move { s3_service.call(req).await.map_err(Into::into) })
     }
@@ -106,10 +145,11 @@ where
 
 /// Handle Swift API requests with full access to request data
 async fn handle_swift_request(
-    req: Request<Body>,
+    req: Request<SwiftRequestBody>,
     route: SwiftRoute,
     credentials: Option<Credentials>,
 ) -> Result<Response<Body>, SwiftError> {
+    let client_ip = trusted_client_ip(&req);
     // Extract parts
     let (parts, body) = req.into_parts();
     let method = parts.method.clone();
@@ -127,7 +167,16 @@ async fn handle_swift_request(
         && let Some(tempurl_params) = tempurl::TempURLParams::from_query(query)
     {
         // TempURL detected - validate it
-        debug!("TempURL detected for {}/{}/{}", account, container, object);
+        debug!(
+            event = EVENT_SWIFT_TEMPURL_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_SWIFT_HANDLER,
+            state = "detected",
+            account = %account,
+            container = %container,
+            object = %object,
+            "swift tempurl state changed"
+        );
 
         // Get account TempURL key
         let tempurl_key = super::account::get_tempurl_key(account, &credentials).await?;
@@ -137,10 +186,19 @@ async fn handle_swift_request(
             let tempurl = tempurl::TempURL::new(key);
             let path = uri.path();
 
-            tempurl.validate_request(method.as_str(), path, &tempurl_params)?;
+            tempurl.validate_request(method.as_str(), path, &tempurl_params, client_ip)?;
 
             // TempURL is valid - proceed with request (no credentials needed)
-            debug!("TempURL validated successfully");
+            debug!(
+                event = EVENT_SWIFT_TEMPURL_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_SWIFT_HANDLER,
+                result = "validated",
+                account = %account,
+                container = %container,
+                object = %object,
+                "swift tempurl state changed"
+            );
 
             // Reconstruct request for object operation
             let req = Request::from_parts(parts, body);
@@ -188,7 +246,7 @@ async fn handle_swift_request(
 }
 
 /// Handle TempURL-authenticated object requests
-async fn handle_tempurl_object_request(req: Request<Body>, route: SwiftRoute) -> Result<Response<Body>, SwiftError> {
+async fn handle_tempurl_object_request(req: Request<SwiftRequestBody>, route: SwiftRoute) -> Result<Response<Body>, SwiftError> {
     let SwiftRoute::Object {
         account,
         container,
@@ -221,7 +279,7 @@ async fn handle_tempurl_object_request(req: Request<Body>, route: SwiftRoute) ->
 
 /// Handle authenticated Swift API requests
 async fn handle_authenticated_request(
-    req: Request<Body>,
+    req: Request<SwiftRequestBody>,
     route: SwiftRoute,
     credentials: Credentials,
 ) -> Result<Response<Body>, SwiftError> {
@@ -274,32 +332,15 @@ async fn handle_authenticated_request(
                     Err(SwiftError::NotImplemented("Swift Account HEAD operation not yet implemented".to_string()))
                 }
                 Method::POST => {
-                    // Account metadata update - extract headers
-                    let mut metadata = std::collections::HashMap::new();
+                    // Account metadata update. Additive, per Swift: the request
+                    // names the items to set (X-Account-Meta-*) and the items to
+                    // drop (X-Remove-Account-Meta-*, or an empty value), and
+                    // everything it does not name keeps its stored value. The
+                    // TempURL signing key lives here, so a replacing POST would
+                    // invalidate every outstanding signature for the account.
+                    let update = MetadataUpdate::from_account_headers(&headers);
 
-                    // Extract X-Account-Meta-* headers
-                    for (key, value) in &headers {
-                        let key_str = key.as_str();
-                        if let Some(meta_key) = key_str.strip_prefix("x-account-meta-") {
-                            // Strip "x-account-meta-"
-                            if let Ok(value_str) = value.to_str() {
-                                metadata.insert(meta_key.to_string(), value_str.to_string());
-                            }
-                        }
-                    }
-
-                    // Special handling for TempURL key headers
-                    // X-Account-Meta-Temp-URL-Key or X-Account-Meta-Temp-Url-Key
-                    if let Some(tempurl_key) = headers
-                        .get("x-account-meta-temp-url-key")
-                        .or_else(|| headers.get("x-account-meta-temp-Url-key"))
-                        && let Ok(key_str) = tempurl_key.to_str()
-                    {
-                        metadata.insert("temp-url-key".to_string(), key_str.to_string());
-                    }
-
-                    // Update account metadata
-                    super::account::update_account_metadata(&account, &metadata, &credentials_opt).await?;
+                    super::account::update_account_metadata(&account, &update, &credentials_opt).await?;
 
                     let trans_id = generate_trans_id();
                     Response::builder()
@@ -534,17 +575,15 @@ async fn handle_authenticated_request(
                         container::set_container_acl(&account, &container, new_read, new_write, &credentials).await?;
                     }
 
-                    // Update container metadata - now we have access to request headers
-                    let mut metadata = std::collections::HashMap::new();
-                    for (name, value) in headers.iter() {
-                        if let Some(meta_key) = name.as_str().strip_prefix("x-container-meta-")
-                            && let Ok(value_str) = value.to_str()
-                        {
-                            metadata.insert(meta_key.to_string(), value_str.to_string());
-                        }
-                    }
+                    // Update container metadata. Additive, per Swift: items the
+                    // request does not name keep their stored value, and removal
+                    // is explicit (X-Remove-Container-Meta-*, or an empty value).
+                    // Still called when the request named no item — an ACL-only
+                    // or versioning-only POST — because this is what reports 404
+                    // for a container that does not exist.
+                    let update = MetadataUpdate::from_container_headers(&headers);
 
-                    container::update_container_metadata(&account, &container, &credentials, metadata).await?;
+                    container::update_container_metadata(&account, &container, &credentials, update).await?;
 
                     let trans_id = generate_trans_id();
                     Response::builder()
@@ -605,14 +644,11 @@ async fn handle_authenticated_request(
                             .await;
                     }
 
-                    // Check quota before upload (if Content-Length provided)
-                    if let Some(content_length) = headers.get("content-length")
-                        && let Ok(size_str) = content_length.to_str()
-                        && let Ok(object_size) = size_str.parse::<u64>()
-                    {
-                        // Check if upload would exceed quota
-                        super::quota::check_upload_quota(&account, &container, object_size, &credentials).await?;
-                    }
+                    let object_size = headers
+                        .get("content-length")
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| value.parse::<u64>().ok());
+                    super::quota::check_upload_quota(&account, &container, object_size, &credentials).await?;
 
                     // Check if versioning is enabled for this container
                     if let Some(archive_container) = container::get_versions_location(&account, &container, &credentials).await? {
@@ -640,8 +676,9 @@ async fn handle_authenticated_request(
                         .into_data_stream()
                         .map(|result| result.map_err(|e| std::io::Error::other(e.to_string())));
 
-                    // Create streaming reader from the body stream
-                    let reader = StreamReader::new(stream);
+                    // Create streaming reader from the body stream; the storage
+                    // writer needs a Sync reader and the request body is only Send
+                    let reader = StreamReader::new(sync_wrapper::SyncStream::new(stream));
 
                     // Add buffering for optimal streaming performance (64KB buffer)
                     // This provides backpressure handling and reduces syscall overhead
@@ -721,10 +758,11 @@ async fn handle_authenticated_request(
                                     response = response.header("etag", etag);
                                 }
 
-                                for (key, value) in info.user_defined {
-                                    if key != "content-type" {
-                                        let header_name = format!("x-object-meta-{}", key);
-                                        response = response.header(header_name, value);
+                                for (key, value) in info.user_defined.iter() {
+                                    if key != "content-type"
+                                        && let Some(key) = object::swift_response_user_metadata_key(key)
+                                    {
+                                        response = response.header(format!("x-object-meta-{key}"), value.as_str());
                                     }
                                 }
 
@@ -790,19 +828,16 @@ async fn handle_authenticated_request(
                     }
 
                     // Add custom metadata headers (X-Object-Meta-*)
-                    for (key, value) in info.user_defined {
-                        if key != "content-type" {
-                            let header_name = format!("x-object-meta-{}", key);
-                            response = response.header(header_name, value);
+                    for (key, value) in info.user_defined.iter() {
+                        if key != "content-type"
+                            && let Some(key) = object::swift_response_user_metadata_key(key)
+                        {
+                            response = response.header(format!("x-object-meta-{key}"), value.as_str());
                         }
                     }
 
-                    // Convert GetObjectReader stream to Body
-                    // Use ReaderStream to convert AsyncRead to Stream
-                    let stream = tokio_util::io::ReaderStream::new(reader.stream);
-                    let axum_body = axum::body::Body::from_stream(stream);
-                    // Use http_body_unsync since axum Body doesn't implement Sync
-                    let body = Body::http_body_unsync(axum_body);
+                    // Stream the GetObjectReader through a ReaderStream
+                    let body = Body::from_stream(tokio_util::io::ReaderStream::new(reader.stream));
 
                     response
                         .body(body)
@@ -829,10 +864,11 @@ async fn handle_authenticated_request(
                     }
 
                     // Add custom metadata headers (X-Object-Meta-*)
-                    for (key, value) in info.user_defined {
-                        if key != "content-type" {
-                            let header_name = format!("x-object-meta-{}", key);
-                            response = response.header(header_name, value);
+                    for (key, value) in info.user_defined.iter() {
+                        if key != "content-type"
+                            && let Some(key) = object::swift_response_user_metadata_key(key)
+                        {
+                            response = response.header(format!("x-object-meta-{key}"), value.as_str());
                         }
                     }
 
@@ -904,7 +940,14 @@ async fn handle_authenticated_request(
                         .await
                         .unwrap_or_else(|e| {
                             // Log restore error but don't fail the DELETE
-                            tracing::warn!("Failed to restore version after delete: {}", e);
+                            tracing::warn!(
+                                event = EVENT_SWIFT_TEMPURL_STATE,
+                                component = LOG_COMPONENT_PROTOCOLS,
+                                subsystem = LOG_SUBSYSTEM_SWIFT_HANDLER,
+                                result = "restore_after_delete_failed",
+                                error = %e,
+                                "swift tempurl state changed"
+                            );
                             false
                         });
 
@@ -1013,7 +1056,7 @@ async fn handle_authenticated_request(
 type SymlinkResolutionFuture<'a> =
     Pin<Box<dyn std::future::Future<Output = Result<(String, String, String, Option<String>), SwiftError>> + Send + 'a>>;
 
-/// Resolve symlink chain recursively
+/// Resolve symlink chain recursively with circular reference detection
 ///
 /// Returns (final_account, final_container, final_object, symlink_target_header)
 /// where symlink_target_header is Some(target) if the original object was a symlink
@@ -1023,12 +1066,17 @@ fn resolve_symlink_chain<'a>(
     object: &'a str,
     credentials: &'a Option<Credentials>,
     depth: u8,
+    visited: std::collections::HashSet<crate::swift::symlink::SymlinkPath>,
 ) -> SymlinkResolutionFuture<'a> {
     Box::pin(async move {
         use super::symlink;
 
-        // Validate depth to prevent infinite loops
-        symlink::validate_symlink_depth(depth)?;
+        // Validate both depth and circular references
+        symlink::validate_symlink_access(&visited, depth, account, container, object)?;
+
+        // Add current path to visited set
+        let mut new_visited = visited;
+        new_visited.insert(symlink::SymlinkPath::new(account, container, object));
 
         // Get object metadata
         let info = if let Some(creds) = credentials {
@@ -1041,14 +1089,14 @@ fn resolve_symlink_chain<'a>(
         // Check if this object is a symlink
         if let Some(target) = symlink::get_symlink_target(&info.user_defined)? {
             let target_container = target.resolve_container(container);
-            let target_object = &target.object;
+            let target_object = target.object.clone();
 
             // Store the original target for the response header
             let target_header = target.to_header_value(container);
 
             // Recursively resolve the target (it might also be a symlink)
             let (final_account, final_container, final_object, _) =
-                resolve_symlink_chain(account, target_container, target_object, credentials, depth + 1).await?;
+                resolve_symlink_chain(account, target_container, &target_object, credentials, depth + 1, new_visited).await?;
 
             // Return the final target, but keep the first-level symlink target for the header
             Ok((final_account, final_container, final_object, Some(target_header)))
@@ -1057,6 +1105,18 @@ fn resolve_symlink_chain<'a>(
             Ok((account.to_string(), container.to_string(), object.to_string(), None))
         }
     })
+}
+
+/// Helper function to start symlink resolution with an empty visited set
+fn resolve_symlink_chain_wrapper<'a>(
+    account: &'a str,
+    container: &'a str,
+    object: &'a str,
+    credentials: &'a Option<Credentials>,
+) -> SymlinkResolutionFuture<'a> {
+    Box::pin(
+        async move { resolve_symlink_chain(account, container, object, credentials, 0, std::collections::HashSet::new()).await },
+    )
 }
 
 /// Helper function for object GET operations (used by both authenticated and TempURL requests)
@@ -1072,7 +1132,7 @@ async fn handle_object_get(
 
     // Resolve symlinks first (with loop detection)
     let (final_account, final_container, final_object, symlink_target) =
-        resolve_symlink_chain(account, container, object, credentials, 0).await?;
+        resolve_symlink_chain_wrapper(account, container, object, credentials).await?;
 
     // Check if object is SLO (via metadata)
     if slo::is_slo_object(&final_account, &final_container, &final_object, credentials).await? {
@@ -1117,10 +1177,11 @@ async fn handle_object_get(
                     response = response.header("etag", etag);
                 }
 
-                for (key, value) in info.user_defined {
-                    if key != "content-type" {
-                        let header_name = format!("x-object-meta-{}", key);
-                        response = response.header(header_name, value);
+                for (key, value) in info.user_defined.iter() {
+                    if key != "content-type"
+                        && let Some(key) = object::swift_response_user_metadata_key(key)
+                    {
+                        response = response.header(format!("x-object-meta-{key}"), value.as_str());
                     }
                 }
 
@@ -1183,21 +1244,19 @@ async fn handle_object_get(
         response = response.header("etag", etag);
     }
 
-    for (key, value) in info.user_defined {
+    for (key, value) in info.user_defined.iter() {
         if key == "x-delete-at" {
             // Add X-Delete-At header directly (not as X-Object-Meta-*)
-            response = response.header("x-delete-at", value);
-        } else if key != "content-type" {
-            let header_name = format!("x-object-meta-{}", key);
-            response = response.header(header_name, value);
+            response = response.header("x-delete-at", value.as_str());
+        } else if key != "content-type"
+            && let Some(key) = object::swift_response_user_metadata_key(key)
+        {
+            response = response.header(format!("x-object-meta-{key}"), value.as_str());
         }
     }
 
-    // Convert GetObjectReader AsyncRead stream to Body
-    // Use ReaderStream to convert AsyncRead to Stream
-    let stream = tokio_util::io::ReaderStream::new(reader.stream);
-    let axum_body = axum::body::Body::from_stream(stream);
-    let body = Body::http_body_unsync(axum_body);
+    // Stream the GetObjectReader through a ReaderStream
+    let body = Body::from_stream(tokio_util::io::ReaderStream::new(reader.stream));
 
     response
         .body(body)
@@ -1213,7 +1272,7 @@ async fn handle_object_head(
 ) -> Result<Response<Body>, SwiftError> {
     // Resolve symlinks first (with loop detection)
     let (final_account, final_container, final_object, symlink_target) =
-        resolve_symlink_chain(account, container, object, credentials, 0).await?;
+        resolve_symlink_chain_wrapper(account, container, object, credentials).await?;
 
     let info = if let Some(creds) = credentials {
         object::head_object(&final_account, &final_container, &final_object, creds).await?
@@ -1239,13 +1298,14 @@ async fn handle_object_head(
         response = response.header("etag", etag);
     }
 
-    for (key, value) in info.user_defined {
+    for (key, value) in info.user_defined.iter() {
         if key == "x-delete-at" {
             // Add X-Delete-At header directly (not as X-Object-Meta-*)
-            response = response.header("x-delete-at", value);
-        } else if key != "content-type" {
-            let header_name = format!("x-object-meta-{}", key);
-            response = response.header(header_name, value);
+            response = response.header("x-delete-at", value.as_str());
+        } else if key != "content-type"
+            && let Some(key) = object::swift_response_user_metadata_key(key)
+        {
+            response = response.header(format!("x-object-meta-{key}"), value.as_str());
         }
     }
 
@@ -1259,7 +1319,7 @@ async fn handle_object_put(
     account: &str,
     container: &str,
     object: &str,
-    body: Body,
+    body: SwiftRequestBody,
     headers: &http::HeaderMap,
     credentials: &Option<Credentials>,
 ) -> Result<Response<Body>, SwiftError> {
@@ -1276,8 +1336,9 @@ async fn handle_object_put(
         .into_data_stream()
         .map(|result| result.map_err(|e| std::io::Error::other(e.to_string())));
 
-    // Create streaming reader from the body stream
-    let reader = StreamReader::new(stream);
+    // Create streaming reader from the body stream; the storage writer needs a
+    // Sync reader and the request body is only Send
+    let reader = StreamReader::new(sync_wrapper::SyncStream::new(stream));
 
     // Add buffering for optimal streaming performance (64KB buffer)
     let buffered_reader = tokio::io::BufReader::with_capacity(65536, reader);
@@ -1415,6 +1476,7 @@ fn swift_error_to_response(error: SwiftError) -> Response<Body> {
         SwiftError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.as_str()),
         SwiftError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.as_str()),
         SwiftError::Conflict(msg) => (StatusCode::CONFLICT, msg.as_str()),
+        SwiftError::LengthRequired(msg) => (StatusCode::LENGTH_REQUIRED, msg.as_str()),
         SwiftError::RequestEntityTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, msg.as_str()),
         SwiftError::UnprocessableEntity(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg.as_str()),
         SwiftError::TooManyRequests { .. } => (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded"),
@@ -1437,8 +1499,10 @@ fn swift_error_to_response(error: SwiftError) -> Response<Body> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
+    use super::{parse_range_header, trusted_client_ip};
+    use axum::http::Request;
+    use rustfs_trusted_proxies::ClientInfo;
+    use std::net::SocketAddr;
     #[test]
     fn test_parse_range_header_start_end() {
         // bytes=100-199
@@ -1528,5 +1592,131 @@ mod tests {
         // bytes=0-999 (entire 1000-byte file)
         let result = parse_range_header("bytes=0-999", 1000);
         assert_eq!(result, Some((0, 999)));
+    }
+
+    #[test]
+    fn trusted_client_ip_ignores_untrusted_forwarded_headers() {
+        let mut request = Request::builder()
+            .header("x-forwarded-for", "198.51.100.9")
+            .header("x-real-ip", "198.51.100.10")
+            .body(())
+            .expect("request");
+        request
+            .extensions_mut()
+            .insert("192.0.2.7:9000".parse::<SocketAddr>().expect("socket address"));
+
+        assert_eq!(trusted_client_ip(&request), Some("192.0.2.7".parse().expect("peer IP address")));
+    }
+
+    #[test]
+    fn trusted_client_ip_prefers_validated_proxy_identity() {
+        let mut request = Request::new(());
+        request
+            .extensions_mut()
+            .insert("192.0.2.7:9000".parse::<SocketAddr>().expect("socket address"));
+        request.extensions_mut().insert(ClientInfo::direct(
+            "203.0.113.8:443".parse::<SocketAddr>().expect("validated client address"),
+        ));
+
+        assert_eq!(trusted_client_ip(&request), Some("203.0.113.8".parse().expect("validated client IP")));
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_unspecified_fallback() {
+        let mut request = Request::new(());
+        request
+            .extensions_mut()
+            .insert(ClientInfo::direct("0.0.0.0:0".parse::<SocketAddr>().expect("unspecified fallback")));
+
+        assert_eq!(trusted_client_ip(&request), None);
+    }
+
+    // ---- the service edge: request and response body types ----
+
+    use super::{Body, SwiftService};
+    use axum::http::{Response, StatusCode};
+    use bytes::Bytes;
+    use http_body_util::combinators::UnsyncBoxBody;
+    use http_body_util::{BodyExt, Full};
+    use std::convert::Infallible;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tower::ServiceExt as _;
+
+    /// Stands in for the S3 service's response body type, which a Swift
+    /// response can only reach through `From<Body>`.
+    struct S3Body(Body);
+
+    impl From<Body> for S3Body {
+        fn from(body: Body) -> Self {
+            Self(body)
+        }
+    }
+
+    /// A Send-only request body, the kind the server may hand over.
+    type SendOnlyBody = UnsyncBoxBody<Bytes, std::io::Error>;
+
+    fn request(path: &str) -> Request<SendOnlyBody> {
+        let body = Full::new(Bytes::from_static(b"payload"))
+            .map_err(|never: Infallible| match never {})
+            .boxed_unsync();
+        Request::get(path).body(body).expect("a valid test request")
+    }
+
+    /// The S3 service behind the Swift one, counting the requests it gets.
+    fn s3_service(
+        calls: Arc<AtomicUsize>,
+    ) -> impl tower::Service<Request<SendOnlyBody>, Response = Response<S3Body>, Error = Infallible, Future: Send> + Clone + Send
+    {
+        tower::service_fn(move |request: Request<SendOnlyBody>| {
+            let calls = Arc::clone(&calls);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let payload = request.into_body().collect().await.map(|b| b.to_bytes()).unwrap_or_default();
+                Ok(Response::new(S3Body(Body::from(payload))))
+            }
+        })
+    }
+
+    async fn text(response: Response<S3Body>) -> String {
+        let bytes = response.into_body().0.collect().await.expect("an in-memory body").to_bytes();
+        String::from_utf8(bytes.to_vec()).expect("a text body")
+    }
+
+    #[tokio::test]
+    async fn a_swift_error_leaves_as_the_s3_body_type_with_its_status_and_text() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = SwiftService::new(true, None, s3_service(Arc::clone(&calls)));
+        let response = service
+            .oneshot(request("/v1/AUTH_test/photos"))
+            .await
+            .expect("a Swift error is a response, not a service error");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.headers()["content-type"], "text/plain; charset=utf-8");
+        assert!(response.headers().contains_key("x-trans-id"));
+        assert_eq!(text(response).await, "Authentication required");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "a Swift route never reaches the S3 service");
+    }
+
+    #[tokio::test]
+    async fn a_non_swift_request_reaches_the_s3_service_with_its_body_untouched() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = SwiftService::new(true, None, s3_service(Arc::clone(&calls)));
+        let response = service.oneshot(request("/bucket/key")).await.expect("the S3 service answers");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(text(response).await, "payload", "the S3 service read the original request body");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_disabled_swift_router_hands_swift_paths_to_the_s3_service() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = SwiftService::new(false, None, s3_service(Arc::clone(&calls)));
+        let response = service
+            .oneshot(request("/v1/AUTH_test/photos"))
+            .await
+            .expect("the S3 service answers");
+        assert_eq!(text(response).await, "payload");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

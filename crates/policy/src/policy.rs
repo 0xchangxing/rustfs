@@ -21,6 +21,7 @@ pub mod opa;
 #[allow(clippy::module_inception)]
 mod policy;
 mod principal;
+pub mod probe;
 pub mod resource;
 pub mod statement;
 pub(crate) mod utils;
@@ -29,12 +30,14 @@ pub mod variables;
 pub use action::ActionSet;
 pub use doc::PolicyDoc;
 pub use effect::Effect;
-pub use function::Functions;
+pub use function::key_name::SVC_TARGET_USER;
+pub use function::{Functions, is_server_derived_condition_key};
 pub use id::ID;
 pub use policy::*;
 pub use principal::Principal;
 pub use resource::ResourceSet;
 pub use statement::Statement;
+pub use utils::{ClaimLookup, get_claim_case_insensitive};
 
 #[derive(thiserror::Error, Debug)]
 #[cfg_attr(test, derive(Eq, PartialEq))]
@@ -66,6 +69,15 @@ pub enum Error {
     #[error("invalid action: '{0}'")]
     InvalidAction(String),
 
+    #[error("'Action' contains mixed action families in the same statement")]
+    MixedActionFamilies,
+
     #[error("invalid resource, type: '{0}', pattern: '{1}'")]
     InvalidResource(String, String),
+
+    #[error("KMS resources require a statement whose actions are all KMS actions")]
+    KmsResourceWithNonKmsAction,
+
+    #[error("bucket policies do not support KMS actions or resources")]
+    KmsUnsupportedInBucketPolicy,
 }

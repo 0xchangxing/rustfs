@@ -16,7 +16,8 @@
 mod tests {
     use crate::storage::sse::SseDekProvider;
     use crate::storage::sse::TestSseDekProvider;
-    use rustfs_rio::{DecryptReader, EncryptReader, WarpReader};
+    use rustfs_kms::types::ObjectEncryptionContext;
+    use rustfs_rio::{DecryptReader, EncryptReader};
     use std::io::Cursor;
     use tokio::io::AsyncReadExt;
 
@@ -36,9 +37,10 @@ mod tests {
         let bucket = "test-bucket";
         let key = "test-key";
         let kms_key_id = "default"; // Key ID is ignored in test provider
+        let context = ObjectEncryptionContext::new(bucket.to_string(), key.to_string());
 
         let (data_key, _encrypted_dek) = provider
-            .generate_sse_dek(bucket, key, kms_key_id)
+            .generate_sse_dek(&context, kms_key_id)
             .await
             .expect("Failed to generate DEK");
 
@@ -51,8 +53,8 @@ mod tests {
         println!("Original plaintext: {:?}", String::from_utf8_lossy(plaintext));
         println!("Plaintext length: {} bytes", plaintext.len());
 
-        // Step 4: Encrypt using EncryptReader (wrap Cursor with WarpReader)
-        let plaintext_reader = WarpReader::new(Cursor::new(plaintext.to_vec()));
+        // Step 4: Encrypt using EncryptReader.
+        let plaintext_reader = Cursor::new(plaintext.to_vec());
         let mut encrypt_reader = EncryptReader::new(plaintext_reader, data_key.plaintext_key, data_key.nonce);
 
         // Read encrypted data
@@ -75,8 +77,8 @@ mod tests {
             "Encrypted data should be different from plaintext"
         );
 
-        // Step 5: Decrypt using DecryptReader (wrap Cursor with WarpReader)
-        let encrypted_reader = WarpReader::new(Cursor::new(encrypted_data));
+        // Step 5: Decrypt using DecryptReader.
+        let encrypted_reader = Cursor::new(encrypted_data);
         let mut decrypt_reader = DecryptReader::new(encrypted_reader, data_key.plaintext_key, data_key.nonce);
 
         // Read decrypted data
@@ -104,9 +106,10 @@ mod tests {
         let bucket = "test-bucket";
         let key = "test-key-large";
         let kms_key_id = "default";
+        let context = ObjectEncryptionContext::new(bucket.to_string(), key.to_string());
 
         let (data_key, _encrypted_dek) = provider
-            .generate_sse_dek(bucket, key, kms_key_id)
+            .generate_sse_dek(&context, kms_key_id)
             .await
             .expect("Failed to generate DEK");
 
@@ -115,8 +118,8 @@ mod tests {
         let plaintext: Vec<u8> = (0..plaintext_size).map(|i| (i % 256) as u8).collect();
         println!("Testing with {} bytes of data", plaintext.len());
 
-        // Encrypt (wrap with WarpReader)
-        let plaintext_reader = WarpReader::new(Cursor::new(plaintext.clone()));
+        // Encrypt.
+        let plaintext_reader = Cursor::new(plaintext.clone());
         let mut encrypt_reader = EncryptReader::new(plaintext_reader, data_key.plaintext_key, data_key.nonce);
 
         let mut encrypted_data = Vec::new();
@@ -127,8 +130,8 @@ mod tests {
 
         println!("Encrypted {} bytes to {} bytes", plaintext.len(), encrypted_data.len());
 
-        // Decrypt (wrap with WarpReader)
-        let encrypted_reader = WarpReader::new(Cursor::new(encrypted_data));
+        // Decrypt.
+        let encrypted_reader = Cursor::new(encrypted_data);
         let mut decrypt_reader = DecryptReader::new(encrypted_reader, data_key.plaintext_key, data_key.nonce);
 
         let mut decrypted_data = Vec::new();
@@ -153,15 +156,16 @@ mod tests {
         let bucket = "test-bucket";
         let key = "test-key";
         let kms_key_id = "default";
+        let context = ObjectEncryptionContext::new(bucket.to_string(), key.to_string());
 
         // Generate two different keys (with different nonces)
         let (data_key1, _) = provider
-            .generate_sse_dek(bucket, key, kms_key_id)
+            .generate_sse_dek(&context, kms_key_id)
             .await
             .expect("Failed to generate DEK 1");
 
         let (data_key2, _) = provider
-            .generate_sse_dek(bucket, key, kms_key_id)
+            .generate_sse_dek(&context, kms_key_id)
             .await
             .expect("Failed to generate DEK 2");
 
@@ -171,14 +175,14 @@ mod tests {
         // Same plaintext
         let plaintext = b"Same plaintext";
 
-        // Encrypt with first key (wrap with WarpReader)
-        let reader1 = WarpReader::new(Cursor::new(plaintext.to_vec()));
+        // Encrypt with first key.
+        let reader1 = Cursor::new(plaintext.to_vec());
         let mut encrypt_reader1 = EncryptReader::new(reader1, data_key1.plaintext_key, data_key1.nonce);
         let mut encrypted1 = Vec::new();
         encrypt_reader1.read_to_end(&mut encrypted1).await.unwrap();
 
-        // Encrypt with second key (wrap with WarpReader)
-        let reader2 = WarpReader::new(Cursor::new(plaintext.to_vec()));
+        // Encrypt with second key.
+        let reader2 = Cursor::new(plaintext.to_vec());
         let mut encrypt_reader2 = EncryptReader::new(reader2, data_key2.plaintext_key, data_key2.nonce);
         let mut encrypted2 = Vec::new();
         encrypt_reader2.read_to_end(&mut encrypted2).await.unwrap();
@@ -201,10 +205,11 @@ mod tests {
         let bucket = "test-bucket";
         let key = "test-key";
         let kms_key_id = "default";
+        let context = ObjectEncryptionContext::new(bucket.to_string(), key.to_string());
 
         // Step 1: Generate DEK and get encrypted DEK
         let (data_key, encrypted_dek) = provider
-            .generate_sse_dek(bucket, key, kms_key_id)
+            .generate_sse_dek(&context, kms_key_id)
             .await
             .expect("Failed to generate DEK");
 
@@ -213,7 +218,7 @@ mod tests {
 
         // Step 2: Later, decrypt the DEK (simulating GET operation)
         let decrypted_plaintext_key = provider
-            .decrypt_sse_dek(&encrypted_dek, kms_key_id)
+            .decrypt_sse_dek(&encrypted_dek, kms_key_id, &context)
             .await
             .expect("Failed to decrypt DEK");
 
@@ -226,14 +231,14 @@ mod tests {
         // Step 4: Use decrypted key to encrypt/decrypt data
         let plaintext = b"Test data with decrypted DEK";
 
-        // Encrypt with original key (wrap with WarpReader)
-        let reader = WarpReader::new(Cursor::new(plaintext.to_vec()));
+        // Encrypt with original key.
+        let reader = Cursor::new(plaintext.to_vec());
         let mut encrypt_reader = EncryptReader::new(reader, original_plaintext_key, original_nonce);
         let mut encrypted_data = Vec::new();
         encrypt_reader.read_to_end(&mut encrypted_data).await.unwrap();
 
-        // Decrypt with recovered key (simulating GET operation) (wrap with WarpReader)
-        let reader = WarpReader::new(Cursor::new(encrypted_data));
+        // Decrypt with recovered key (simulating GET operation).
+        let reader = Cursor::new(encrypted_data);
         let mut decrypt_reader = DecryptReader::new(
             reader,
             decrypted_plaintext_key,

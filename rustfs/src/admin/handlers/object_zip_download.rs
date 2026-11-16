@@ -1,0 +1,1724 @@
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{ADMIN_OBJECT_ZIP_DOWNLOADS_PATH, AdminOperation, S3Router};
+use crate::admin::runtime_sources::{ServerContextSlot, current_action_credentials, current_object_store_handle, current_region};
+use crate::admin::storage_api::access::{ReqInfo, authorize_owned_request};
+use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
+use crate::admin::storage_api::contract::list::ListOperations as _;
+use crate::admin::storage_api::contract::object::{ObjectIO as _, ObjectOperations as _};
+use crate::admin::storage_api::object::StorageObjectOptions as ObjectOptions;
+use crate::app::{RequestEnvelope, RequestHead};
+use crate::auth::{check_key_valid, get_session_token};
+use crate::error::ApiError;
+use crate::license::license_check;
+use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use aes_gcm::{
+    Aes256Gcm, Key, Nonce,
+    aead::{Aead, KeyInit},
+};
+use async_zip::{Compression, ZipEntryBuilder, base::write::ZipFileWriter};
+use futures_lite::io::AsyncWriteExt;
+use http::header::CONTENT_TYPE;
+use http::{HeaderMap, HeaderValue, StatusCode, header};
+use hyper::{Method, Uri};
+use matchit::Params;
+use rand::RngExt;
+use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
+use rustfs_credentials::Credentials;
+use rustfs_policy::policy::action::{Action, S3Action};
+use rustfs_s3_types::{Body, S3Result, s3_error};
+use rustfs_trusted_proxies::{ClientInfo, ValidationMode};
+use rustfs_utils::{base64_decode_url_safe_no_pad, base64_encode_url_safe_no_pad};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::HashSet;
+use std::io;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio::fs::File;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio_util::io::ReaderStream;
+use url::form_urlencoded;
+use uuid::Uuid;
+
+const OBJECT_ZIP_DOWNLOAD_TOKEN_TTL: Duration = Duration::minutes(5);
+const ZIP_STREAM_BUFFER_SIZE: usize = 1024 * 1024;
+const ZIP_OBJECT_BUFFER_SIZE: usize = 128 * 1024;
+const ZIP_LIST_MAX_KEYS: i32 = 1000;
+
+pub fn register_object_zip_download_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    r.insert(
+        Method::POST,
+        format!("{ADMIN_PREFIX}{ADMIN_OBJECT_ZIP_DOWNLOADS_PATH}").as_str(),
+        AdminOperation(&CreateObjectZipDownloadHandler {}),
+    )?;
+    r.insert(
+        Method::GET,
+        format!("{ADMIN_PREFIX}{ADMIN_OBJECT_ZIP_DOWNLOADS_PATH}/{{id}}.zip").as_str(),
+        AdminOperation(&DownloadObjectZipHandler {}),
+    )?;
+
+    Ok(())
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateObjectZipDownloadRequest {
+    pub bucket: String,
+    #[serde(default)]
+    pub prefix: Option<String>,
+    #[serde(default)]
+    pub objects: Vec<String>,
+    #[serde(default)]
+    pub prefixes: Vec<String>,
+    #[serde(default)]
+    pub filename: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateObjectZipDownloadResponse {
+    pub download_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+}
+
+impl CreateObjectZipDownloadRequest {
+    fn validate(&self) -> S3Result<()> {
+        if self.bucket.trim().is_empty() {
+            return Err(s3_error!(InvalidRequest, "bucket must not be empty"));
+        }
+
+        if self.objects.iter().any(|object| object.is_empty()) {
+            return Err(s3_error!(InvalidRequest, "objects must not contain empty strings"));
+        }
+
+        if self.prefixes.iter().any(|prefix| prefix.is_empty()) {
+            return Err(s3_error!(InvalidRequest, "prefixes must not contain empty strings"));
+        }
+
+        let has_prefix = self.prefix.as_deref().is_some_and(|prefix| !prefix.is_empty());
+        if !has_prefix && self.objects.is_empty() && self.prefixes.is_empty() {
+            return Err(s3_error!(InvalidRequest, "at least one of prefix, objects, or prefixes is required"));
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ObjectZipDownloadToken {
+    id: String,
+    principal: String,
+    req_info: ReqInfo,
+    auth_context: ObjectZipDownloadAuthContext,
+    request: CreateObjectZipDownloadRequest,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ObjectZipDownloadAuthContext {
+    headers: HeaderMap,
+    remote_addr: Option<RemoteAddr>,
+    client_info: Option<ClientInfo>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ObjectZipDownloadTokenPayload {
+    id: String,
+    principal: String,
+    req_info: ObjectZipDownloadReqInfoSnapshot,
+    auth_context: ObjectZipDownloadAuthContextSnapshot,
+    request: CreateObjectZipDownloadRequest,
+    expires_at_unix: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ObjectZipDownloadReqInfoSnapshot {
+    cred: Option<rustfs_credentials::Credentials>,
+    is_owner: bool,
+    bucket: Option<String>,
+    object: Option<String>,
+    version_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ObjectZipDownloadAuthContextSnapshot {
+    headers: Vec<(String, String)>,
+    remote_addr: Option<SocketAddr>,
+    client_info: Option<ClientInfoSnapshot>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ClientInfoSnapshot {
+    real_ip: IpAddr,
+    forwarded_host: Option<String>,
+    forwarded_proto: Option<String>,
+    is_from_trusted_proxy: bool,
+    proxy_ip: Option<IpAddr>,
+    proxy_hops: usize,
+    validation_mode: ValidationMode,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug)]
+struct CreatedObjectZipDownloadToken {
+    id: String,
+    token: String,
+    expires_at: OffsetDateTime,
+}
+
+struct PreparedZipArchive {
+    file: File,
+}
+
+impl From<&ReqInfo> for ObjectZipDownloadReqInfoSnapshot {
+    fn from(req_info: &ReqInfo) -> Self {
+        let mut cred = req_info.cred.clone();
+        if let Some(cred) = cred.as_mut() {
+            cred.secret_key.clear();
+            cred.session_token.clear();
+        }
+
+        Self {
+            cred,
+            is_owner: req_info.is_owner,
+            bucket: req_info.bucket.clone(),
+            object: req_info.object.clone(),
+            version_id: req_info.version_id.clone(),
+        }
+    }
+}
+
+impl From<ObjectZipDownloadReqInfoSnapshot> for ReqInfo {
+    fn from(snapshot: ObjectZipDownloadReqInfoSnapshot) -> Self {
+        Self {
+            cred: snapshot.cred,
+            is_owner: snapshot.is_owner,
+            keystone_session_present: None,
+            bucket: snapshot.bucket,
+            object: snapshot.object,
+            version_id: snapshot.version_id,
+            replication_request_authorized: false,
+            region: current_region(),
+            request_context: None,
+            suppress_denial_log: false,
+            suppress_denial_audit: false,
+        }
+    }
+}
+
+impl From<&ObjectZipDownloadAuthContext> for ObjectZipDownloadAuthContextSnapshot {
+    fn from(context: &ObjectZipDownloadAuthContext) -> Self {
+        Self {
+            headers: context
+                .headers
+                .iter()
+                .filter_map(|(name, value)| {
+                    value
+                        .to_str()
+                        .ok()
+                        .map(|value| (name.as_str().to_string(), value.to_string()))
+                })
+                .collect(),
+            remote_addr: context.remote_addr.map(|addr| addr.0),
+            client_info: context.client_info.as_ref().map(ClientInfoSnapshot::from),
+        }
+    }
+}
+
+impl TryFrom<ObjectZipDownloadAuthContextSnapshot> for ObjectZipDownloadAuthContext {
+    type Error = rustfs_s3_types::S3Error;
+
+    fn try_from(snapshot: ObjectZipDownloadAuthContextSnapshot) -> S3Result<Self> {
+        let mut headers = HeaderMap::new();
+        for (name, value) in snapshot.headers {
+            let name = http::header::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| s3_error!(AccessDenied, "invalid or expired download token"))?;
+            let value =
+                HeaderValue::from_str(&value).map_err(|_| s3_error!(AccessDenied, "invalid or expired download token"))?;
+            headers.append(name, value);
+        }
+
+        Ok(Self {
+            headers,
+            remote_addr: snapshot.remote_addr.map(RemoteAddr),
+            client_info: snapshot.client_info.map(ClientInfo::from),
+        })
+    }
+}
+
+impl From<&ClientInfo> for ClientInfoSnapshot {
+    fn from(client_info: &ClientInfo) -> Self {
+        Self {
+            real_ip: client_info.real_ip,
+            forwarded_host: client_info.forwarded_host.clone(),
+            forwarded_proto: client_info.forwarded_proto.clone(),
+            is_from_trusted_proxy: client_info.is_from_trusted_proxy,
+            proxy_ip: client_info.proxy_ip,
+            proxy_hops: client_info.proxy_hops,
+            validation_mode: client_info.validation_mode,
+            warnings: client_info.warnings.clone(),
+        }
+    }
+}
+
+impl From<ClientInfoSnapshot> for ClientInfo {
+    fn from(snapshot: ClientInfoSnapshot) -> Self {
+        Self {
+            real_ip: snapshot.real_ip,
+            forwarded_host: snapshot.forwarded_host,
+            forwarded_proto: snapshot.forwarded_proto,
+            is_from_trusted_proxy: snapshot.is_from_trusted_proxy,
+            proxy_ip: snapshot.proxy_ip,
+            proxy_hops: snapshot.proxy_hops,
+            validation_mode: snapshot.validation_mode,
+            warnings: snapshot.warnings,
+        }
+    }
+}
+
+fn current_download_token_credentials() -> S3Result<Credentials> {
+    current_action_credentials().ok_or_else(|| s3_error!(InternalError, "global action credentials are not initialized"))
+}
+
+fn download_token_encryption_key(credentials: &Credentials) -> S3Result<[u8; 32]> {
+    if credentials.secret_key.is_empty() {
+        return Err(s3_error!(InternalError, "global action credentials are not initialized"));
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"rustfs-object-zip-download-token-v1");
+    hasher.update(credentials.secret_key.as_bytes());
+    Ok(hasher.finalize().into())
+}
+
+fn encode_download_token(payload: &ObjectZipDownloadTokenPayload, credentials: &Credentials) -> S3Result<String> {
+    let payload_json =
+        serde_json::to_vec(payload).map_err(|e| s3_error!(InternalError, "failed to serialize download token: {}", e))?;
+    let key = download_token_encryption_key(credentials)?;
+    let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from(key));
+    let mut nonce_bytes = [0_u8; 12];
+    rand::rng().fill(&mut nonce_bytes);
+    let nonce = Nonce::from(nonce_bytes);
+    let ciphertext = cipher
+        .encrypt(&nonce, payload_json.as_slice())
+        .map_err(|_| s3_error!(InternalError, "failed to encrypt download token"))?;
+    Ok(format!(
+        "{}.{}",
+        base64_encode_url_safe_no_pad(&nonce_bytes),
+        base64_encode_url_safe_no_pad(&ciphertext)
+    ))
+}
+
+fn decode_download_token(token: &str, credentials: &Credentials) -> S3Result<ObjectZipDownloadTokenPayload> {
+    let Some((nonce_part, ciphertext_part)) = token.split_once('.') else {
+        return Err(s3_error!(AccessDenied, "invalid or expired download token"));
+    };
+    if ciphertext_part.contains('.') {
+        return Err(s3_error!(AccessDenied, "invalid or expired download token"));
+    }
+
+    let nonce = base64_decode_url_safe_no_pad(nonce_part.as_bytes())
+        .map_err(|_| s3_error!(AccessDenied, "invalid or expired download token"))?;
+    let ciphertext = base64_decode_url_safe_no_pad(ciphertext_part.as_bytes())
+        .map_err(|_| s3_error!(AccessDenied, "invalid or expired download token"))?;
+    let nonce: [u8; 12] = nonce
+        .as_slice()
+        .try_into()
+        .map_err(|_| s3_error!(AccessDenied, "invalid or expired download token"))?;
+    let key = download_token_encryption_key(credentials)?;
+    let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from(key));
+    let payload = cipher
+        .decrypt(&Nonce::from(nonce), ciphertext.as_slice())
+        .map_err(|_| s3_error!(AccessDenied, "invalid or expired download token"))?;
+
+    serde_json::from_slice(&payload).map_err(|_| s3_error!(AccessDenied, "invalid or expired download token"))
+}
+
+fn create_download_token(
+    principal: String,
+    req_info: ReqInfo,
+    auth_context: ObjectZipDownloadAuthContext,
+    request: CreateObjectZipDownloadRequest,
+    now: OffsetDateTime,
+    credentials: &Credentials,
+) -> S3Result<CreatedObjectZipDownloadToken> {
+    let id = Uuid::new_v4().to_string();
+    let expires_at = now + OBJECT_ZIP_DOWNLOAD_TOKEN_TTL;
+    let payload = ObjectZipDownloadTokenPayload {
+        id: id.clone(),
+        principal,
+        req_info: ObjectZipDownloadReqInfoSnapshot::from(&req_info),
+        auth_context: ObjectZipDownloadAuthContextSnapshot::from(&auth_context),
+        request,
+        expires_at_unix: expires_at.unix_timestamp(),
+    };
+    let token = encode_download_token(&payload, credentials)?;
+
+    Ok(CreatedObjectZipDownloadToken { id, token, expires_at })
+}
+
+fn validate_download_token(
+    id: &str,
+    token: &str,
+    now: OffsetDateTime,
+    credentials: &Credentials,
+) -> S3Result<ObjectZipDownloadToken> {
+    let payload = decode_download_token(token, credentials)?;
+    if payload.id != id {
+        return Err(s3_error!(AccessDenied, "invalid or expired download token"));
+    }
+    let expires_at = OffsetDateTime::from_unix_timestamp(payload.expires_at_unix)
+        .map_err(|_| s3_error!(AccessDenied, "invalid or expired download token"))?;
+    if expires_at <= now {
+        return Err(s3_error!(AccessDenied, "invalid or expired download token"));
+    }
+
+    Ok(ObjectZipDownloadToken {
+        id: payload.id,
+        principal: payload.principal,
+        req_info: payload.req_info.into(),
+        auth_context: payload.auth_context.try_into()?,
+        request: payload.request,
+    })
+}
+
+fn format_expires_at(value: OffsetDateTime) -> S3Result<String> {
+    value
+        .format(&Rfc3339)
+        .map_err(|e| s3_error!(InternalError, "failed to format token expiration: {}", e))
+}
+
+fn build_download_url(id: &str, token: &str) -> String {
+    format!("{ADMIN_PREFIX}{ADMIN_OBJECT_ZIP_DOWNLOADS_PATH}/{id}.zip?token={token}")
+}
+
+async fn authenticate_object_zip_download_request(req: &mut AdminRequest) -> S3Result<()> {
+    let Some(input_cred) = req.credentials() else {
+        return Err(s3_error!(InvalidRequest, "authentication required"));
+    };
+
+    let (cred, owner) =
+        check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), input_cred.access_key()).await?;
+
+    let request_context = req.request_context().cloned();
+    req.install_req_info(ReqInfo {
+        cred: Some(cred),
+        is_owner: owner,
+        region: current_region(),
+        request_context,
+        ..Default::default()
+    });
+
+    license_check().map_err(|er| match er.kind() {
+        std::io::ErrorKind::PermissionDenied => s3_error!(AccessDenied, "{er}"),
+        _ => {
+            tracing::error!("license check failed due to unexpected error: {er}");
+            s3_error!(InternalError, "License validation failed")
+        }
+    })?;
+
+    Ok(())
+}
+
+fn authenticated_zip_download_principal(req: &AdminRequest) -> S3Result<String> {
+    let req_info = req
+        .req_info()
+        .ok_or_else(|| s3_error!(AccessDenied, "authentication required"))?;
+    let credentials = req_info
+        .cred
+        .clone()
+        .ok_or_else(|| s3_error!(AccessDenied, "authentication required"))?;
+
+    Ok(credentials.access_key)
+}
+
+fn authenticated_zip_download_req_info(req: &AdminRequest) -> S3Result<ReqInfo> {
+    let mut req_info = req
+        .req_info()
+        .cloned()
+        .ok_or_else(|| s3_error!(AccessDenied, "authentication required"))?;
+    if let Some(cred) = req_info.cred.as_mut() {
+        cred.secret_key.clear();
+        cred.session_token.clear();
+    }
+    Ok(req_info)
+}
+
+fn authenticated_zip_download_auth_context(req: &AdminRequest) -> ObjectZipDownloadAuthContext {
+    ObjectZipDownloadAuthContext {
+        headers: req.headers().clone(),
+        remote_addr: req.remote_addr().map(RemoteAddr),
+        client_info: req.client_info().cloned(),
+    }
+}
+
+async fn authorize_object_zip_download_scope(req: &mut AdminRequest, request: &CreateObjectZipDownloadRequest) -> S3Result<()> {
+    for prefix in listing_prefixes(request) {
+        authorize_object_zip_download_list_prefix(req, &request.bucket, prefix).await?;
+    }
+
+    for object in &request.objects {
+        authorize_object_zip_download_s3_action(req, &request.bucket, Some(object), S3Action::GetObjectAction).await?;
+    }
+
+    Ok(())
+}
+
+async fn authorize_object_zip_download_list_prefix(req: &mut AdminRequest, bucket: &str, prefix: &str) -> S3Result<()> {
+    let original_uri = req.uri().clone();
+    *req.envelope_mut().uri_mut() = uri_with_prefix_query(&original_uri, prefix)?;
+    let result = authorize_object_zip_download_s3_action(req, bucket, None, S3Action::ListBucketAction).await;
+    *req.envelope_mut().uri_mut() = original_uri;
+    result
+}
+
+async fn authorize_object_zip_download_s3_action(
+    req: &mut AdminRequest,
+    bucket: &str,
+    object: Option<&str>,
+    action: S3Action,
+) -> S3Result<()> {
+    if let Some(req_info) = req.req_info_mut() {
+        req_info.bucket = Some(bucket.to_string());
+        req_info.object = object.map(str::to_string);
+        req_info.version_id = None;
+    }
+
+    let mut extensions = http::Extensions::new();
+    extensions.insert(req.remote_addr().map(RemoteAddr));
+    if let Some(client_info) = req.client_info() {
+        extensions.insert(client_info.clone());
+    }
+    if let Some(server_context) = req.envelope().server_context() {
+        extensions.insert(server_context.clone());
+    }
+    if let Some(req_info) = req.req_info() {
+        extensions.insert(req_info.clone());
+    }
+    let mut authorization = RequestEnvelope::from_parts(
+        RequestHead {
+            method: req.method().clone(),
+            uri: req.uri().clone(),
+            headers: req.headers().clone(),
+            credentials: None,
+            region: None,
+            service: None,
+        },
+        extensions,
+    );
+    authorize_owned_request(&mut authorization, Action::S3Action(action), None).await
+}
+
+/// Builds the owned authorization request used when a download token is redeemed.
+fn token_authorization_request(
+    method: Method,
+    uri: Uri,
+    auth_context: &ObjectZipDownloadAuthContext,
+    server_context: Option<Arc<ServerContextSlot>>,
+    req_info: Option<ReqInfo>,
+) -> RequestEnvelope {
+    let mut extensions = http::Extensions::new();
+    extensions.insert(auth_context.remote_addr);
+    if let Some(client_info) = auth_context.client_info.clone() {
+        extensions.insert(client_info);
+    }
+    if let Some(server_context) = server_context {
+        extensions.insert(server_context);
+    }
+    if let Some(req_info) = req_info {
+        extensions.insert(req_info);
+    }
+    RequestEnvelope::from_parts(
+        RequestHead {
+            method,
+            uri,
+            headers: auth_context.headers.clone(),
+            credentials: None,
+            region: None,
+            service: None,
+        },
+        extensions,
+    )
+}
+
+fn uri_with_prefix_query(uri: &Uri, prefix: &str) -> S3Result<Uri> {
+    let existing_pairs: Vec<(String, String)> = uri
+        .query()
+        .map(|query| {
+            form_urlencoded::parse(query.as_bytes())
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut query = form_urlencoded::Serializer::new(String::new());
+    for (key, value) in existing_pairs {
+        if key != "prefix" {
+            query.append_pair(&key, &value);
+        }
+    }
+    query.append_pair("prefix", prefix);
+    let path_and_query = format!("{}?{}", uri.path(), query.finish());
+    let mut parts = uri.clone().into_parts();
+    parts.path_and_query = Some(
+        path_and_query
+            .parse()
+            .map_err(|e| s3_error!(InvalidRequest, "invalid prefix authorization URI: {}", e))?,
+    );
+    Uri::from_parts(parts).map_err(|e| s3_error!(InvalidRequest, "invalid prefix authorization URI: {}", e))
+}
+
+fn build_json_response(status: StatusCode, body: &impl Serialize, request_id: Option<&HeaderValue>) -> S3Result<AdminResponse> {
+    let data = serde_json::to_vec(body).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
+    let mut header = HeaderMap::new();
+    header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    if let Some(value) = request_id {
+        header.insert("x-request-id", value.clone());
+    }
+    Ok(AdminResponse::with_headers(status, Body::from(data), header))
+}
+
+fn query_value_exact(uri: &Uri, key: &str) -> Option<String> {
+    uri.query().and_then(|query| {
+        form_urlencoded::parse(query.as_bytes())
+            .find_map(|(name, value)| if name == key { Some(value.into_owned()) } else { None })
+    })
+}
+
+pub struct CreateObjectZipDownloadHandler {}
+
+#[async_trait::async_trait]
+impl Operation for CreateObjectZipDownloadHandler {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        authenticate_object_zip_download_request(&mut req).await?;
+
+        let body = req
+            .take_body()
+            .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
+            .await
+            .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
+        let request: CreateObjectZipDownloadRequest =
+            serde_json::from_slice(&body).map_err(|e| s3_error!(InvalidRequest, "invalid JSON: {}", e))?;
+        request.validate()?;
+        authorize_object_zip_download_scope(&mut req, &request).await?;
+        let principal = authenticated_zip_download_principal(&req)?;
+        let req_info = authenticated_zip_download_req_info(&req)?;
+        let auth_context = authenticated_zip_download_auth_context(&req);
+        let credentials = current_download_token_credentials()?;
+        let created = create_download_token(principal, req_info, auth_context, request, OffsetDateTime::now_utc(), &credentials)?;
+
+        build_json_response(
+            StatusCode::OK,
+            &CreateObjectZipDownloadResponse {
+                download_url: build_download_url(&created.id, &created.token),
+                expires_at: Some(format_expires_at(created.expires_at)?),
+            },
+            req.headers().get("x-request-id"),
+        )
+    }
+}
+
+pub struct DownloadObjectZipHandler {}
+
+#[async_trait::async_trait]
+impl Operation for DownloadObjectZipHandler {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let id = params.get("id").unwrap_or("");
+        let token = query_value_exact(req.uri(), "token").unwrap_or_default();
+        if id.is_empty() || token.is_empty() {
+            return Err(s3_error!(AccessDenied, "invalid or expired download token"));
+        }
+
+        let credentials = current_download_token_credentials()?;
+        let record = validate_download_token(id, &token, OffsetDateTime::now_utc(), &credentials)?;
+        let _token_id = &record.id;
+        let _principal = &record.principal;
+        let prepared = prepare_zip_download_archive(&record).await?;
+        let body = build_zip_stream_body(prepared);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/zip"));
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        headers.insert(
+            header::CONTENT_DISPOSITION,
+            HeaderValue::from_str(&format!(
+                "attachment; filename=\"{}\"",
+                sanitize_content_disposition_filename(record.request.filename.as_deref().unwrap_or("download.zip"))
+            ))
+            .map_err(|e| s3_error!(InternalError, "invalid download filename: {}", e))?,
+        );
+
+        Ok(AdminResponse::with_headers(StatusCode::OK, body, headers))
+    }
+}
+
+fn sanitize_content_disposition_filename(filename: &str) -> String {
+    let cleaned = filename
+        .chars()
+        .map(|ch| match ch {
+            '"' | '\\' | '\r' | '\n' => '_',
+            ch if ch.is_control() => '_',
+            ch => ch,
+        })
+        .collect::<String>();
+    if cleaned.trim().is_empty() {
+        "download.zip".to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn zip_entry_name(base_prefix: Option<&str>, key: &str) -> S3Result<String> {
+    let relative = base_prefix
+        .filter(|base| !base.is_empty() && key.starts_with(*base))
+        .map(|base| &key[base.len()..])
+        .unwrap_or(key);
+    let entry_name = relative.trim_start_matches('/').to_string();
+    validate_zip_entry_name(&entry_name)?;
+    Ok(entry_name)
+}
+
+fn validate_zip_entry_name(entry_name: &str) -> S3Result<()> {
+    if entry_name.is_empty() {
+        return Err(s3_error!(InvalidRequest, "zip entry name must not be empty"));
+    }
+    if entry_name.starts_with('/') || entry_name.contains('\\') || entry_name.split('/').any(|part| part == "..") {
+        return Err(s3_error!(InvalidRequest, "zip entry name must be relative"));
+    }
+    Ok(())
+}
+
+async fn preflight_zip_items(request: &CreateObjectZipDownloadRequest, items: &[ZipDownloadItem]) -> S3Result<()> {
+    let store = current_object_store_handle().ok_or_else(|| s3_error!(InternalError, "object store not initialized"))?;
+    for item in items {
+        store
+            .get_object_info(&request.bucket, &item.key, &ObjectOptions::default())
+            .await
+            .map_err(storage_error_to_s3)?;
+    }
+    Ok(())
+}
+
+fn storage_error_to_s3(err: crate::admin::storage_api::error::Error) -> rustfs_s3_types::S3Error {
+    ApiError::from(err).into()
+}
+
+async fn validate_zip_download_request(record: &ObjectZipDownloadToken) -> S3Result<()> {
+    let store = current_object_store_handle().ok_or_else(|| s3_error!(InternalError, "object store not initialized"))?;
+    store
+        .get_bucket_info(&record.request.bucket, &BucketOptions::default())
+        .await
+        .map_err(storage_error_to_s3)?;
+
+    validate_zip_download_items(record, &collect_explicit_zip_items(&record.request)?).await?;
+    Ok(())
+}
+
+async fn validate_zip_download_items(record: &ObjectZipDownloadToken, items: &[ZipDownloadItem]) -> S3Result<()> {
+    authorize_zip_items_for_download(record, items).await?;
+    preflight_zip_items(&record.request, items).await
+}
+
+fn listing_prefixes(request: &CreateObjectZipDownloadRequest) -> Vec<&str> {
+    if request.objects.is_empty()
+        && request.prefixes.is_empty()
+        && let Some(prefix) = request.prefix.as_deref().filter(|prefix| !prefix.is_empty())
+    {
+        return vec![prefix];
+    }
+
+    request.prefixes.iter().map(String::as_str).collect()
+}
+
+async fn authorize_zip_items_for_download(record: &ObjectZipDownloadToken, items: &[ZipDownloadItem]) -> S3Result<()> {
+    for item in items {
+        let mut req_info = record.req_info.clone();
+        req_info.bucket = Some(record.request.bucket.clone());
+        req_info.object = Some(item.key.clone());
+        req_info.version_id = None;
+        let mut req = token_authorization_request(
+            Method::GET,
+            format!("{ADMIN_PREFIX}{ADMIN_OBJECT_ZIP_DOWNLOADS_PATH}/{}.zip", record.id)
+                .parse()
+                .map_err(|e| s3_error!(InternalError, "failed to build download authorization URI: {}", e))?,
+            &record.auth_context,
+            None,
+            Some(req_info),
+        );
+        authorize_owned_request(&mut req, Action::S3Action(S3Action::GetObjectAction), None).await?;
+    }
+    Ok(())
+}
+
+fn collect_explicit_zip_items(request: &CreateObjectZipDownloadRequest) -> S3Result<Vec<ZipDownloadItem>> {
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+    for key in &request.objects {
+        push_zip_item(request, &mut seen, &mut items, key.clone())?;
+    }
+    Ok(items)
+}
+
+fn push_zip_item(
+    request: &CreateObjectZipDownloadRequest,
+    seen: &mut HashSet<String>,
+    items: &mut Vec<ZipDownloadItem>,
+    key: String,
+) -> S3Result<()> {
+    if seen.insert(key.clone()) {
+        items.push(ZipDownloadItem {
+            entry_name: zip_entry_name(request.prefix.as_deref(), &key)?,
+            key,
+        });
+    }
+    Ok(())
+}
+
+fn explicit_zip_item_keys(items: &[ZipDownloadItem]) -> HashSet<String> {
+    items.iter().map(|item| item.key.clone()).collect()
+}
+
+fn normalized_listing_prefixes(request: &CreateObjectZipDownloadRequest) -> Vec<String> {
+    let mut prefixes: Vec<String> = listing_prefixes(request).into_iter().map(str::to_string).collect();
+    prefixes.sort();
+    prefixes.dedup();
+
+    let mut normalized = Vec::new();
+    for prefix in prefixes {
+        if normalized.iter().any(|existing: &String| prefix.starts_with(existing)) {
+            continue;
+        }
+        normalized.push(prefix);
+    }
+    normalized
+}
+
+fn build_zip_stream_body(prepared: PreparedZipArchive) -> Body {
+    let stream = ReaderStream::with_capacity(prepared.file, ZIP_STREAM_BUFFER_SIZE);
+    Body::from_stream(stream)
+}
+
+async fn prepare_zip_download_archive(record: &ObjectZipDownloadToken) -> S3Result<PreparedZipArchive> {
+    validate_zip_download_request(record).await?;
+
+    let temp_file = tempfile::tempfile().map_err(|err| s3_error!(InternalError, "failed to create ZIP temp file: {}", err))?;
+    let std_file = temp_file;
+    let mut file = File::from_std(std_file);
+
+    generate_zip_archive(record, &mut file)
+        .await
+        .map_err(|err| s3_error!(InternalError, "failed to prepare ZIP download: {}", err))?;
+    file.seek(std::io::SeekFrom::Start(0))
+        .await
+        .map_err(|err| s3_error!(InternalError, "failed to rewind ZIP temp file: {}", err))?;
+
+    Ok(PreparedZipArchive { file })
+}
+
+async fn generate_zip_archive(record: &ObjectZipDownloadToken, file: &mut File) -> io::Result<()> {
+    let mut zip = ZipFileWriter::with_tokio(file).force_zip64();
+    let store = current_object_store_handle().ok_or_else(|| io::Error::other("object store not initialized"))?;
+
+    let explicit_items = collect_explicit_zip_items(&record.request)
+        .map_err(|err| io::Error::other(format!("failed to prepare explicit ZIP items: {err}")))?;
+    let explicit_keys = explicit_zip_item_keys(&explicit_items);
+    write_zip_items(&mut zip, &record.request.bucket, &explicit_items).await?;
+
+    for prefix in normalized_listing_prefixes(&record.request) {
+        let mut continuation_token = None;
+        loop {
+            let listed = store
+                .clone()
+                .list_objects_v2(
+                    &record.request.bucket,
+                    prefix.as_str(),
+                    continuation_token.clone(),
+                    None,
+                    ZIP_LIST_MAX_KEYS,
+                    false,
+                    None,
+                    false,
+                )
+                .await
+                .map_err(|err| io::Error::other(format!("failed to list prefix `{prefix}` for ZIP stream: {err}")))?;
+
+            let mut page_items = Vec::new();
+            for object in listed.objects {
+                if object.name == prefix && object.size == 0 {
+                    continue;
+                }
+                if explicit_keys.contains(&object.name) {
+                    continue;
+                }
+                page_items.push(ZipDownloadItem {
+                    entry_name: zip_entry_name(record.request.prefix.as_deref(), &object.name)
+                        .map_err(|err| io::Error::other(format!("failed to prepare ZIP entry name: {err}")))?,
+                    key: object.name,
+                });
+            }
+            validate_zip_download_items(record, &page_items)
+                .await
+                .map_err(|err| io::Error::other(format!("failed to validate ZIP page for prefix `{prefix}`: {err}")))?;
+            write_zip_items(&mut zip, &record.request.bucket, &page_items).await?;
+
+            if !listed.is_truncated {
+                break;
+            }
+            continuation_token = listed.next_continuation_token;
+            if continuation_token.is_none() {
+                break;
+            }
+        }
+    }
+
+    zip.close()
+        .await
+        .map(|_| ())
+        .map_err(|err| io::Error::other(format!("failed to finish ZIP archive: {err}")))
+}
+
+async fn write_zip_items<W>(
+    zip: &mut async_zip::tokio::write::ZipFileWriter<W>,
+    bucket: &str,
+    items: &[ZipDownloadItem],
+) -> io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    for item in items {
+        write_zip_item(zip, bucket, item).await.map_err(|err| {
+            io::Error::other(format!(
+                "failed to write bucket `{}` object `{}` into ZIP entry `{}`: {}",
+                bucket, item.key, item.entry_name, err
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+async fn write_zip_item<W>(
+    zip: &mut async_zip::tokio::write::ZipFileWriter<W>,
+    bucket: &str,
+    item: &ZipDownloadItem,
+) -> io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let store = current_object_store_handle().ok_or_else(|| io::Error::other("object store not initialized"))?;
+    let mut reader = store
+        .get_object_reader(bucket, &item.key, None, HeaderMap::new(), &ObjectOptions::default())
+        .await
+        .map_err(|err| io::Error::other(format!("failed to open object reader: {err}")))?;
+    let entry = ZipEntryBuilder::new(item.entry_name.clone().into(), Compression::Stored);
+    let mut entry_writer = zip
+        .write_entry_stream(entry)
+        .await
+        .map_err(|err| io::Error::other(format!("failed to start ZIP entry: {err}")))?;
+
+    let mut buffer = vec![0_u8; ZIP_OBJECT_BUFFER_SIZE];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        entry_writer.write_all(&buffer[..read]).await?;
+    }
+    entry_writer
+        .close()
+        .await
+        .map_err(|err| io::Error::other(format!("failed to close ZIP entry: {err}")))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ZipDownloadItem {
+    key: String,
+    entry_name: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustfs_s3_types::S3ErrorCode;
+
+    #[tokio::test]
+    async fn zip_scope_authorizes_real_iam_and_restores_prefix_query() {
+        use crate::admin::operation::test_support::TestRequest;
+        use crate::admin::runtime_sources::{AppContext, IamInterface, KmsInterface};
+        use crate::storage::storage_api::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+        use rustfs_iam::store::{Store as _, UserType};
+        use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
+        use rustfs_policy::policy::Policy;
+
+        struct ReadyIam(Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>>);
+        impl IamInterface for ReadyIam {
+            fn handle(&self) -> Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>> {
+                Arc::clone(&self.0)
+            }
+            fn is_ready(&self) -> bool {
+                true
+            }
+        }
+        struct TestKms;
+        impl KmsInterface for TestKms {
+            fn handle(&self) -> Arc<rustfs_kms::KmsServiceManager> {
+                Arc::new(rustfs_kms::KmsServiceManager::new())
+            }
+        }
+
+        let (_temp_dir, _disk_paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+        store
+            .make_bucket("photos", &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        rustfs_iam::store::object::ObjectStore::new(Arc::clone(&store))
+            .save_iam_config(
+                serde_json::json!({"version": 1}),
+                format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+            )
+            .await
+            .expect("seed IAM format");
+        let iam = rustfs_iam::build_iam_sys(Arc::clone(&store)).await.expect("initialize IAM");
+        let access_key = "zip-scope-user";
+        iam.create_user(
+            access_key,
+            &AddOrUpdateUserReq {
+                secret_key: "zip-scope-secret-key".to_owned(),
+                policy: None,
+                status: AccountStatus::Enabled,
+            },
+        )
+        .await
+        .expect("create user");
+        iam.set_policy(
+            "zip-scope-policy",
+            Policy::parse_config(br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::photos","Condition":{"StringEquals":{"s3:prefix":"allowed/"}}},{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::photos/allowed/*"}]}"#)
+                .expect("parse policy"),
+        )
+        .await
+        .expect("store policy");
+        iam.policy_db_set(access_key, UserType::Reg, false, "zip-scope-policy")
+            .await
+            .expect("attach policy");
+        let credentials = iam.get_user(access_key).await.expect("load user").credentials;
+        let context = Arc::new(AppContext::new(store, Arc::new(ReadyIam(iam)), Arc::new(TestKms)));
+        let slot = ServerContextSlot::new();
+        assert!(slot.install(context));
+        let original_uri = "/rustfs/admin/v3/object-zip-downloads?prefix=old&marker=1";
+        let mut request = TestRequest::new(Method::POST, original_uri)
+            .extension(slot)
+            .extension(ReqInfo {
+                cred: Some(credentials),
+                ..Default::default()
+            })
+            .build();
+
+        let mut selection = valid_request();
+        selection.prefix = None;
+        selection.prefixes = vec!["allowed/".to_owned()];
+        selection.objects = vec!["allowed/file".to_owned()];
+        authorize_object_zip_download_scope(&mut request, &selection)
+            .await
+            .expect("allowed prefix and object");
+        assert_eq!(request.uri().to_string(), original_uri);
+
+        selection.prefixes = vec!["denied/".to_owned()];
+        let err = authorize_object_zip_download_scope(&mut request, &selection)
+            .await
+            .expect_err("another prefix is denied");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(request.uri().to_string(), original_uri);
+
+        selection.prefixes = vec!["allowed/".to_owned()];
+        selection.objects = vec!["denied/file".to_owned()];
+        let err = authorize_object_zip_download_scope(&mut request, &selection)
+            .await
+            .expect_err("another object is denied");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(request.uri().to_string(), original_uri);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn token_redemption_authorizes_each_item_through_real_iam() {
+        crate::app::gating_test_env::run_large_stack_test("zip-token-redemption", || async {
+            use crate::admin::runtime_sources::{AppContext, IamInterface, KmsInterface, publish_test_app_context};
+            use crate::storage::storage_api::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+            use rustfs_iam::store::{Store as _, UserType};
+            use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
+            use rustfs_policy::policy::Policy;
+
+            struct ReadyIam(Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>>);
+            impl IamInterface for ReadyIam {
+                fn handle(&self) -> Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>> {
+                    Arc::clone(&self.0)
+                }
+                fn is_ready(&self) -> bool {
+                    true
+                }
+            }
+            struct TestKms;
+            impl KmsInterface for TestKms {
+                fn handle(&self) -> Arc<rustfs_kms::KmsServiceManager> {
+                    Arc::new(rustfs_kms::KmsServiceManager::new())
+                }
+            }
+
+            let previous = crate::runtime_sources::current_app_context();
+            let (_temp_dir, _disk_paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+            store
+                .make_bucket("photos", &MakeBucketOptions::default())
+                .await
+                .expect("create bucket");
+            rustfs_iam::store::object::ObjectStore::new(Arc::clone(&store))
+                .save_iam_config(
+                    serde_json::json!({"version": 1}),
+                    format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+                )
+                .await
+                .expect("seed IAM format");
+            let iam = rustfs_iam::build_iam_sys(Arc::clone(&store)).await.expect("initialize IAM");
+            let access_key = "zip-redeem-user";
+            iam.create_user(
+                access_key,
+                &AddOrUpdateUserReq {
+                    secret_key: "zip-redeem-secret-key".to_owned(),
+                    policy: None,
+                    status: AccountStatus::Enabled,
+                },
+            )
+            .await
+            .expect("create user");
+            iam.set_policy(
+                "zip-redeem-policy",
+                Policy::parse_config(
+                    br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::photos/allowed/*"}]}"#,
+                )
+                .expect("parse policy"),
+            )
+            .await
+            .expect("store policy");
+            iam.policy_db_set(access_key, UserType::Reg, false, "zip-redeem-policy")
+                .await
+                .expect("attach policy");
+            let credentials = iam.get_user(access_key).await.expect("load user").credentials;
+            // Redemption carries no server context slot, so it resolves the ambient context.
+            publish_test_app_context(Arc::new(AppContext::new(store, Arc::new(ReadyIam(iam)), Arc::new(TestKms))));
+
+            let record = zip_redemption_record(access_key, credentials, test_auth_context());
+
+            authorize_zip_items_for_download(&record, &[zip_item("allowed/one"), zip_item("allowed/two")])
+                .await
+                .expect("every saved item is readable by the token principal");
+            let err = authorize_zip_items_for_download(&record, &[zip_item("allowed/one"), zip_item("denied/one")])
+                .await
+                .expect_err("one unreadable item denies the download");
+            assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+            let err = authorize_zip_items_for_download(&record, &[zip_item("denied/one")])
+                .await
+                .expect_err("an unreadable item is denied");
+            assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+
+            if let Some(previous) = previous {
+                publish_test_app_context(previous);
+            }
+        });
+    }
+
+    /// A saved copy-source header is a body-derived policy input the token cannot supply,
+    /// so redemption fails closed before any policy is evaluated.
+    #[tokio::test]
+    async fn token_redemption_denies_saved_copy_source_header() {
+        let mut auth_context = test_auth_context();
+        auth_context
+            .headers
+            .insert("x-amz-copy-source", HeaderValue::from_static("/photos/allowed/one"));
+        let record = zip_redemption_record("zip-redeem-user", rustfs_credentials::Credentials::default(), auth_context);
+        let err = authorize_zip_items_for_download(&record, &[zip_item("allowed/one")])
+            .await
+            .expect_err("an unresolved copy-source input fails closed");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(err.message(), Some("request body policy input is missing for this action"));
+    }
+
+    fn zip_redemption_record(
+        access_key: &str,
+        credentials: rustfs_credentials::Credentials,
+        auth_context: ObjectZipDownloadAuthContext,
+    ) -> ObjectZipDownloadToken {
+        ObjectZipDownloadToken {
+            id: "zip-redeem-token".to_owned(),
+            principal: access_key.to_owned(),
+            req_info: ReqInfo {
+                cred: Some(credentials),
+                ..Default::default()
+            },
+            auth_context,
+            request: CreateObjectZipDownloadRequest {
+                bucket: "photos".to_owned(),
+                prefix: None,
+                objects: Vec::new(),
+                prefixes: Vec::new(),
+                filename: None,
+            },
+        }
+    }
+
+    fn zip_item(key: &str) -> ZipDownloadItem {
+        ZipDownloadItem {
+            key: key.to_owned(),
+            entry_name: key.to_owned(),
+        }
+    }
+
+    fn valid_request() -> CreateObjectZipDownloadRequest {
+        CreateObjectZipDownloadRequest {
+            bucket: "photos".to_string(),
+            prefix: Some("2026/".to_string()),
+            objects: Vec::new(),
+            prefixes: Vec::new(),
+            filename: None,
+        }
+    }
+
+    fn assert_invalid_request(request: CreateObjectZipDownloadRequest, expected_message: &str) {
+        let err = request.validate().expect_err("request should be invalid");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some(expected_message));
+    }
+
+    #[test]
+    fn validation_accepts_prefix_objects_or_prefixes() {
+        valid_request().validate().expect("prefix selection should be valid");
+
+        let mut object_request = valid_request();
+        object_request.prefix = None;
+        object_request.objects = vec!["a.txt".to_string()];
+        object_request.validate().expect("object selection should be valid");
+
+        let mut prefix_request = valid_request();
+        prefix_request.prefix = None;
+        prefix_request.prefixes = vec!["folder/".to_string()];
+        prefix_request.validate().expect("prefixes selection should be valid");
+    }
+
+    #[test]
+    fn validation_rejects_empty_bucket() {
+        let mut request = valid_request();
+        request.bucket = "   ".to_string();
+
+        assert_invalid_request(request, "bucket must not be empty");
+    }
+
+    #[test]
+    fn validation_rejects_empty_selection() {
+        let mut request = valid_request();
+        request.prefix = None;
+
+        assert_invalid_request(request, "at least one of prefix, objects, or prefixes is required");
+    }
+
+    #[test]
+    fn validation_rejects_empty_objects_and_prefixes() {
+        let mut object_request = valid_request();
+        object_request.objects = vec!["".to_string()];
+        assert_invalid_request(object_request, "objects must not contain empty strings");
+
+        let mut prefix_request = valid_request();
+        prefix_request.prefixes = vec!["".to_string()];
+        assert_invalid_request(prefix_request, "prefixes must not contain empty strings");
+    }
+
+    #[test]
+    fn request_deserialization_defaults_optional_collections() {
+        let request: CreateObjectZipDownloadRequest =
+            serde_json::from_str(r#"{"bucket":"photos","prefix":"2026/"}"#).expect("request should deserialize");
+
+        assert_eq!(request.bucket, "photos");
+        assert_eq!(request.prefix.as_deref(), Some("2026/"));
+        assert!(request.objects.is_empty());
+        assert!(request.prefixes.is_empty());
+        assert_eq!(request.filename, None);
+    }
+
+    #[test]
+    fn request_deserialization_denies_unknown_fields() {
+        let err =
+            serde_json::from_str::<CreateObjectZipDownloadRequest>(r#"{"bucket":"photos","prefix":"2026/","unexpected":true}"#)
+                .expect_err("unknown fields should be rejected");
+
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn response_serialization_skips_absent_expires_at() {
+        let response = CreateObjectZipDownloadResponse {
+            download_url: "/rustfs/admin/v3/object-zip-downloads/id.zip?token=token".to_string(),
+            expires_at: None,
+        };
+
+        let json = serde_json::to_value(response).expect("response should serialize");
+        assert_eq!(json["download_url"], "/rustfs/admin/v3/object-zip-downloads/id.zip?token=token");
+        assert!(json.get("expires_at").is_none());
+    }
+
+    #[test]
+    fn create_download_token_returns_browser_download_url_parts() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let created = create_test_download_token(now);
+
+        assert!(!created.id.is_empty());
+        assert!(!created.token.is_empty());
+        assert_eq!(created.expires_at, now + OBJECT_ZIP_DOWNLOAD_TOKEN_TTL);
+        let download_url = build_download_url(&created.id, &created.token);
+        assert!(download_url.starts_with("/rustfs/admin/v3/object-zip-downloads/"));
+        assert!(download_url.ends_with(&format!(".zip?token={}", created.token)));
+    }
+
+    #[test]
+    fn validate_download_token_rejects_unknown_token() {
+        let credentials = test_signing_credentials();
+        let err = validate_download_token("missing", "missing", OffsetDateTime::UNIX_EPOCH, &credentials)
+            .expect_err("unknown token should be rejected");
+
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
+
+    #[test]
+    fn validate_download_token_rejects_mismatched_token_value() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let created = create_test_download_token(now);
+        let credentials = test_signing_credentials();
+
+        let err = validate_download_token("different-id", &created.token, now, &credentials)
+            .expect_err("wrong token id should be rejected");
+
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
+
+    #[test]
+    fn validate_download_token_rejects_expired_token() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let created = create_test_download_token(now);
+        let credentials = test_signing_credentials();
+
+        let err = validate_download_token(&created.id, &created.token, now + OBJECT_ZIP_DOWNLOAD_TOKEN_TTL, &credentials)
+            .expect_err("expired token should be rejected");
+
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
+
+    #[test]
+    fn validate_download_token_accepts_unexpired_matching_token() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let created = create_test_download_token(now);
+        let credentials = test_signing_credentials();
+
+        let record =
+            validate_download_token(&created.id, &created.token, now, &credentials).expect("matching token should be accepted");
+
+        assert_eq!(record.id, created.id);
+        assert_eq!(record.principal, "alice");
+        assert_eq!(record.request.bucket, "photos");
+        assert_eq!(record.req_info.cred.as_ref().map(|cred| cred.access_key.as_str()), Some("alice"));
+        assert_eq!(record.req_info.cred.as_ref().map(|cred| cred.secret_key.as_str()), Some(""));
+        assert_eq!(
+            record
+                .auth_context
+                .headers
+                .get("user-agent")
+                .and_then(|value| value.to_str().ok()),
+            Some("object-zip-test")
+        );
+        assert_eq!(
+            record.auth_context.remote_addr.map(|addr| addr.0),
+            Some("127.0.0.1:9000".parse().expect("test socket addr should parse"))
+        );
+        assert_eq!(
+            record.auth_context.client_info.as_ref().map(|info| info.real_ip),
+            Some("203.0.113.10".parse().expect("test IP should parse"))
+        );
+    }
+
+    #[test]
+    fn validate_download_token_rejects_tampered_payload() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let created = create_test_download_token(now);
+        let (nonce, ciphertext) = created
+            .token
+            .split_once('.')
+            .expect("token should contain nonce and ciphertext");
+        let mut ciphertext = base64_decode_url_safe_no_pad(ciphertext.as_bytes()).expect("ciphertext should decode");
+        let first = ciphertext.first_mut().expect("ciphertext should not be empty");
+        *first ^= 0x01;
+        let tampered = format!("{}.{}", nonce, base64_encode_url_safe_no_pad(&ciphertext));
+        let credentials = test_signing_credentials();
+
+        let err =
+            validate_download_token(&created.id, &tampered, now, &credentials).expect_err("tampered token should be rejected");
+
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
+
+    #[test]
+    fn object_zip_download_tokens_are_stateless_encrypted_payloads() {
+        let src = include_str!("object_zip_download.rs");
+
+        assert!(
+            src.contains("ObjectZipDownloadTokenPayload"),
+            "object ZIP download token should carry an authenticated payload"
+        );
+        assert!(
+            src.contains("current_action_credentials"),
+            "object ZIP download token should be verifiable by any node sharing global credentials"
+        );
+        assert!(
+            src.contains("Aes256Gcm"),
+            "object ZIP download token payload should not expose captured authorization headers in clear text"
+        );
+        assert!(
+            !src.contains(&format!("{}{}{}", "OnceLock<", "RwLock<", "HashMap")),
+            "object ZIP download tokens must not use process-local storage"
+        );
+    }
+
+    #[test]
+    fn create_download_token_does_not_expose_payload_plaintext() {
+        let created = create_test_download_token(OffsetDateTime::UNIX_EPOCH);
+
+        assert!(!created.token.contains("alice"));
+        assert!(!created.token.contains("photos"));
+        assert!(!created.token.contains("object-zip-test"));
+    }
+
+    #[test]
+    fn uri_with_prefix_query_preserves_existing_query_and_overrides_prefix() {
+        let uri: Uri = "/rustfs/admin/v3/object-zip-downloads?X-Amz-Algorithm=AWS4-HMAC-SHA256&prefix=old&marker=1"
+            .parse()
+            .expect("uri should parse");
+
+        let updated = uri_with_prefix_query(&uri, "new/prefix/").expect("uri should be rewritten");
+        let query = updated.query().expect("query should exist");
+
+        assert!(query.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"));
+        assert!(query.contains("marker=1"));
+        assert!(query.contains("prefix=new%2Fprefix%2F"));
+        assert!(!query.contains("prefix=old"));
+    }
+
+    #[test]
+    fn sanitize_content_disposition_filename_removes_unsafe_characters() {
+        assert_eq!(sanitize_content_disposition_filename("bad\"\\\r\nname.zip"), "bad____name.zip");
+        assert_eq!(sanitize_content_disposition_filename("   "), "download.zip");
+    }
+
+    #[test]
+    fn zip_entry_name_strips_base_prefix() {
+        assert_eq!(
+            zip_entry_name(Some("2026/events/"), "2026/events/a.txt").expect("entry name should build"),
+            "a.txt"
+        );
+        assert_eq!(
+            zip_entry_name(Some("2026/events/"), "2026/events/nested/b.txt").expect("entry name should build"),
+            "nested/b.txt"
+        );
+    }
+
+    #[test]
+    fn zip_entry_name_falls_back_to_full_key_when_outside_base_prefix() {
+        assert_eq!(
+            zip_entry_name(Some("2026/events/"), "other/a.txt").expect("entry name should build"),
+            "other/a.txt"
+        );
+        assert_eq!(
+            zip_entry_name(None, "/absolute-ish.txt").expect("entry name should build"),
+            "absolute-ish.txt"
+        );
+    }
+
+    #[test]
+    fn zip_entry_name_rejects_empty_or_parent_directory_entries() {
+        assert_eq!(
+            zip_entry_name(Some("2026/events/"), "2026/events/")
+                .expect_err("empty relative entry should be rejected")
+                .code(),
+            &S3ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            zip_entry_name(None, "../secret.txt")
+                .expect_err("parent directory entry should be rejected")
+                .code(),
+            &S3ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            zip_entry_name(None, "..\\secret.txt")
+                .expect_err("windows parent directory entry should be rejected")
+                .code(),
+            &S3ErrorCode::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn collect_explicit_zip_items_deduplicates_keys_preserving_order() {
+        let mut request = valid_request();
+        request.prefix = Some("2026/events/".to_string());
+        request.objects = vec![
+            "2026/events/a.txt".to_string(),
+            "2026/events/a.txt".to_string(),
+            "2026/events/b.txt".to_string(),
+        ];
+
+        let items = collect_explicit_zip_items(&request).expect("items should collect");
+
+        assert_eq!(
+            items,
+            vec![
+                ZipDownloadItem {
+                    key: "2026/events/a.txt".to_string(),
+                    entry_name: "a.txt".to_string()
+                },
+                ZipDownloadItem {
+                    key: "2026/events/b.txt".to_string(),
+                    entry_name: "b.txt".to_string()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn push_zip_item_deduplicates_across_explicit_and_listed_keys() {
+        let mut request = valid_request();
+        request.prefix = Some("2026/events/".to_string());
+        request.objects = vec!["2026/events/a.txt".to_string()];
+
+        let mut seen = HashSet::new();
+        let mut items = collect_explicit_zip_items(&request).expect("explicit items should collect");
+        seen.extend(items.iter().map(|item| item.key.clone()));
+
+        push_zip_item(&request, &mut seen, &mut items, "2026/events/a.txt".to_string())
+            .expect("duplicate listed item should be ignored");
+        push_zip_item(&request, &mut seen, &mut items, "2026/events/nested/b.txt".to_string())
+            .expect("new listed item should be added");
+
+        assert_eq!(
+            items,
+            vec![
+                ZipDownloadItem {
+                    key: "2026/events/a.txt".to_string(),
+                    entry_name: "a.txt".to_string()
+                },
+                ZipDownloadItem {
+                    key: "2026/events/nested/b.txt".to_string(),
+                    entry_name: "nested/b.txt".to_string()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn listing_prefixes_uses_prefix_as_scope_only_when_no_explicit_selection() {
+        let request = valid_request();
+
+        assert_eq!(listing_prefixes(&request), vec!["2026/"]);
+
+        let mut mixed = valid_request();
+        mixed.objects = vec!["2026/a.txt".to_string()];
+        mixed.prefixes = vec!["2026/nested/".to_string()];
+
+        assert_eq!(listing_prefixes(&mixed), vec!["2026/nested/"]);
+    }
+
+    #[test]
+    fn normalized_listing_prefixes_removes_duplicates_and_nested_prefixes() {
+        let mut request = valid_request();
+        request.prefix = None;
+        request.prefixes = vec![
+            "2026/".to_string(),
+            "2026/reports/".to_string(),
+            "2026/".to_string(),
+            "2027/".to_string(),
+        ];
+
+        assert_eq!(normalized_listing_prefixes(&request), vec!["2026/".to_string(), "2027/".to_string()]);
+    }
+
+    #[test]
+    fn download_handler_prepares_archive_before_streaming_response() {
+        let src = include_str!("object_zip_download.rs");
+        let handler_block = extract_block_between_markers(
+            src,
+            "impl Operation for DownloadObjectZipHandler",
+            "fn sanitize_content_disposition_filename",
+        );
+
+        assert!(
+            handler_block.contains("prepare_zip_download_archive(&record).await?;"),
+            "download handler should fully prepare the ZIP archive before returning the ZIP response"
+        );
+        assert!(
+            handler_block.contains("build_zip_stream_body(prepared)"),
+            "download handler should stream the prepared archive instead of rebuilding request scope during response"
+        );
+        assert!(
+            !handler_block.contains("tokio::spawn"),
+            "download handler should not defer archive generation to a background task after returning 200"
+        );
+    }
+
+    #[test]
+    fn zip_download_preflight_preserves_storage_error_semantics() {
+        let src = include_str!("object_zip_download.rs");
+        let preflight_block = extract_block_between_markers(src, "async fn preflight_zip_items", "fn storage_error_to_s3");
+        let validation_block =
+            extract_block_between_markers(src, "async fn validate_zip_download_request", "async fn validate_zip_download_items");
+
+        assert!(
+            preflight_block.contains(".map_err(storage_error_to_s3)?;"),
+            "preflight object checks should preserve storage-layer S3 semantics"
+        );
+        assert!(
+            validation_block.contains(".map_err(storage_error_to_s3)?;"),
+            "bucket and listing checks should preserve storage-layer S3 semantics"
+        );
+        assert!(
+            preflight_block.contains(".get_object_info(&request.bucket, &item.key, &ObjectOptions::default())")
+                && !preflight_block.contains("failed to prepare object"),
+            "preflight object checks must not wrap expected missing object errors with a custom InternalError message"
+        );
+        assert!(
+            validation_block.contains(".get_bucket_info(&record.request.bucket, &BucketOptions::default())")
+                && !validation_block.contains("failed to validate bucket")
+                && !validation_block.contains("failed to list prefix"),
+            "bucket checks must not wrap expected user-facing errors with custom InternalError messages"
+        );
+    }
+
+    #[test]
+    fn object_zip_download_handler_requires_admin_authorization_contract() {
+        let src = include_str!("object_zip_download.rs");
+        let handler_block =
+            extract_block_between_markers(src, "impl Operation for CreateObjectZipDownloadHandler", "#[cfg(test)]");
+
+        assert!(
+            handler_block.contains("authenticate_object_zip_download_request(&mut req).await?;"),
+            "object ZIP download POST should authenticate the signed request"
+        );
+        assert!(
+            handler_block.contains("authorize_object_zip_download_scope(&mut req, &request).await?;"),
+            "object ZIP download POST should authorize the requested object/list scope"
+        );
+        assert!(
+            !handler_block.contains("ServerInfoAdminAction"),
+            "object ZIP download POST must not use broad server-info admin authorization for object reads"
+        );
+    }
+
+    #[test]
+    fn prefix_authorization_binds_body_prefix_to_list_bucket_query_conditions() {
+        let src = include_str!("object_zip_download.rs");
+        let scope_block = extract_block_between_markers(
+            src,
+            "async fn authorize_object_zip_download_scope",
+            "async fn authorize_object_zip_download_s3_action",
+        );
+
+        assert!(
+            scope_block.contains("listing_prefixes(request)"),
+            "object ZIP download should authorize the actual prefixes used for listing"
+        );
+        assert!(
+            !scope_block.contains("request.prefix.as_deref()"),
+            "base prefix alone should not force ListBucket authorization for explicit object selection"
+        );
+        assert!(
+            scope_block.contains("authorize_object_zip_download_list_prefix"),
+            "prefix list authorization should bind body prefixes into s3:prefix conditions"
+        );
+    }
+
+    fn extract_block_between_markers<'a>(src: &'a str, start_marker: &str, end_marker: &str) -> &'a str {
+        let start = src
+            .find(start_marker)
+            .unwrap_or_else(|| panic!("Expected marker `{start_marker}` in source"));
+        let after_start = &src[start..];
+        let end = after_start
+            .find(end_marker)
+            .unwrap_or_else(|| panic!("Expected end marker `{end_marker}` in source"));
+        &after_start[..end]
+    }
+
+    fn create_test_download_token(now: OffsetDateTime) -> CreatedObjectZipDownloadToken {
+        let credentials = test_signing_credentials();
+        create_download_token(
+            "alice".to_string(),
+            test_req_info(),
+            test_auth_context(),
+            valid_request(),
+            now,
+            &credentials,
+        )
+        .expect("token should be created")
+    }
+
+    fn test_signing_credentials() -> Credentials {
+        Credentials {
+            access_key: "TESTROOTACCESSKEY".to_string(),
+            secret_key: "TESTROOTSECRET1234567890".to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn test_req_info() -> ReqInfo {
+        let mut credentials = rustfs_credentials::Credentials {
+            access_key: "alice".to_string(),
+            secret_key: "should-not-be-serialized".to_string(),
+            session_token: "should-not-be-serialized".to_string(),
+            ..Default::default()
+        };
+        credentials.secret_key.clear();
+        credentials.session_token.clear();
+        ReqInfo {
+            cred: Some(credentials),
+            is_owner: false,
+            keystone_session_present: None,
+            bucket: Some("photos".to_string()),
+            object: None,
+            version_id: None,
+            replication_request_authorized: false,
+            region: current_region(),
+            request_context: None,
+            suppress_denial_log: false,
+            suppress_denial_audit: false,
+        }
+    }
+
+    fn test_auth_context() -> ObjectZipDownloadAuthContext {
+        let mut headers = HeaderMap::new();
+        headers.insert("user-agent", HeaderValue::from_static("object-zip-test"));
+        ObjectZipDownloadAuthContext {
+            headers,
+            remote_addr: Some(RemoteAddr("127.0.0.1:9000".parse().expect("test socket addr should parse"))),
+            client_info: Some(ClientInfo {
+                real_ip: "203.0.113.10".parse().expect("test IP should parse"),
+                forwarded_host: Some("console.example.test".to_string()),
+                forwarded_proto: Some("https".to_string()),
+                is_from_trusted_proxy: true,
+                proxy_ip: Some("192.0.2.10".parse().expect("test IP should parse")),
+                proxy_hops: 1,
+                validation_mode: ValidationMode::HopByHop,
+                warnings: Vec::new(),
+            }),
+        }
+    }
+}

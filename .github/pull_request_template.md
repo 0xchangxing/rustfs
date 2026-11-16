@@ -2,36 +2,34 @@
 Pull Request Template for RustFS
 -->
 
-## Type of Change
-- [ ] New Feature
-- [ ] Bug Fix
-- [ ] Documentation
-- [ ] Performance Improvement
-- [ ] Test/CI
-- [ ] Refactor
-- [ ] Other:
-
 ## Related Issues
-<!-- List related Issue numbers, e.g. #123 -->
+<!--
+List related issues, e.g. Fixes #123.
+Use N/A when there is no related issue.
+-->
 
 ## Summary of Changes
-<!-- Briefly describe the main changes and motivation for this PR -->
+<!--
+Describe the concrete problem and resulting behavior. For a behavior change, name the input or state that triggers it and the expected outcome. Explain any new dependency or abstraction that the change needs.
+-->
 
-## Checklist
-- [ ] I have read and followed the [CONTRIBUTING.md](CONTRIBUTING.md) guidelines
-- [ ] Passed `make pre-commit`
-- [ ] Added/updated necessary tests
-- [ ] Documentation updated (if needed)
-- [ ] CI/CD passed (if applicable)
+## Verification
+<!--
+Give 1–3 concrete pieces of evidence for the changed behavior: the test or command, its observed result, and the regression it catches. For a bug fix, record a failing-before/passing-after check or explain why it was unavailable.
+
+Identify the tested commit and any local changes. When testing a prebuilt binary or external service, include its source/version and artifact identity; a successful run against a different build is not evidence for this change.
+
+List relevant checks not run and the remaining risk. Use the validation tier in AGENTS.md; do not run broader checks solely to fill this section. For documentation-only changes, list the applicable documentation checks. Use N/A only when verification is not applicable.
+-->
 
 ## Impact
-- [ ] Breaking change (compatibility)
-- [ ] Requires doc/config/deployment update
-- [ ] Other impact:
+<!--
+Describe user-facing, compatibility, API, deployment, configuration, or documentation impact. Use N/A when there is no expected impact.
+-->
 
 ## Additional Notes
-<!-- Any extra information for reviewers -->
+<!-- Any extra information for reviewers, or N/A. -->
 
 ---
 
-Thank you for your contribution! Please ensure your PR follows the community standards ([CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)) and sign the CLA if this is your first contribution.
+Thank you for your contribution! Please ensure your PR follows the community standards ([CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)). If this is your first contribution, review the [CLA document](https://github.com/rustfs/cla/blob/main/cla/v2.md) and sign it by commenting `I have read and agree to the CLA.` on the PR.

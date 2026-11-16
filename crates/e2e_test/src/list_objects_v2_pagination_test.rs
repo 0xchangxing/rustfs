@@ -30,8 +30,22 @@ mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging};
     use aws_sdk_s3::Client;
     use aws_sdk_s3::primitives::ByteStream;
-    use serial_test::serial;
+    use futures::{StreamExt, stream};
+    use std::collections::HashSet;
+    use std::future::Future;
+    use std::time::Duration;
+    use tokio::time::{Instant, error::Elapsed, timeout_at};
     use tracing::info;
+
+    const PAGINATION_TIMEOUT: Duration = Duration::from_secs(120);
+    // Bound queued durable commits on the single fixture disk under CI I/O pressure.
+    const FIXTURE_PUT_CONCURRENCY: usize = 4;
+
+    // Fixture population can require thousands of durable PUTs. Bound the
+    // listing traversal itself with one deadline shared by every page.
+    async fn listing_request_before<T>(deadline: Instant, request: impl Future<Output = T>) -> Result<T, Elapsed> {
+        timeout_at(deadline, request).await
+    }
 
     /// Helper function to create an S3 client for testing
     fn create_s3_client(env: &RustFSTestEnvironment) -> Client {
@@ -57,12 +71,182 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_list_objects_v2_deadline_rejects_unresponsive_peer() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+        use tokio::sync::oneshot;
+        use tokio::time::timeout;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind unresponsive listing peer");
+        let endpoint = format!("http://{}", listener.local_addr().expect("listing peer address"));
+        let (received_tx, received_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept listing request");
+            let mut bytes = [0; 4096];
+            assert!(stream.read(&mut bytes).await.expect("read listing request") > 0);
+            received_tx.send(()).expect("signal received listing request");
+            std::future::pending::<()>().await;
+            drop(stream);
+        });
+        let client = Client::from_conf(
+            crate::common::build_test_s3_config(&endpoint, "test-access", "test-secret", None, "pagination-deadline")
+                .to_builder()
+                .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1))
+                .build(),
+        );
+        let request = client.list_objects_v2().bucket("deadline-test").send();
+        tokio::pin!(request);
+        tokio::select! {
+            response = &mut request => panic!("unresponsive listing peer unexpectedly returned: {response:?}"),
+            received = timeout(Duration::from_secs(10), received_rx) => {
+                received.expect("listing request must reach peer").expect("listing peer must remain alive");
+            }
+        }
+
+        // Expire the same absolute deadline after the real request is observed;
+        // this tests a stalled response without relying on transport timing.
+        let result = timeout(Duration::from_secs(1), listing_request_before(Instant::now(), request))
+            .await
+            .expect("expired pagination deadline must stop the in-flight request");
+        server.abort();
+        let _ = server.await;
+        assert!(
+            result.is_err(),
+            "an unresponsive ListObjectsV2 request must exceed the pagination deadline"
+        );
+    }
+
+    /// Test for Issue #2775: continuation forwarding must not
+    /// skip a child directory when the prefix component repeats in the key.
+    #[tokio::test]
+    async fn test_list_objects_v2_repeated_prefix_continuation() {
+        init_logging();
+        info!("Starting test: ListObjectsV2 repeated-prefix continuation");
+
+        const PAGE_SIZE: i32 = 2;
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server_with_env(vec![], &[("RUSTFS_CONSOLE_ENABLE", "false")])
+            .await
+            .expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-repeated-prefix-small";
+        let prefix = "engineering/";
+
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        let expected_keys = vec![
+            format!("{prefix}alpha-000/artifact.txt"),
+            format!("{prefix}engineering/engineering/project-000/artifact.txt"),
+            format!("{prefix}engineering/engineering/project-001/artifact.txt"),
+            format!("{prefix}engineering/project-000/artifact.txt"),
+            format!("{prefix}engineering/project-001/artifact.txt"),
+            format!("{prefix}engineering/project-002/artifact.txt"),
+            format!("{prefix}zulu-000/artifact.txt"),
+        ];
+        let noise_keys = [
+            "different/prefix/prefix/project-000/artifact.txt",
+            "engineering-other/project-000/artifact.txt",
+            "unrelated/engineering/project-000/artifact.txt",
+        ];
+
+        for key in &expected_keys {
+            client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"x"))
+                .send()
+                .await
+                .expect("Failed to put object");
+        }
+        for key in noise_keys {
+            client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"x"))
+                .send()
+                .await
+                .expect("Failed to put noise object");
+        }
+
+        let mut listed_keys = Vec::new();
+        let mut continuation_token: Option<String> = None;
+        let mut last_key: Option<String> = None;
+        let mut page_count = 0;
+
+        loop {
+            let mut request = client.list_objects_v2().bucket(bucket).prefix(prefix).max_keys(PAGE_SIZE);
+
+            if let Some(token) = continuation_token.take() {
+                request = request.continuation_token(token);
+            }
+
+            let output = request.send().await.expect("Failed to list objects");
+
+            for obj in output.contents() {
+                if let Some(key) = obj.key() {
+                    if let Some(previous) = &last_key {
+                        assert!(
+                            key > previous.as_str(),
+                            "ListObjectsV2 did not preserve lexicographic order: {key} <= {previous}"
+                        );
+                    }
+
+                    last_key = Some(key.to_string());
+                    listed_keys.push(key.to_string());
+                }
+            }
+
+            page_count += 1;
+
+            if output.is_truncated().unwrap_or(false) {
+                continuation_token = output.next_continuation_token().map(|s| s.to_string());
+                assert!(
+                    continuation_token.is_some(),
+                    "BUG: NextContinuationToken must be present when IsTruncated is true"
+                );
+            } else {
+                break;
+            }
+
+            if page_count > 10 {
+                panic!("Too many pages, possible infinite loop due to pagination bug");
+            }
+        }
+
+        let seen: HashSet<String> = listed_keys.iter().cloned().collect();
+
+        assert_eq!(
+            listed_keys, expected_keys,
+            "Issue #2775 regression: repeated-prefix pagination must return exactly the expected keys in lexicographic order"
+        );
+        assert_eq!(
+            listed_keys.len(),
+            expected_keys.len(),
+            "Issue #2775 regression: expected all {} repeated-prefix objects under {prefix}, got {}",
+            expected_keys.len(),
+            listed_keys.len()
+        );
+        assert_eq!(seen.len(), expected_keys.len(), "Listed keys must be unique");
+
+        for key in &expected_keys {
+            assert!(seen.contains(key), "Missing expected key after repeated-prefix pagination: {key}");
+        }
+
+        env.stop_server();
+    }
+
     /// Test that IsTruncated is false when all objects fit within max_keys
     ///
     /// This is the core bug from issue #1596: the server was returning
     /// IsTruncated=true even when all objects fit within the requested max_keys.
     #[tokio::test]
-    #[serial]
     async fn test_list_objects_v2_not_truncated_when_all_objects_returned() {
         init_logging();
         info!("Starting test: ListObjectsV2 should not be truncated when all objects fit within max_keys");
@@ -127,7 +311,6 @@ mod tests {
     /// 2. NextContinuationToken is returned (not NextMarker)
     /// 3. Using ContinuationToken fetches the remaining objects
     #[tokio::test]
-    #[serial]
     async fn test_list_objects_v2_pagination_with_continuation_token() {
         init_logging();
         info!("Starting test: ListObjectsV2 pagination with continuation token");
@@ -269,7 +452,6 @@ mod tests {
     /// Edge case: when max_keys exactly equals the number of objects,
     /// IsTruncated should be false.
     #[tokio::test]
-    #[serial]
     async fn test_list_objects_v2_max_keys_equals_object_count() {
         init_logging();
         info!("Starting test: ListObjectsV2 with max_keys equal to object count");
@@ -330,7 +512,6 @@ mod tests {
     ///
     /// Edge case: IsTruncated should be false for empty bucket.
     #[tokio::test]
-    #[serial]
     async fn test_list_objects_v2_empty_bucket() {
         init_logging();
         info!("Starting test: ListObjectsV2 with empty bucket");
@@ -368,12 +549,85 @@ mod tests {
         env.stop_server();
     }
 
+    /// Test ListObjectsV2 caps max_keys above the service limit and still paginates.
+    #[tokio::test]
+    async fn test_list_objects_v2_max_keys_above_limit_returns_token() {
+        init_logging();
+        info!("Starting test: ListObjectsV2 with max_keys above limit");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-max-keys-above-limit";
+
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        let object_count = 1002;
+        // Finish every durable PUT before listing, with the same bounded fanout as the delimiter fixtures.
+        stream::iter(0..object_count)
+            .for_each_concurrent(FIXTURE_PUT_CONCURRENCY, |i| {
+                let client = &client;
+                async move {
+                    let key = format!("object{i:04}.txt");
+                    client
+                        .put_object()
+                        .bucket(bucket)
+                        .key(&key)
+                        .body(ByteStream::from_static(b"test content"))
+                        .send()
+                        .await
+                        .unwrap_or_else(|err| panic!("Failed to put fixture object {key}: {err:?}"));
+                }
+            })
+            .await;
+
+        eprintln!("Seeded {object_count} objects in {bucket}; starting ListObjectsV2 pagination");
+        let deadline = Instant::now() + PAGINATION_TIMEOUT;
+
+        let output = listing_request_before(deadline, client.list_objects_v2().bucket(bucket).max_keys(1001).send())
+            .await
+            .expect("ListObjectsV2 pagination exceeded its deadline after fixture population")
+            .expect("Failed to list objects");
+
+        assert_eq!(output.contents().len(), 1000);
+        assert_eq!(output.key_count(), Some(1000));
+        assert_eq!(output.max_keys(), Some(1000));
+        assert!(
+            output.is_truncated().unwrap_or(false),
+            "IsTruncated should be true when more objects remain after capped max_keys"
+        );
+
+        let next_token = output
+            .next_continuation_token()
+            .expect("NextContinuationToken should be present when capped response is truncated")
+            .to_string();
+
+        let output = listing_request_before(
+            deadline,
+            client
+                .list_objects_v2()
+                .bucket(bucket)
+                .max_keys(1001)
+                .continuation_token(next_token)
+                .send(),
+        )
+        .await
+        .expect("ListObjectsV2 continuation exceeded the shared pagination deadline")
+        .expect("Failed to list objects with continuation token");
+
+        assert_eq!(output.contents().len(), 2);
+        assert!(!output.is_truncated().unwrap_or(false));
+        assert!(output.next_continuation_token().is_none());
+
+        env.stop_server();
+    }
+
     /// Test ListObjectsV2 with max_keys=0
     ///
     /// S3 semantics: when max_keys is 0, the response should include no objects
     /// and IsTruncated should be false.
     #[tokio::test]
-    #[serial]
     async fn test_list_objects_v2_max_keys_zero() {
         init_logging();
         info!("Starting test: ListObjectsV2 with max_keys=0");
@@ -419,6 +673,520 @@ mod tests {
         );
 
         info!("Test passed: max_keys=0 returns no objects and IsTruncated=false");
+
+        env.stop_server();
+    }
+
+    /// Regression test: delimiter listing must not produce false-positive truncation
+    /// when many raw keys collapse into a small number of CommonPrefixes.
+    ///
+    /// Scenario: 30 objects across 3 directories + 2 direct files under prefix.
+    /// With max_keys=1000, all 5 visible results (3 prefixes + 2 objects) fit in one
+    /// page, so IsTruncated must be false even though raw entry count is much larger.
+    #[tokio::test]
+    async fn test_list_objects_v2_delimiter_collapsed_prefix_no_false_truncation() {
+        init_logging();
+        info!("Starting test: ListObjectsV2 delimiter collapsed-prefix no false truncation");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-collapsed-prefix";
+        let prefix = "data/";
+
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        // Create objects under 3 subdirectories (10 each = 30 raw keys)
+        let dirs = ["alpha/", "beta/", "gamma/"];
+        let mut expected_keys = Vec::new();
+        for dir in &dirs {
+            for i in 0..10 {
+                let key = format!("{prefix}{dir}file{i:02}.txt");
+                client
+                    .put_object()
+                    .bucket(bucket)
+                    .key(&key)
+                    .body(ByteStream::from_static(b"x"))
+                    .send()
+                    .await
+                    .expect("Failed to put object");
+                expected_keys.push(key);
+            }
+        }
+        // Add 2 direct objects under prefix
+        for name in ["readme.txt", "config.json"] {
+            let key = format!("{prefix}{name}");
+            client
+                .put_object()
+                .bucket(bucket)
+                .key(&key)
+                .body(ByteStream::from_static(b"x"))
+                .send()
+                .await
+                .expect("Failed to put object");
+            expected_keys.push(key);
+        }
+
+        // List with delimiter="/", max_keys large enough to cover all visible results
+        // Visible: 3 common prefixes + 2 direct objects = 5
+        let output = client
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix(prefix)
+            .delimiter("/")
+            .max_keys(1000)
+            .send()
+            .await
+            .expect("Failed to list objects");
+
+        let listed_keys: Vec<String> = output
+            .contents()
+            .iter()
+            .filter_map(|obj| obj.key())
+            .map(|k| k.to_string())
+            .collect();
+        let listed_prefixes: Vec<String> = output
+            .common_prefixes()
+            .iter()
+            .filter_map(|cp| cp.prefix())
+            .map(|p| p.to_string())
+            .collect();
+
+        // KEY ASSERTION: IsTruncated must be false because all visible results fit within max_keys
+        let is_truncated = output.is_truncated().unwrap_or(false);
+        assert!(
+            !is_truncated,
+            "BUG: IsTruncated should be false when all visible results ({} objects + {} prefixes = {}) fit within max_keys (1000)",
+            listed_keys.len(),
+            listed_prefixes.len(),
+            listed_keys.len() + listed_prefixes.len()
+        );
+
+        assert!(
+            output.next_continuation_token().is_none(),
+            "NextContinuationToken should be None when IsTruncated is false"
+        );
+
+        // All 32 objects must be covered (listed_keys + keys under listed_prefixes)
+        let total_raw_count = expected_keys.len();
+        let keys_under_prefixes: usize = listed_prefixes
+            .iter()
+            .map(|p| {
+                let dir = p.trim_end_matches('/');
+                expected_keys.iter().filter(|k| k.starts_with(&format!("{dir}/"))).count()
+            })
+            .sum();
+        let covered = listed_keys.len() + keys_under_prefixes;
+
+        assert_eq!(
+            covered,
+            total_raw_count,
+            "Collapsed-prefix listing must cover all {} objects, got {} (keys={}, under_prefixes={})",
+            total_raw_count,
+            covered,
+            listed_keys.len(),
+            keys_under_prefixes
+        );
+
+        info!(
+            "Collapsed-prefix test passed: {} objects covered ({} keys + {} prefixes), IsTruncated=false",
+            covered,
+            listed_keys.len(),
+            listed_prefixes.len()
+        );
+
+        env.stop_server();
+    }
+
+    /// Regression test: delimiter listing pagination must traverse all keys
+    /// even when the visible result count per page is much smaller than the
+    /// raw entry count (due to CommonPrefix collapse).
+    ///
+    /// Scenario: 1000 objects across 100 directories, paginated with max_keys=50.
+    /// Each page returns up to 50 CommonPrefixes. The server must correctly set
+    /// IsTruncated and provide a valid continuation token across all pages.
+    #[tokio::test]
+    async fn test_list_objects_v2_delimiter_small_page_traverses_all() {
+        init_logging();
+        info!("Starting test: ListObjectsV2 delimiter small page traverses all keys");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-delimiter-small-page";
+
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        // Keep every fixture key while overlapping durable PUTs within a bounded fanout.
+        let all_keys: Vec<String> = (0..100)
+            .flat_map(|dir| (0..10).map(move |file| format!("dir-{dir:03}/file{file:02}.txt")))
+            .collect();
+        stream::iter(&all_keys)
+            .for_each_concurrent(FIXTURE_PUT_CONCURRENCY, |key| {
+                let client = &client;
+                async move {
+                    client
+                        .put_object()
+                        .bucket(bucket)
+                        .key(key)
+                        .body(ByteStream::from_static(b"x"))
+                        .send()
+                        .await
+                        .unwrap_or_else(|err| panic!("Failed to put fixture object {key}: {err:?}"));
+                }
+            })
+            .await;
+
+        eprintln!("Seeded {} objects in {bucket}; starting ListObjectsV2 pagination", all_keys.len());
+        let deadline = Instant::now() + PAGINATION_TIMEOUT;
+
+        // Paginate with delimiter="/" and max_keys=50
+        // Visible per page: up to 50 CommonPrefixes
+        let mut listed_keys = Vec::new();
+        let mut listed_prefixes = Vec::new();
+        let mut continuation_token: Option<String> = None;
+        let mut page_count = 0;
+        let mut last_page_is_truncated: bool;
+
+        loop {
+            let mut request = client.list_objects_v2().bucket(bucket).delimiter("/").max_keys(50);
+
+            if let Some(token) = continuation_token.take() {
+                request = request.continuation_token(token);
+            }
+
+            let output = listing_request_before(deadline, request.send())
+                .await
+                .expect("ListObjectsV2 delimiter traversal exceeded the shared pagination deadline")
+                .expect("Failed to list objects");
+            last_page_is_truncated = output.is_truncated().unwrap_or(false);
+
+            for obj in output.contents() {
+                if let Some(key) = obj.key() {
+                    listed_keys.push(key.to_string());
+                }
+            }
+            for cp in output.common_prefixes() {
+                if let Some(p) = cp.prefix() {
+                    listed_prefixes.push(p.to_string());
+                }
+            }
+
+            page_count += 1;
+
+            if last_page_is_truncated {
+                continuation_token = output.next_continuation_token().map(|s| s.to_string());
+                assert!(
+                    continuation_token.is_some(),
+                    "BUG: NextContinuationToken must be present when IsTruncated is true"
+                );
+            } else {
+                break;
+            }
+
+            if page_count > 20 {
+                panic!("Too many pages, possible infinite loop in delimiter pagination");
+            }
+        }
+
+        // Last page must have IsTruncated=false
+        assert!(
+            !last_page_is_truncated,
+            "BUG: Last page must have IsTruncated=false after all results returned"
+        );
+
+        // Verify all objects are covered via listed prefixes
+        let keys_under_prefixes: HashSet<String> = all_keys
+            .iter()
+            .filter(|k| {
+                listed_prefixes
+                    .iter()
+                    .any(|p| k.starts_with(&format!("{}/", p.trim_end_matches('/'))))
+            })
+            .cloned()
+            .collect();
+        let listed_set: HashSet<String> = listed_keys.iter().cloned().collect();
+        let covered: HashSet<String> = listed_set.union(&keys_under_prefixes).cloned().collect();
+        let expected_set: HashSet<String> = all_keys.iter().cloned().collect();
+
+        assert_eq!(
+            covered,
+            expected_set,
+            "Delimiter pagination must cover all {} objects, missing: {:?}",
+            expected_set.difference(&covered).count(),
+            expected_set.difference(&covered)
+        );
+
+        info!(
+            "Delimiter small-page test passed: {} objects covered in {} pages",
+            covered.len(),
+            page_count
+        );
+
+        env.stop_server();
+    }
+
+    /// Regression test: raw entries exceed MaxKeys but all collapse into fewer
+    /// visible CommonPrefixes — IsTruncated must be false because there are no
+    /// more visible results beyond the collapsed prefixes.
+    ///
+    /// Scenario: 10 directories with 200 files each = 2000 raw keys.
+    /// With MaxKeys=1000, the raw entry count exceeds MaxKeys (disk_has_more=true),
+    /// but after delimiter collapse only 10 CommonPrefixes are visible (10 < 1000).
+    /// IsTruncated must be false since there are no additional visible results.
+    #[tokio::test]
+    async fn test_list_objects_v2_raw_exceeds_maxkeys_but_visible_below() {
+        init_logging();
+        info!("Starting test: ListObjectsV2 raw > MaxKeys but visible < MaxKeys after collapse");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-raw-exceeds-visible-below";
+
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        // Create 10 directories × 200 files = 2000 raw keys
+        let dir_count = 10;
+        let files_per_dir = 200;
+        let mut all_keys = Vec::new();
+        for d in 0..dir_count {
+            let dir = format!("dir-{:02}/", d);
+            for f in 0..files_per_dir {
+                let key = format!("{}file{:03}.txt", dir, f);
+                client
+                    .put_object()
+                    .bucket(bucket)
+                    .key(&key)
+                    .body(ByteStream::from_static(b"x"))
+                    .send()
+                    .await
+                    .expect("Failed to put object");
+                all_keys.push(key);
+            }
+        }
+
+        // List with delimiter="/", max_keys=1000
+        // Visible: 10 CommonPrefixes (dir-00/ .. dir-09/) = 10 visible << 1000 MaxKeys
+        // But raw entry count (2000+1001 requested) exceeds MaxKeys
+        let output = client
+            .list_objects_v2()
+            .bucket(bucket)
+            .delimiter("/")
+            .max_keys(1000)
+            .send()
+            .await
+            .expect("Failed to list objects");
+
+        let listed_keys: Vec<String> = output
+            .contents()
+            .iter()
+            .filter_map(|obj| obj.key())
+            .map(|k| k.to_string())
+            .collect();
+        let listed_prefixes: Vec<String> = output
+            .common_prefixes()
+            .iter()
+            .filter_map(|cp| cp.prefix())
+            .map(|p| p.to_string())
+            .collect();
+
+        // KEY ASSERTION: IsTruncated must be false because visible results (10)
+        // are far below MaxKeys (1000), even though raw entries exceeded MaxKeys.
+        let is_truncated = output.is_truncated().unwrap_or(false);
+        assert!(
+            !is_truncated,
+            "BUG: IsTruncated should be false when visible results ({} objects + {} prefixes = {}) < MaxKeys (1000), even if raw entries exceeded MaxKeys",
+            listed_keys.len(),
+            listed_prefixes.len(),
+            listed_keys.len() + listed_prefixes.len()
+        );
+
+        assert!(
+            output.next_continuation_token().is_none(),
+            "NextContinuationToken should be None when IsTruncated is false"
+        );
+
+        // All objects must be covered by listed prefixes
+        assert_eq!(
+            listed_prefixes.len(),
+            dir_count,
+            "Expected {} prefixes, got {}",
+            dir_count,
+            listed_prefixes.len()
+        );
+        for d in 0..dir_count {
+            let prefix = format!("dir-{:02}/", d);
+            assert!(listed_prefixes.contains(&prefix), "Missing prefix: {}", prefix);
+        }
+
+        info!(
+            "Raw-exceeds-visible test passed: {} raw keys → {} prefixes, IsTruncated=false",
+            all_keys.len(),
+            listed_prefixes.len()
+        );
+
+        env.stop_server();
+    }
+
+    /// Regression test: pagination with MaxKeys exceeding S3 limit (1000) and delimiter.
+    /// The server caps MaxKeys to 1000. With delimiter="/", many raw keys collapse into
+    /// few CommonPrefixes. Visible results (prefixes) < capped MaxKeys → IsTruncated=false.
+    ///
+    /// This complements test_list_objects_v2_max_keys_above_limit_returns_token which
+    /// tests the non-delimiter case.
+    #[tokio::test]
+    async fn test_list_objects_v2_maxkeys_above_limit_with_delimiter() {
+        init_logging();
+        info!("Starting test: ListObjectsV2 MaxKeys above limit with delimiter");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-maxkeys-limit-delimiter";
+
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        // Keep all 1200 raw keys while bounding upload concurrency so fixture setup
+        // leaves the test's timeout budget available for the listing regression.
+        let dir_count = 12;
+        let files_per_dir = 100;
+        let fixture_started = std::time::Instant::now();
+        stream::iter((0..dir_count).flat_map(|d| (0..files_per_dir).map(move |f| (d, f))))
+            .for_each_concurrent(FIXTURE_PUT_CONCURRENCY, |(d, f)| {
+                let client = &client;
+                async move {
+                    let key = format!("dir-{d:02}/file{f:03}.txt");
+                    client
+                        .put_object()
+                        .bucket(bucket)
+                        .key(&key)
+                        .body(ByteStream::from_static(b"x"))
+                        .send()
+                        .await
+                        .unwrap_or_else(|err| panic!("Failed to put fixture object {key}: {err:?}"));
+                }
+            })
+            .await;
+        info!(
+            event = "pagination_fixture_ready",
+            component = "e2e_test",
+            subsystem = "list_objects_v2",
+            object_count = dir_count * files_per_dir,
+            elapsed_ms = fixture_started.elapsed().as_millis(),
+            "Pagination fixture ready"
+        );
+
+        eprintln!(
+            "Seeded {} objects in {bucket}; starting ListObjectsV2 pagination",
+            dir_count * files_per_dir
+        );
+        let deadline = Instant::now() + PAGINATION_TIMEOUT;
+
+        // With delimiter: 12 CommonPrefixes visible, all fit within capped 1000
+        let output =
+            listing_request_before(deadline, client.list_objects_v2().bucket(bucket).delimiter("/").max_keys(2000).send())
+                .await
+                .expect("ListObjectsV2 delimiter listing exceeded its deadline after fixture population")
+                .expect("Failed to list objects");
+
+        assert_eq!(
+            output.common_prefixes().len(),
+            dir_count,
+            "Expected {} prefixes, got {}",
+            dir_count,
+            output.common_prefixes().len()
+        );
+        let prefixes = output
+            .common_prefixes()
+            .iter()
+            .map(|entry| entry.prefix().expect("each CommonPrefix must carry its prefix").to_owned())
+            .collect::<Vec<_>>();
+        let expected_prefixes = (0..dir_count).map(|d| format!("dir-{d:02}/")).collect::<Vec<_>>();
+        assert_eq!(prefixes, expected_prefixes);
+        assert!(output.contents().is_empty(), "all fixture objects must collapse into prefixes");
+        assert_eq!(output.key_count(), Some(i32::try_from(dir_count).expect("fixture count fits i32")));
+        assert_eq!(output.max_keys(), Some(1000));
+        assert!(
+            output.next_continuation_token().is_none(),
+            "a complete listing must not return a continuation token"
+        );
+        // 12 visible < 1000 capped MaxKeys → not truncated
+        assert!(
+            !output.is_truncated().unwrap_or(false),
+            "BUG: IsTruncated should be false when visible ({}) < capped MaxKeys (1000)",
+            output.common_prefixes().len()
+        );
+
+        info!("MaxKeys above limit with delimiter test passed");
+
+        env.stop_server();
+    }
+
+    /// Test that continuation pages do not skip keys sorting between the marker
+    /// and the marker plus the cursor tag.
+    ///
+    /// Bug Reference: backlog#1047
+    /// Earlier releases appended a `[rustfs_cache:...]` cursor tag to the last
+    /// returned key inside the V2 continuation token. The orchestration layer
+    /// passed that raw string to `forward_past`, so any key whose byte after the
+    /// shared stem sorts below `[` (0x5B) — `.`, `/`, `-`, digits, uppercase —
+    /// was silently dropped on the next page: with keys `a`, `a.txt`, `zz` and
+    /// max_keys=1, page 2 returned `zz` and `a.txt` was never listed. The token
+    /// is now base64 of the plain key, and this test keeps guarding the
+    /// continuation boundary.
+    #[tokio::test]
+    async fn test_list_objects_v2_continuation_keeps_keys_after_marker_stem() {
+        init_logging();
+        info!("Starting test: continuation must not skip keys sorting below the cursor tag");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server_with_env(vec![], &[("RUSTFS_CONSOLE_ENABLE", "false")])
+            .await
+            .expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-continuation-marker-stem";
+
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        let expected_keys = ["a", "a.txt", "zz"];
+        for key in expected_keys {
+            client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"content"))
+                .send()
+                .await
+                .unwrap_or_else(|err| panic!("Failed to create test object {key}: {err}"));
+        }
+
+        let mut collected: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut request = client.list_objects_v2().bucket(bucket).max_keys(1);
+            if let Some(continuation) = token.take() {
+                request = request.continuation_token(continuation);
+            }
+            let page = request.send().await.expect("Failed to list objects");
+            collected.extend(
+                page.contents()
+                    .iter()
+                    .filter_map(|object| object.key().map(ToOwned::to_owned)),
+            );
+            token = page.next_continuation_token().map(ToOwned::to_owned);
+            if token.is_none() {
+                break;
+            }
+            assert!(collected.len() <= expected_keys.len() + 1, "pagination did not converge: {collected:?}");
+        }
+
+        assert_eq!(collected, expected_keys, "every key must survive pagination in order");
 
         env.stop_server();
     }

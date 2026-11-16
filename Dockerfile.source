@@ -24,17 +24,24 @@
 #
 # Supports cross-compilation for amd64 and arm64 via TARGETPLATFORM.
 
-ARG TARGETPLATFORM
-ARG BUILDPLATFORM
+# Do not declare TARGETPLATFORM, BUILDPLATFORM or TARGETARCH here: a global
+# declaration without a value shadows BuildKit's automatic values, so the
+# stage-level re-declarations below see empty strings. They are only
+# declared inside the stage that uses them.
+ARG RUSTFS_BUILD_FEATURES=""
+ARG RC_RELEASE=latest
 
 # -----------------------------
 # Build stage
 # -----------------------------
-FROM rust:1.91-trixie AS builder
+FROM rust:1.99.1-trixie AS builder
 
 # Re-declare args after FROM
 ARG TARGETPLATFORM
 ARG BUILDPLATFORM
+ARG TARGETARCH
+ARG RUSTFS_BUILD_FEATURES
+ARG RC_RELEASE
 
 # Debug: print platforms
 RUN echo "Build info -> BUILDPLATFORM=${BUILDPLATFORM}, TARGETPLATFORM=${TARGETPLATFORM}"
@@ -48,6 +55,7 @@ RUN set -eux; \
     build-essential \
     ca-certificates \
     curl \
+    jq \
     git \
     pkg-config \
     libssl-dev \
@@ -60,7 +68,15 @@ RUN set -eux; \
 
 # Optional: cross toolchain for aarch64 (only when targeting linux/arm64)
 RUN set -eux; \
-    if [ "${TARGETPLATFORM:-linux/amd64}" = "linux/arm64" ]; then \
+    target_platform="${TARGETPLATFORM:-}"; \
+    if [ -z "${target_platform}" ]; then \
+    case "$(uname -m)" in \
+    x86_64) target_platform="linux/amd64" ;; \
+    aarch64|arm64) target_platform="linux/arm64" ;; \
+    *) target_platform="linux/amd64" ;; \
+    esac; \
+    fi; \
+    if [ "${target_platform}" = "linux/arm64" ]; then \
     export DEBIAN_FRONTEND=noninteractive; \
     apt-get update; \
     apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu; \
@@ -79,6 +95,7 @@ ENV CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
 ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc
 ENV CC_x86_64_unknown_linux_gnu=x86_64-linux-gnu-gcc
 ENV CXX_x86_64_unknown_linux_gnu=x86_64-linux-gnu-g++
+ENV CARGO_TARGET_DIR=/usr/src/rustfs/target/docker-build
 
 WORKDIR /usr/src/rustfs
 
@@ -112,29 +129,72 @@ ENV CARGO_NET_GIT_FETCH_WITH_CLI=true \
 # Generate protobuf/flatbuffers code (uses protoc/flatc from distro)
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/usr/src/rustfs/target \
+    --mount=type=cache,target=/usr/src/rustfs/target/docker-build \
     cargo run --bin gproto
 
 # Build RustFS (target depends on TARGETPLATFORM)
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/usr/src/rustfs/target \
+    --mount=type=cache,target=/usr/src/rustfs/target/docker-build \
     set -eux; \
-    case "${TARGETPLATFORM:-linux/amd64}" in \
+    rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; \
+    target_platform="${TARGETPLATFORM:-}"; \
+    if [ -z "${target_platform}" ]; then \
+    case "${TARGETARCH:-$(uname -m)}" in \
+    amd64|x86_64) target_platform="linux/amd64" ;; \
+    arm64|aarch64) target_platform="linux/arm64" ;; \
+    *) echo "Unsupported target architecture: ${TARGETARCH:-$(uname -m)}" >&2; exit 1 ;; \
+    esac; \
+    fi; \
+    case "${target_platform}" in \
     linux/amd64) \
     echo "Building for x86_64-unknown-linux-gnu"; \
+    if [ -n "${RUSTFS_BUILD_FEATURES}" ]; then \
+    cargo build --release --locked --target x86_64-unknown-linux-gnu --bin rustfs --features "${RUSTFS_BUILD_FEATURES}" -j "$(nproc)"; \
+    else \
     cargo build --release --locked --target x86_64-unknown-linux-gnu --bin rustfs -j "$(nproc)"; \
-    install -m 0755 target/x86_64-unknown-linux-gnu/release/rustfs /usr/local/bin/rustfs \
+    fi; \
+    install -m 0755 "${CARGO_TARGET_DIR}/x86_64-unknown-linux-gnu/release/rustfs" /usr/local/bin/rustfs \
     ;; \
     linux/arm64) \
     echo "Building for aarch64-unknown-linux-gnu"; \
+    if [ -n "${RUSTFS_BUILD_FEATURES}" ]; then \
+    cargo build --release --locked --target aarch64-unknown-linux-gnu --bin rustfs --features "${RUSTFS_BUILD_FEATURES}" -j "$(nproc)"; \
+    else \
     cargo build --release --locked --target aarch64-unknown-linux-gnu --bin rustfs -j "$(nproc)"; \
-    install -m 0755 target/aarch64-unknown-linux-gnu/release/rustfs /usr/local/bin/rustfs \
+    fi; \
+    install -m 0755 "${CARGO_TARGET_DIR}/aarch64-unknown-linux-gnu/release/rustfs" /usr/local/bin/rustfs \
     ;; \
     *) \
-    echo "Unsupported TARGETPLATFORM=${TARGETPLATFORM}" >&2; exit 1 \
+    echo "Unsupported target platform=${target_platform}" >&2; exit 1 \
     ;; \
     esac
+
+# `RC_RELEASE=disabled` is reserved for local server-only validation when the
+# GitHub release asset is unavailable. The placeholder fails if invoked, so a
+# production image that needs the CLI must keep the default release download.
+# TARGETARCH is only provided by BuildKit. Fall back to TARGETPLATFORM (for
+# example set by docker-compose) and then to the build host, like the cargo
+# step above, so every path that builds this file passes a real architecture.
+RUN set -eu; \
+    if [ "${RC_RELEASE}" = "disabled" ]; then \
+    install -m 0755 /bin/false /usr/local/bin/rc; \
+    exit 0; \
+    fi; \
+    rc_arch="${TARGETARCH:-}"; \
+    if [ -z "${rc_arch}" ]; then \
+    case "${TARGETPLATFORM:-}" in \
+    linux/amd64) rc_arch=amd64 ;; \
+    linux/arm64) rc_arch=arm64 ;; \
+    *) \
+    case "$(uname -m)" in \
+    x86_64) rc_arch=amd64 ;; \
+    aarch64|arm64) rc_arch=arm64 ;; \
+    *) echo "TARGETARCH is empty and TARGETPLATFORM='${TARGETPLATFORM:-}' is not linux/amd64 or linux/arm64; cannot choose an rc architecture on $(uname -m)" >&2; exit 1 ;; \
+    esac ;; \
+    esac; \
+    fi; \
+    sh /usr/src/rustfs/scripts/download_rc.sh "${rc_arch}" musl "${RC_RELEASE}" /usr/local/bin/rc
 
 # -----------------------------
 # Development stage (keeps toolchain)
@@ -157,11 +217,7 @@ WORKDIR /app
 ENV CARGO_INCREMENTAL=1
 
 # Ensure we have the same default env vars available
-ENV RUSTFS_ADDRESS=":9000" \
-    RUSTFS_ACCESS_KEY="rustfsadmin" \
-    RUSTFS_SECRET_KEY="rustfsadmin" \
-    RUSTFS_CONSOLE_ENABLE="true" \
-    RUSTFS_VOLUMES="/data" \
+ENV RUSTFS_VOLUMES="/data" \
     RUST_LOG="warn" \
     RUSTFS_OBS_LOG_DIRECTORY="/logs" \
     RUSTFS_USERNAME="rustfs" \
@@ -173,16 +229,19 @@ ENV RUSTFS_ADDRESS=":9000" \
 # We rely on cargo run to build and run
 EXPOSE 9000 9001
 
-COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+COPY entrypoint.sh /etc/rustfs/entrypoint.sh
+COPY bootstrap/ /etc/rustfs/bootstrap/
+RUN install -m 0755 /usr/local/bin/rc /usr/bin/rc && \
+    chmod +x /etc/rustfs/entrypoint.sh && \
+    ln -s /etc/rustfs/entrypoint.sh /entrypoint.sh
 
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["/etc/rustfs/entrypoint.sh"]
 CMD ["cargo", "run", "--bin", "rustfs", "--"]
 
 # -----------------------------
 # Runtime stage (Ubuntu minimal)
 # -----------------------------
-FROM ubuntu:22.04
+FROM ubuntu:26.04
 
 ARG BUILD_DATE
 ARG VCS_REF
@@ -197,8 +256,11 @@ LABEL name="RustFS (dev-local)" \
 RUN set -eux; \
     export DEBIAN_FRONTEND=noninteractive; \
     apt-get update; \
+    apt-get upgrade -y; \
     apt-get install -y --no-install-recommends \
     ca-certificates \
+    curl \
+    jq \
     tzdata \
     coreutils; \
     rm -rf /var/lib/apt/lists/*
@@ -212,21 +274,22 @@ WORKDIR /app
 
 # Prepare data/log directories with sane defaults
 RUN set -eux; \
-    mkdir -p /data /logs; \
+    mkdir -p /data/.rustfs/events /data/.rustfs/audit /logs /opt/rustfs; \
+    ln -s /data/.rustfs/events /opt/rustfs/events; \
+    ln -s /data/.rustfs/audit /opt/rustfs/audit; \
     chown -R rustfs:rustfs /data /logs /app; \
     chmod 0750 /data /logs
 
 # Copy the freshly built binary and the entrypoint
 COPY --from=builder /usr/local/bin/rustfs /usr/bin/rustfs
-COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /usr/bin/rustfs /entrypoint.sh
+COPY --from=builder /usr/local/bin/rc /usr/bin/rc
+COPY entrypoint.sh /etc/rustfs/entrypoint.sh
+COPY bootstrap/ /etc/rustfs/bootstrap/
+RUN chmod +x /usr/bin/rustfs /usr/bin/rc /etc/rustfs/entrypoint.sh && \
+    ln -s /etc/rustfs/entrypoint.sh /entrypoint.sh
 
 # Default environment (override in docker run/compose as needed)
-ENV RUSTFS_ADDRESS=":9000" \
-    RUSTFS_ACCESS_KEY="rustfsadmin" \
-    RUSTFS_SECRET_KEY="rustfsadmin" \
-    RUSTFS_CONSOLE_ENABLE="true" \
-    RUSTFS_VOLUMES="/data" \
+ENV RUSTFS_VOLUMES="/data" \
     RUST_LOG="warn" \
     RUSTFS_USERNAME="rustfs" \
     RUSTFS_GROUPNAME="rustfs" \
@@ -237,5 +300,5 @@ EXPOSE 9000
 VOLUME ["/data"]
 
 # Keep root here; entrypoint will drop privileges using chroot --userspec
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["/etc/rustfs/entrypoint.sh"]
 CMD ["/usr/bin/rustfs"]

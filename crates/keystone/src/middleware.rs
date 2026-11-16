@@ -15,14 +15,14 @@
 //! Keystone authentication middleware
 //!
 //! This middleware intercepts HTTP requests and checks for OpenStack Keystone
-//! authentication headers (X-Auth-Token). If found, it validates the token
-//! with Keystone and stores the authenticated credentials in task-local storage
-//! for use by downstream authentication handlers.
+//! authentication headers (X-Auth-Token or Swift X-Storage-Token). If found, it validates the token
+//! with Keystone. The legacy edge receives credentials in task-local storage; the gateway
+//! receives a single-use request identity containing the proof and sanitized authorization facts.
 //!
 //! ## Authentication Flow
 //!
 //! 1. Check if Keystone is enabled (via global provider)
-//! 2. Extract X-Auth-Token header from request
+//! 2. Extract X-Auth-Token or X-Storage-Token header from request
 //! 3. If token present:
 //!    - Validate with Keystone service
 //!    - On success: Store credentials in task-local, continue processing
@@ -40,21 +40,75 @@ use futures::Future;
 use http::{HeaderMap, Request, Response, StatusCode};
 use http_body::Body;
 use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
 use rustfs_credentials::Credentials;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use tower::{Layer, Service};
 use tracing::{debug, info, warn};
 
-use crate::KeystoneAuthProvider;
+use crate::{KeystoneAuthProvider, ValidatedKeystoneToken};
+
+const HEADER_X_AUTH_TOKEN: &str = "X-Auth-Token";
+const HEADER_X_STORAGE_TOKEN: &str = "X-Storage-Token";
 
 // Task-local storage for Keystone credentials
 // This allows passing credentials from middleware to auth handlers
 // without modifying the request/response types
 tokio::task_local! {
     pub static KEYSTONE_CREDENTIALS: Option<Credentials>;
+}
+
+/// A request-local, single-use result of one Keystone validation. Only this middleware can
+/// create it. Clones share the same consumption slot and contain no token or secret key.
+#[derive(Clone)]
+pub struct KeystoneRequestIdentity(Arc<Mutex<Option<KeystoneRequestValidation>>>);
+
+struct KeystoneRequestValidation {
+    provider: Arc<KeystoneAuthProvider>,
+    proof: ValidatedKeystoneToken,
+    credentials: Credentials,
+    had_session_token: bool,
+}
+
+/// A missing, consumed, poisoned or differently configured request identity.
+#[derive(Debug, thiserror::Error)]
+#[error("the request has no matching Keystone validation")]
+pub struct KeystoneRequestNotValidated;
+
+impl KeystoneRequestIdentity {
+    fn new(provider: Arc<KeystoneAuthProvider>, proof: ValidatedKeystoneToken, mut credentials: Credentials) -> Self {
+        let had_session_token = !credentials.session_token.is_empty();
+        credentials.secret_key.clear();
+        credentials.session_token.clear();
+        Self(Arc::new(Mutex::new(Some(KeystoneRequestValidation {
+            provider,
+            proof,
+            credentials,
+            had_session_token,
+        }))))
+    }
+
+    /// Consumes the paired proof and sanitized credential once, only for the validating provider.
+    /// The boolean records whether the original credential had a session token.
+    ///
+    /// # Errors
+    /// Returns [`KeystoneRequestNotValidated`] for a different provider, a consumed slot or poison.
+    pub fn take_for(
+        self,
+        provider: &Arc<KeystoneAuthProvider>,
+    ) -> Result<(ValidatedKeystoneToken, Credentials, bool), KeystoneRequestNotValidated> {
+        let value = self
+            .0
+            .lock()
+            .map_err(|_| KeystoneRequestNotValidated)?
+            .take()
+            .ok_or(KeystoneRequestNotValidated)?;
+        if !Arc::ptr_eq(provider, &value.provider) {
+            return Err(KeystoneRequestNotValidated);
+        }
+        Ok((value.proof, value.credentials, value.had_session_token))
+    }
 }
 
 /// Tower Layer for Keystone authentication
@@ -106,11 +160,12 @@ pub struct KeystoneAuthMiddleware<S> {
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type BoxBody = http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError>;
 
-impl<S, B> Service<Request<Incoming>> for KeystoneAuthMiddleware<S>
+impl<S, ReqBody, B> Service<Request<ReqBody>> for KeystoneAuthMiddleware<S>
 where
-    S: Service<Request<Incoming>, Response = Response<B>> + Clone + Send + 'static,
+    S: Service<Request<ReqBody>, Response = Response<B>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Send + 'static,
+    ReqBody: Send + 'static,
     B: Body<Data = Bytes> + Send + 'static,
     B::Error: Into<BoxError> + Send + 'static,
 {
@@ -122,7 +177,8 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: Request<Incoming>) -> Self::Future {
+    fn call(&mut self, mut req: Request<ReqBody>) -> Self::Future {
+        req.extensions_mut().remove::<KeystoneRequestIdentity>();
         let keystone_auth = self.keystone_auth.clone();
         let mut inner = self.inner.clone();
 
@@ -133,28 +189,35 @@ where
                 None => {
                     // No Keystone configured, pass through to normal authentication
                     debug!("Keystone middleware: No provider configured, passing through");
-                    let resp = inner.call(req).await?;
+                    let resp = KEYSTONE_CREDENTIALS.scope(None, async move { inner.call(req).await }).await?;
                     let (parts, body) = resp.into_parts();
                     let body: BoxBody = body.map_err(Into::into).boxed_unsync();
                     return Ok(Response::from_parts(parts, body));
                 }
             };
 
-            // Extract X-Auth-Token header
             let token = extract_keystone_token(req.headers());
 
             if let Some(token) = token {
-                debug!("Keystone middleware: Found X-Auth-Token header, validating");
+                debug!("Keystone middleware: Found Keystone token header, validating");
 
                 // Validate token with Keystone
-                match keystone_auth.authenticate_with_token(token).await {
-                    Ok(credentials) => {
+                match keystone_auth.authenticate_with_token_and_proof(token).await {
+                    Ok((credentials, proof)) => {
                         // Authentication successful!
                         info!("Keystone middleware: Authentication successful for user: {}", credentials.parent_user);
 
+                        req.extensions_mut().insert(KeystoneRequestIdentity::new(
+                            Arc::clone(&keystone_auth),
+                            proof,
+                            credentials.clone(),
+                        ));
+
                         // Store credentials in task-local storage and continue processing
                         // The auth handlers will retrieve these credentials when needed
-                        let resp = KEYSTONE_CREDENTIALS.scope(Some(credentials), inner.call(req)).await?;
+                        let resp = KEYSTONE_CREDENTIALS
+                            .scope(Some(credentials), async move { inner.call(req).await })
+                            .await?;
                         let (parts, body) = resp.into_parts();
                         let body: BoxBody = body.map_err(Into::into).boxed_unsync();
                         return Ok(Response::from_parts(parts, body));
@@ -171,11 +234,15 @@ where
     <Message>Invalid Keystone token</Message>
     <Details>{}</Details>
 </Error>"#,
-                            xml_escape(&e.to_string())
+                            xml_escape(match e {
+                                crate::KeystoneError::InvalidToken => "Invalid token",
+                                crate::KeystoneError::TokenExpired => "Token expired",
+                                _ => "Keystone token validation failed",
+                            })
                         );
 
                         let body: BoxBody = Full::new(Bytes::from(error_xml))
-                            .map_err(|e| -> BoxError { Box::new(e) })
+                            .map_err(|never| match never {})
                             .boxed_unsync();
 
                         let response = Response::builder()
@@ -191,8 +258,8 @@ where
             }
 
             // No Keystone token header present, pass through to normal S3 authentication
-            debug!("Keystone middleware: No X-Auth-Token header, passing through to S3 auth");
-            let resp = inner.call(req).await?;
+            debug!("Keystone middleware: No Keystone token header, passing through to S3 auth");
+            let resp = KEYSTONE_CREDENTIALS.scope(None, async move { inner.call(req).await }).await?;
             let (parts, body) = resp.into_parts();
             let body: BoxBody = body.map_err(Into::into).boxed_unsync();
             Ok(Response::from_parts(parts, body))
@@ -200,14 +267,11 @@ where
     }
 }
 
-/// Extract Keystone token from request headers
-///
-/// Checks for X-Auth-Token header (Keystone v3 standard).
-/// Note: X-Storage-Token (Swift) support deferred to future PR per Q4.C
 fn extract_keystone_token(headers: &HeaderMap) -> Option<&str> {
-    headers.get("X-Auth-Token").and_then(|v| v.to_str().ok())
-    // TODO: Add X-Storage-Token support in Phase 2 (Swift API)
-    // .or_else(|| headers.get("X-Storage-Token").and_then(|v| v.to_str().ok()))
+    headers
+        .get(HEADER_X_AUTH_TOKEN)
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| headers.get(HEADER_X_STORAGE_TOKEN).and_then(|v| v.to_str().ok()))
 }
 
 /// Escape XML special characters to prevent injection
@@ -224,6 +288,113 @@ mod tests {
     use super::*;
     use crate::{KeystoneClient, KeystoneVersion};
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn request_identity_erases_secrets_and_consumes_its_proof_once() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind Keystone stub");
+        let endpoint = format!("http://{}", listener.local_addr().expect("stub address"));
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("validation request");
+            socket.set_read_timeout(Some(Duration::from_secs(5))).expect("stub timeout");
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).expect("read validation request") > 0);
+            let expiry = (time::OffsetDateTime::now_utc() + time::Duration::hours(1))
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("expiry");
+            let body = serde_json::json!({"token": {"user": {"id": "user-id", "name": "user-name"}, "roles": [{"name": "member"}], "expires_at": expiry}}).to_string();
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("validation response");
+        });
+        let client = KeystoneClient::new(
+            endpoint,
+            KeystoneVersion::V3,
+            None,
+            None,
+            None,
+            "Default".into(),
+            true,
+            Duration::from_secs(5),
+        );
+        let provider = Arc::new(KeystoneAuthProvider::new(client, 1, Duration::from_secs(1), false));
+        let (mut credentials, proof) = provider
+            .authenticate_with_token_and_proof("request-token")
+            .await
+            .expect("validated token");
+        server.join().expect("stub answered");
+        credentials.secret_key = "original-secret".into();
+        credentials.session_token = "original-session".into();
+        let original = credentials.clone();
+        let carrier = KeystoneRequestIdentity::new(Arc::clone(&provider), proof, credentials);
+        let clone = carrier.clone();
+        let (proof, sanitized, had_session) = carrier.take_for(&provider).expect("first consumer");
+        let mut failures = Vec::new();
+        for (ok, fact) in [
+            (proof.user_id() == "user-id", "proof identity"),
+            (sanitized.secret_key.is_empty(), "secret erased"),
+            (sanitized.session_token.is_empty(), "session erased"),
+            (had_session, "original session presence"),
+            (sanitized.access_key == original.access_key, "access key retained"),
+            (sanitized.parent_user == original.parent_user, "parent retained"),
+            (sanitized.expiration == original.expiration, "expiry retained"),
+            (sanitized.groups == original.groups, "groups retained"),
+            (sanitized.claims == original.claims, "claims retained"),
+            (clone.take_for(&provider).is_err(), "single consumption"),
+        ] {
+            if !ok {
+                failures.push(fact);
+            }
+        }
+        let poisoned = KeystoneRequestIdentity::new(Arc::clone(&provider), proof, sanitized);
+        let slot = Arc::clone(&poisoned.0);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = slot.lock().expect("unpoisoned slot");
+                panic!("poison the request slot");
+            })
+            .join()
+            .is_err()
+        );
+        if poisoned.take_for(&provider).is_ok() {
+            failures.push("poison refusal");
+        }
+        assert!(failures.is_empty(), "{}", failures.join(", "));
+    }
+
+    #[tokio::test]
+    async fn disabled_middleware_clears_identity_before_inner_call_and_poll() {
+        use tower::ServiceExt;
+        let service = tower::service_fn(|_request: Request<()>| {
+            assert!(KEYSTONE_CREDENTIALS.try_with(Clone::clone).expect("call scope").is_none());
+            async {
+                assert!(KEYSTONE_CREDENTIALS.try_with(Clone::clone).expect("poll scope").is_none());
+                Ok::<_, std::convert::Infallible>(Response::new(Full::new(Bytes::new())))
+            }
+        });
+        let outer = Credentials {
+            access_key: "outer-identity".into(),
+            ..Default::default()
+        };
+        KEYSTONE_CREDENTIALS
+            .scope(Some(outer), async {
+                let response = KeystoneAuthLayer::new(None)
+                    .layer(service)
+                    .oneshot(Request::new(()))
+                    .await
+                    .expect("disabled middleware");
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(
+                    KEYSTONE_CREDENTIALS.with(|credentials| credentials.as_ref().map(|value| value.access_key.clone())),
+                    Some("outer-identity".into())
+                );
+            })
+            .await;
+    }
 
     #[test]
     fn test_layer_creation_no_keystone() {
@@ -243,6 +414,7 @@ mod tests {
             None,
             "Default".to_string(),
             true,
+            Duration::from_secs(30),
         );
         let provider = KeystoneAuthProvider::new(client, 100, Duration::from_secs(60), true);
         let layer = KeystoneAuthLayer::new(Some(Arc::new(provider)));
@@ -254,8 +426,18 @@ mod tests {
         let mut headers = HeaderMap::new();
         assert!(extract_keystone_token(&headers).is_none());
 
-        headers.insert("X-Auth-Token", "test-token-123".parse().unwrap());
+        headers.insert(HEADER_X_AUTH_TOKEN, "test-token-123".parse().expect("auth token header should parse"));
         assert_eq!(extract_keystone_token(&headers), Some("test-token-123"));
+
+        headers.clear();
+        headers.insert(
+            HEADER_X_STORAGE_TOKEN,
+            "swift-token-456".parse().expect("storage token header should parse"),
+        );
+        assert_eq!(extract_keystone_token(&headers), Some("swift-token-456"));
+
+        headers.insert(HEADER_X_AUTH_TOKEN, "auth-token-789".parse().expect("auth token header should parse"));
+        assert_eq!(extract_keystone_token(&headers), Some("auth-token-789"));
     }
 
     #[tokio::test]

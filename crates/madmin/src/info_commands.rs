@@ -14,7 +14,8 @@
 
 use std::{collections::HashMap, time::SystemTime};
 
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Serialize, Serializer};
 use time::OffsetDateTime;
 
 use crate::metrics::TimedAction;
@@ -24,6 +25,18 @@ pub enum ItemState {
     Offline,
     Initializing,
     Online,
+    /// The peer could not be probed this cycle but is not confirmed down.
+    /// Distinct from `Offline` (confirmed unreachable past the failure
+    /// threshold) and `Initializing` (genuinely still starting up): a
+    /// transient probe miss on an otherwise-healthy member must not read as
+    /// an ejection. See rustfs/backlog#1049.
+    Unknown,
+    /// The peer's admin/properties RPC keeps failing, but its drives are still
+    /// answering the independent disk-health heartbeat — the node is alive and
+    /// serving data, only its admin surface is unreachable. Reported instead of
+    /// `Offline` so a stuck admin path (e.g. a saturated scanner) is not
+    /// mistaken for an ejected node. See rustfs/backlog#1049 (P0-B).
+    Degraded,
 }
 
 impl ItemState {
@@ -32,6 +45,8 @@ impl ItemState {
             ItemState::Offline => "offline",
             ItemState::Initializing => "initializing",
             ItemState::Online => "online",
+            ItemState::Unknown => "unknown",
+            ItemState::Degraded => "degraded",
         }
     }
 
@@ -40,20 +55,46 @@ impl ItemState {
             "offline" => Some(ItemState::Offline),
             "initializing" => Some(ItemState::Initializing),
             "online" => Some(ItemState::Online),
+            "unknown" => Some(ItemState::Unknown),
+            "degraded" => Some(ItemState::Degraded),
             _ => None,
         }
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct DiskMetrics {
+    #[serde(rename = "lastMinute", alias = "last_minute")]
     pub last_minute: HashMap<String, TimedAction>,
+    #[serde(rename = "apiCalls", alias = "api_calls")]
     pub api_calls: HashMap<String, u64>,
+    #[serde(rename = "totalWaiting", alias = "total_waiting")]
     pub total_waiting: u32,
+    #[serde(rename = "totalErrsAvailability", alias = "total_errors_availability")]
     pub total_errors_availability: u64,
+    #[serde(rename = "totalErrsTimeout", alias = "total_errors_timeout")]
     pub total_errors_timeout: u64,
+    #[serde(rename = "totalWrites", alias = "total_writes")]
     pub total_writes: u64,
+    #[serde(rename = "totalDeletes", alias = "total_deletes")]
     pub total_deletes: u64,
+}
+
+impl Serialize for DiskMetrics {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("DiskMetrics", 7)?;
+        state.serialize_field("last_minute", &self.last_minute)?;
+        state.serialize_field("api_calls", &self.api_calls)?;
+        state.serialize_field("total_waiting", &self.total_waiting)?;
+        state.serialize_field("total_errors_availability", &self.total_errors_availability)?;
+        state.serialize_field("total_errors_timeout", &self.total_errors_timeout)?;
+        state.serialize_field("total_writes", &self.total_writes)?;
+        state.serialize_field("total_deletes", &self.total_deletes)?;
+        state.end()
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
@@ -93,6 +134,17 @@ pub struct Disk {
     pub pool_index: i32,
     pub set_index: i32,
     pub disk_index: i32,
+    #[serde(rename = "runtimeState", default, skip_serializing_if = "Option::is_none")]
+    pub runtime_state: Option<String>,
+    #[serde(rename = "offlineDurationSeconds", default, skip_serializing_if = "Option::is_none")]
+    pub offline_duration_seconds: Option<u64>,
+    #[serde(rename = "capacityObservationSource", default, skip_serializing_if = "Option::is_none")]
+    pub capacity_observation_source: Option<String>,
+    #[serde(rename = "capacityObservationAgeSeconds", default, skip_serializing_if = "Option::is_none")]
+    pub capacity_observation_age_seconds: Option<u64>,
+    /// Leaf physical block devices backing this disk path when the platform can resolve them.
+    #[serde(rename = "physicalDeviceIds", default, skip_serializing_if = "Option::is_none")]
+    pub physical_device_ids: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -124,7 +176,7 @@ pub struct HealingDisk {
     pub finished: bool,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub enum BackendByte {
     #[default]
     Unknown,
@@ -132,13 +184,37 @@ pub enum BackendByte {
     Erasure,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct StorageInfo {
     pub disks: Vec<Disk>,
     pub backend: BackendInfo,
+    /// Missing observations from older nodes are unknown, never proof of health.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observations: Vec<StorageInfoObservation>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageInfoProbeStatus {
+    Succeeded,
+    Failed,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct StorageInfoObservation {
+    pub endpoint: String,
+    pub status: StorageInfoProbeStatus,
+    pub cached: bool,
+    pub last_success_unix_millis: Option<u64>,
+    pub snapshot_age_seconds: Option<u64>,
+    pub error_code: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct BackendDisks(pub HashMap<String, usize>);
 
 impl BackendDisks {
@@ -150,7 +226,7 @@ impl BackendDisks {
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct BackendInfo {
     pub backend_type: BackendByte,
@@ -175,8 +251,10 @@ pub struct BackendInfo {
 pub const ITEM_OFFLINE: &str = "offline";
 pub const ITEM_INITIALIZING: &str = "initializing";
 pub const ITEM_ONLINE: &str = "online";
+pub const ITEM_UNKNOWN: &str = "unknown";
+pub const ITEM_DEGRADED: &str = "degraded";
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct MemStats {
     pub alloc: u64,
     pub total_alloc: u64,
@@ -185,7 +263,7 @@ pub struct MemStats {
     pub heap_alloc: u64,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ServerProperties {
     pub state: String,
     pub endpoint: String,
@@ -288,6 +366,8 @@ pub struct ErasureSetInfo {
     pub versions_count: u64,
     #[serde(rename = "deleteMarkersCount")]
     pub delete_markers_count: u64,
+    #[serde(rename = "usageError", default, skip_serializing_if = "Option::is_none")]
+    pub usage_error: Option<String>,
     #[serde(rename = "healDisks")]
     pub heal_disks: i32,
 }
@@ -315,6 +395,14 @@ pub struct ErasureBackend {
     pub online_disks: usize,
     #[serde(rename = "offlineDisks")]
     pub offline_disks: usize,
+    /// Drives whose owning member could not be probed this cycle and is not
+    /// confirmed offline. Kept as a separate bucket so
+    /// `online + offline + unknown == totalDrivesPerSet` holds even while a
+    /// member is unreachable, instead of the fourth drive silently vanishing
+    /// from the totals (rustfs/backlog#1049). `#[serde(default)]` keeps older
+    /// payloads that predate this field deserializable.
+    #[serde(rename = "unknownDisks", default)]
+    pub unknown_disks: usize,
     #[serde(rename = "standardSCParity")]
     pub standard_sc_parity: Option<usize>,
     #[serde(rename = "rrSCParity")]
@@ -349,15 +437,68 @@ pub struct InfoMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rmp_serde::{Deserializer, Serializer};
     use serde_json;
-    use std::collections::HashMap;
+    use std::{collections::HashMap, io::Cursor};
     use time::OffsetDateTime;
+
+    #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+    struct LegacyDiskCompat {
+        endpoint: String,
+        #[serde(rename = "rootDisk")]
+        root_disk: bool,
+        #[serde(rename = "path")]
+        drive_path: String,
+        healing: bool,
+        scanning: bool,
+        state: String,
+        uuid: String,
+        major: u32,
+        minor: u32,
+        model: Option<String>,
+        #[serde(rename = "totalspace")]
+        total_space: u64,
+        #[serde(rename = "usedspace")]
+        used_space: u64,
+        #[serde(rename = "availspace")]
+        available_space: u64,
+        #[serde(rename = "readthroughput")]
+        read_throughput: f64,
+        #[serde(rename = "writethroughput")]
+        write_throughput: f64,
+        #[serde(rename = "readlatency")]
+        read_latency: f64,
+        #[serde(rename = "writelatency")]
+        write_latency: f64,
+        utilization: f64,
+        metrics: Option<DiskMetrics>,
+        heal_info: Option<HealingDisk>,
+        used_inodes: u64,
+        free_inodes: u64,
+        local: bool,
+        pool_index: i32,
+        set_index: i32,
+        disk_index: i32,
+    }
+
+    #[derive(Deserialize)]
+    struct LegacyDiskMetricsCompat {
+        last_minute: HashMap<String, TimedAction>,
+        api_calls: HashMap<String, u64>,
+        total_waiting: u32,
+        total_errors_availability: u64,
+        total_errors_timeout: u64,
+        total_writes: u64,
+        total_deletes: u64,
+    }
 
     #[test]
     fn test_item_state_to_string() {
         assert_eq!(ItemState::Offline.to_string(), ITEM_OFFLINE);
         assert_eq!(ItemState::Initializing.to_string(), ITEM_INITIALIZING);
         assert_eq!(ItemState::Online.to_string(), ITEM_ONLINE);
+        assert_eq!(ItemState::Unknown.to_string(), ITEM_UNKNOWN);
+        assert_eq!(ItemState::Degraded.to_string(), ITEM_DEGRADED);
     }
 
     #[test]
@@ -365,6 +506,8 @@ mod tests {
         assert_eq!(ItemState::from_string(ITEM_OFFLINE), Some(ItemState::Offline));
         assert_eq!(ItemState::from_string(ITEM_INITIALIZING), Some(ItemState::Initializing));
         assert_eq!(ItemState::from_string(ITEM_ONLINE), Some(ItemState::Online));
+        assert_eq!(ItemState::from_string(ITEM_UNKNOWN), Some(ItemState::Unknown));
+        assert_eq!(ItemState::from_string(ITEM_DEGRADED), Some(ItemState::Degraded));
     }
 
     #[test]
@@ -413,6 +556,56 @@ mod tests {
     }
 
     #[test]
+    fn test_disk_metrics_json_preserves_internode_legacy_fields() {
+        let metrics = DiskMetrics {
+            total_waiting: 5,
+            total_errors_availability: 2,
+            total_errors_timeout: 1,
+            total_writes: 1000,
+            total_deletes: 50,
+            ..Default::default()
+        };
+
+        let json = serde_json::to_value(metrics).expect("disk metrics should serialize");
+
+        assert!(json.get("last_minute").is_some());
+        assert!(json.get("api_calls").is_some());
+        assert_eq!(json["total_waiting"], serde_json::json!(5));
+        assert_eq!(json["total_errors_availability"], serde_json::json!(2));
+        assert_eq!(json["total_errors_timeout"], serde_json::json!(1));
+        assert_eq!(json["total_writes"], serde_json::json!(1000));
+        assert_eq!(json["total_deletes"], serde_json::json!(50));
+        assert!(json.get("lastMinute").is_none());
+        assert!(json.get("totalErrsTimeout").is_none());
+    }
+
+    #[test]
+    fn test_disk_metrics_msgpack_uses_internode_legacy_fields() {
+        let metrics = DiskMetrics {
+            total_waiting: 5,
+            total_errors_availability: 2,
+            total_errors_timeout: 1,
+            total_writes: 1000,
+            total_deletes: 50,
+            ..Default::default()
+        };
+
+        let mut encoded = Vec::new();
+        metrics
+            .serialize(&mut Serializer::new(&mut encoded).with_struct_map())
+            .expect("disk metrics should encode as named msgpack");
+
+        let decoded: LegacyDiskMetricsCompat = rmp_serde::from_slice(&encoded).expect("legacy disk metrics should decode");
+        assert!(decoded.last_minute.is_empty());
+        assert!(decoded.api_calls.is_empty());
+        assert_eq!(decoded.total_waiting, 5);
+        assert_eq!(decoded.total_errors_availability, 2);
+        assert_eq!(decoded.total_errors_timeout, 1);
+        assert_eq!(decoded.total_writes, 1000);
+        assert_eq!(decoded.total_deletes, 50);
+    }
+
+    #[test]
     fn test_disk_default() {
         let disk = Disk::default();
         assert!(disk.endpoint.is_empty());
@@ -437,6 +630,7 @@ mod tests {
         assert!(disk.heal_info.is_none());
         assert_eq!(disk.used_inodes, 0);
         assert_eq!(disk.free_inodes, 0);
+        assert!(disk.physical_device_ids.is_none());
         assert!(!disk.local);
         assert_eq!(disk.pool_index, 0);
         assert_eq!(disk.set_index, 0);
@@ -465,9 +659,14 @@ mod tests {
             write_latency: 7.8,
             utilization: 50.0,
             metrics: Some(DiskMetrics::default()),
+            runtime_state: Some("online".to_string()),
+            offline_duration_seconds: Some(0),
+            capacity_observation_source: None,
+            capacity_observation_age_seconds: None,
             heal_info: None,
             used_inodes: 1000000,
             free_inodes: 9000000,
+            physical_device_ids: Some(vec!["nvme0n1".to_string()]),
             local: true,
             pool_index: 0,
             set_index: 1,
@@ -485,7 +684,113 @@ mod tests {
         assert_eq!(disk.total_space, 1000000000000);
         assert_eq!(disk.utilization, 50.0);
         assert!(disk.metrics.is_some());
+        assert_eq!(disk.runtime_state.as_deref(), Some("online"));
+        assert_eq!(disk.offline_duration_seconds, Some(0));
+        assert_eq!(disk.physical_device_ids, Some(vec!["nvme0n1".to_string()]));
         assert!(disk.local);
+    }
+
+    #[test]
+    fn test_disk_msgpack_backward_compat_from_legacy_layout() {
+        let legacy = LegacyDiskCompat {
+            endpoint: "http://legacy-node:9000".to_string(),
+            root_disk: false,
+            drive_path: "/data/legacy".to_string(),
+            healing: false,
+            scanning: false,
+            state: ITEM_ONLINE.to_string(),
+            uuid: "legacy-uuid".to_string(),
+            major: 8,
+            minor: 2,
+            model: Some("legacy".to_string()),
+            total_space: 42,
+            used_space: 12,
+            available_space: 30,
+            read_throughput: 1.0,
+            write_throughput: 2.0,
+            read_latency: 3.0,
+            write_latency: 4.0,
+            utilization: 5.0,
+            metrics: None,
+            heal_info: None,
+            used_inodes: 11_125,
+            free_inodes: 98_000,
+            local: true,
+            pool_index: 1,
+            set_index: 2,
+            disk_index: 3,
+        };
+
+        let mut encoded = Vec::new();
+        legacy.serialize(&mut Serializer::new(&mut encoded)).unwrap();
+
+        let mut decoder = Deserializer::new(Cursor::new(encoded));
+        let decoded: Disk = serde::Deserialize::deserialize(&mut decoder).unwrap();
+        assert_eq!(decoded.used_inodes, 11_125);
+        assert_eq!(decoded.runtime_state, None);
+        assert_eq!(decoded.offline_duration_seconds, None);
+        assert_eq!(decoded.physical_device_ids, None);
+    }
+
+    #[test]
+    fn test_disk_msgpack_forward_compat_to_legacy_layout() {
+        let current = Disk {
+            endpoint: "http://current-node:9000".to_string(),
+            root_disk: false,
+            drive_path: "/data/current".to_string(),
+            healing: false,
+            scanning: false,
+            state: ITEM_ONLINE.to_string(),
+            uuid: "current-uuid".to_string(),
+            major: 8,
+            minor: 3,
+            model: Some("current".to_string()),
+            total_space: 64,
+            used_space: 20,
+            available_space: 44,
+            read_throughput: 1.5,
+            write_throughput: 2.5,
+            read_latency: 3.5,
+            write_latency: 4.5,
+            utilization: 6.5,
+            metrics: None,
+            heal_info: None,
+            used_inodes: 22_250,
+            free_inodes: 97_000,
+            local: true,
+            pool_index: 1,
+            set_index: 2,
+            disk_index: 3,
+            physical_device_ids: Some(vec!["nvme0n1".to_string(), "nvme1n1".to_string()]),
+            runtime_state: Some("online".to_string()),
+            offline_duration_seconds: Some(0),
+            capacity_observation_source: None,
+            capacity_observation_age_seconds: None,
+        };
+
+        let mut encoded = Vec::new();
+        current
+            .serialize(&mut Serializer::new(&mut encoded).with_struct_map())
+            .unwrap();
+
+        let mut decoder = Deserializer::new(Cursor::new(encoded));
+        let decoded: LegacyDiskCompat = serde::Deserialize::deserialize(&mut decoder).unwrap();
+        assert_eq!(decoded.used_inodes, 22_250);
+        assert_eq!(decoded.disk_index, 3);
+        assert_eq!(decoded.endpoint, "http://current-node:9000");
+    }
+
+    #[test]
+    fn test_disk_serializes_physical_device_ids_when_present() {
+        let disk = Disk {
+            physical_device_ids: Some(vec!["nvme0n1".to_string(), "nvme1n1".to_string()]),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&disk).unwrap();
+        assert!(json.contains("physicalDeviceIds"));
+        assert!(json.contains("nvme0n1"));
+        assert!(json.contains("nvme1n1"));
     }
 
     #[test]
@@ -598,11 +903,46 @@ mod tests {
                 },
             ],
             backend: BackendInfo::default(),
+            ..Default::default()
         };
 
         assert_eq!(storage_info.disks.len(), 2);
         assert_eq!(storage_info.disks[0].endpoint, "node1:9000");
         assert_eq!(storage_info.disks[1].state, "offline");
+    }
+
+    #[test]
+    fn storage_info_observation_is_additive_and_unknown_for_old_peers() {
+        #[derive(Serialize, Deserialize)]
+        struct LegacyStorageInfo {
+            disks: Vec<Disk>,
+            backend: BackendInfo,
+        }
+        let old = LegacyStorageInfo {
+            disks: Vec::new(),
+            backend: BackendInfo::default(),
+        };
+        let encoded = rmp_serde::to_vec_named(&old).expect("legacy map");
+        let decoded: StorageInfo = rmp_serde::from_slice(&encoded).expect("old peer response");
+        assert!(decoded.observations.is_empty());
+        let mut new = decoded;
+        new.observations.push(StorageInfoObservation {
+            endpoint: "node2:9000".into(),
+            status: StorageInfoProbeStatus::Failed,
+            cached: true,
+            last_success_unix_millis: Some(1_700_000_000_000),
+            snapshot_age_seconds: Some(5),
+            error_code: Some("Timeout".into()),
+        });
+        let encoded = rmp_serde::to_vec_named(&new).expect("new map");
+        let legacy: LegacyStorageInfo = rmp_serde::from_slice(&encoded).expect("old reader ignores new fields");
+        assert!(legacy.disks.is_empty());
+        let roundtrip: StorageInfo = rmp_serde::from_slice(&encoded).expect("new reader preserves observation");
+        assert_eq!(roundtrip.observations, new.observations);
+        let unknown: StorageInfoObservation =
+            serde_json::from_str(r#"{"endpoint":"node2","status":"future_state"}"#).expect("future state remains unknown");
+        assert_eq!(unknown.status, StorageInfoProbeStatus::Unknown);
+        assert_eq!(unknown.snapshot_age_seconds, None);
     }
 
     #[test]
@@ -730,8 +1070,8 @@ mod tests {
         network.insert("ip".to_string(), "192.168.1.100".to_string());
 
         let mut env_vars = HashMap::new();
-        env_vars.insert("RUSTFS_ROOT_USER".to_string(), "admin".to_string());
-        env_vars.insert("RUSTFS_ROOT_PASSWORD".to_string(), "password".to_string());
+        env_vars.insert("RUSTFS_ACCESS_KEY".to_string(), "admin".to_string());
+        env_vars.insert("RUSTFS_SECRET_KEY".to_string(), "password".to_string());
 
         let server_props = ServerProperties {
             state: "online".to_string(),
@@ -914,6 +1254,7 @@ mod tests {
         assert_eq!(erasure_set.objects_count, 0);
         assert_eq!(erasure_set.versions_count, 0);
         assert_eq!(erasure_set.delete_markers_count, 0);
+        assert!(erasure_set.usage_error.is_none());
         assert_eq!(erasure_set.heal_disks, 0);
     }
 
@@ -927,6 +1268,7 @@ mod tests {
             objects_count: 10000,
             versions_count: 15000,
             delete_markers_count: 500,
+            usage_error: None,
             heal_disks: 2,
         };
 
@@ -938,6 +1280,38 @@ mod tests {
         assert_eq!(erasure_set.versions_count, 15000);
         assert_eq!(erasure_set.delete_markers_count, 500);
         assert_eq!(erasure_set.heal_disks, 2);
+    }
+
+    #[test]
+    fn erasure_set_usage_error_is_additive_on_the_wire() {
+        #[derive(Deserialize)]
+        struct LegacyErasureSetInfo {
+            id: i32,
+            usage: u64,
+        }
+
+        let legacy = r#"{"id":1,"rawUsage":2,"rawCapacity":3,"usage":4,"objectsCount":5,"versionsCount":6,"deleteMarkersCount":7,"healDisks":8}"#;
+        let decoded: ErasureSetInfo = serde_json::from_str(legacy).expect("legacy erasure set payload should decode");
+        assert!(decoded.usage_error.is_none());
+
+        let encoded = serde_json::to_value(decoded).expect("erasure set payload should encode");
+        assert!(
+            encoded.get("usageError").is_none(),
+            "an absent usage error must not change the legacy wire shape"
+        );
+
+        let current = ErasureSetInfo {
+            id: 9,
+            usage: 10,
+            usage_error: Some("data usage unavailable".to_string()),
+            ..Default::default()
+        };
+        let encoded = serde_json::to_value(current).expect("current erasure set payload should encode");
+        let legacy: LegacyErasureSetInfo =
+            serde_json::from_value(encoded).expect("legacy erasure set reader should ignore additive fields");
+
+        assert_eq!(legacy.id, 9);
+        assert_eq!(legacy.usage, 10);
     }
 
     #[test]
@@ -982,6 +1356,7 @@ mod tests {
             backend_type: BackendType::ErasureType,
             online_disks: 8,
             offline_disks: 0,
+            unknown_disks: 0,
             standard_sc_parity: Some(2),
             rr_sc_parity: Some(1),
             total_sets: vec![2],
@@ -991,6 +1366,7 @@ mod tests {
         assert!(matches!(erasure_backend.backend_type, BackendType::ErasureType));
         assert_eq!(erasure_backend.online_disks, 8);
         assert_eq!(erasure_backend.offline_disks, 0);
+        assert_eq!(erasure_backend.unknown_disks, 0);
         assert_eq!(erasure_backend.standard_sc_parity.unwrap(), 2);
         assert_eq!(erasure_backend.rr_sc_parity.unwrap(), 1);
         assert_eq!(erasure_backend.total_sets.len(), 1);
@@ -1074,6 +1450,7 @@ mod tests {
         let storage_info = StorageInfo {
             disks: vec![],
             backend: BackendInfo::default(),
+            ..Default::default()
         };
         let backend_info = BackendInfo::default();
         let mem_stats = MemStats::default();
@@ -1108,5 +1485,7 @@ mod tests {
         assert_eq!(ITEM_OFFLINE, "offline");
         assert_eq!(ITEM_INITIALIZING, "initializing");
         assert_eq!(ITEM_ONLINE, "online");
+        assert_eq!(ITEM_UNKNOWN, "unknown");
+        assert_eq!(ITEM_DEGRADED, "degraded");
     }
 }

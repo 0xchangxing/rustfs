@@ -19,7 +19,7 @@ use std::collections::HashSet;
 
 /// Principal that serializes AWS field as single string when containing only "*",
 /// or as an array otherwise (matching AWS S3 API format).
-/// Also supports Service principals (e.g., "logging.s3.amazonaws.com").
+/// Service principals round-trip for compatibility but do not match access keys.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Principal {
     aws: HashSet<String>,
@@ -68,6 +68,7 @@ enum PrincipalFormat {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PrincipalObject {
     #[serde(rename = "AWS", default)]
     aws: Option<PrincipalValues>,
@@ -126,11 +127,6 @@ impl<'de> serde::Deserialize<'de> for Principal {
 impl Principal {
     pub fn is_match(&self, principal: &str) -> bool {
         for pattern in self.aws.iter() {
-            if wildcard::is_simple_match(pattern, principal) {
-                return true;
-            }
-        }
-        for pattern in self.service.iter() {
             if wildcard::is_simple_match(pattern, principal) {
                 return true;
             }
@@ -224,7 +220,7 @@ mod test {
             service: HashSet::from(["logging.s3.amazonaws.com".to_string()]),
         };
 
-        assert!(principal.is_match("logging.s3.amazonaws.com"));
+        assert!(!principal.is_match("logging.s3.amazonaws.com"));
         assert!(!principal.is_match("replication.s3.amazonaws.com"));
         assert!(!principal.is_match("arn:aws:iam::123456789012:root"));
     }
@@ -237,7 +233,7 @@ mod test {
         };
 
         assert!(principal.is_match("arn:aws:iam::123456789012:root"));
-        assert!(principal.is_match("logging.s3.amazonaws.com"));
+        assert!(!principal.is_match("logging.s3.amazonaws.com"));
         assert!(!principal.is_match("other-principal"));
     }
 }

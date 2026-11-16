@@ -12,29 +12,201 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::auth::{check_key_valid, get_session_token};
-use crate::server::ADMIN_PREFIX;
-use futures::stream::{FuturesUnordered, StreamExt};
-use http::{HeaderMap, StatusCode};
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::{
+    auth::authorize_admin_envelope,
+    handlers::notify_runtime_access::{get_notification_system, load_notification_mutation_snapshot},
+    handlers::supervise_admin_mutation,
+    handlers::target_descriptor::{
+        AdminTargetSpec, EndpointKey, RuntimeHealthStatus, TargetEndpointSource, admin_target_spec_from_builtin,
+        build_enabled_target_kvs, collect_runtime_statuses, extract_supported_target_params,
+        merge_target_endpoints as shared_merge_target_endpoints, owned_build_json_response, target_module_disabled_reason,
+        target_mutation_block_reason as shared_target_mutation_block_reason,
+    },
+    handlers::target_read::{collect_notification_runtime_statuses, load_target_read_snapshot},
+    router::{AdminOperation, S3Router},
+    runtime_sources::object_store_from_envelope,
+    runtime_sources::{AppContext, app_context_from_envelope},
+    service::config::{preflight_dynamic_config_reload_for_context, signal_dynamic_config_reload_checked_for_context},
+    storage_api::contract::bucket::{BucketOperations, BucketOptions},
+};
+use crate::app::storage_api::bucket::metadata_sys::get_notification_config;
+use crate::server::{
+    ADMIN_PREFIX, is_notify_module_enabled, refresh_notify_module_enabled, refresh_persisted_module_switches_from_store,
+};
+use http::StatusCode;
 use hyper::Method;
 use matchit::Params;
-use rustfs_config::notify::{NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS};
-use rustfs_config::{ENABLE_KEY, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
-use rustfs_targets::check_mqtt_broker_available;
-use s3s::{Body, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
+use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
+use rustfs_config::server_config::Config;
+use rustfs_config::{EVENT_DEFAULT_DIR, MAX_ADMIN_REQUEST_BODY_SIZE};
+use rustfs_gateway_types::persistence::PersistedNotificationConfiguration;
+use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_s3_types::{Body, S3Error, S3ErrorCode, S3Result, s3_error};
+use rustfs_targets::catalog::builtin::builtin_notify_target_admin_descriptors;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-use std::future::Future;
-use std::io::{Error, ErrorKind};
-use std::net::SocketAddr;
-use std::path::Path;
-use std::sync::Arc;
-use tokio::net::lookup_host;
-use tokio::sync::Semaphore;
-use tokio::time::{Duration, sleep, timeout};
-use tracing::{Span, info, warn};
-use url::Url;
+use std::collections::HashMap;
+use std::sync::LazyLock;
+use tracing::{error, info, warn};
+
+const LOG_COMPONENT_ADMIN_API: &str = "admin_api";
+
+pub(super) async fn converge_target_mutation_on_cluster(
+    context: Option<&AppContext>,
+    target_type: &str,
+    local_result: Result<(), rustfs_notify::NotificationError>,
+) -> S3Result<()> {
+    let subsystem = notification_target_subsystem(target_type)?;
+    let peer_result = signal_dynamic_config_reload_checked_for_context(context, subsystem).await;
+
+    match (local_result, peer_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(_)) => Err(s3_error!(
+            InternalError,
+            "notification target update completed locally but peer convergence failed"
+        )),
+        (Err(local), peer) => {
+            let peer_failed = peer.is_err();
+            let message = match local {
+                rustfs_notify::NotificationError::ConfigurationConvergence { persisted: true, .. } => {
+                    "notification target configuration was persisted but local runtime convergence failed"
+                }
+                rustfs_notify::NotificationError::ConfigurationConvergence { persisted: false, .. } => {
+                    "notification target configuration was unchanged but local runtime convergence failed"
+                }
+                _ => "notification target update failed; persistence status is unknown",
+            };
+            if peer_failed {
+                Err(s3_error!(InternalError, "{}; peer convergence also failed", message))
+            } else {
+                Err(s3_error!(InternalError, "{}", message))
+            }
+        }
+    }
+}
+
+fn notification_target_subsystem(target_type: &str) -> S3Result<&'static str> {
+    notification_target_specs()
+        .iter()
+        .find(|spec| spec.subsystem == target_type)
+        .map(|spec| spec.subsystem)
+        .ok_or_else(|| s3_error!(InvalidArgument, "unsupported notification target type: {}", target_type))
+}
+
+pub(super) async fn preflight_target_mutation_on_cluster(context: Option<&AppContext>, target_type: &str) -> S3Result<()> {
+    preflight_dynamic_config_reload_for_context(context, notification_target_subsystem(target_type)?).await
+}
+
+const LOG_SUBSYSTEM_NOTIFICATION_TARGET: &str = "notification_target";
+const EVENT_ADMIN_REQUEST_REJECTED: &str = "admin_request_rejected";
+const EVENT_ADMIN_REQUEST_FAILED: &str = "admin_request_failed";
+const EVENT_ADMIN_RESPONSE_EMITTED: &str = "admin_response_emitted";
+const EVENT_ADMIN_OPERATION_BLOCKED: &str = "admin_operation_blocked";
+
+macro_rules! log_notification_target_operation_blocked {
+    ($operation:expr, Some($target_type:expr), Some($target_name:expr), $reason:expr) => {
+        warn!(
+            event = EVENT_ADMIN_OPERATION_BLOCKED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_NOTIFICATION_TARGET,
+            operation = $operation,
+            result = "blocked",
+            target_type = $target_type,
+            target_name = $target_name,
+            reason = $reason,
+            "admin request rejected"
+        );
+    };
+    ($operation:expr, None, None, $reason:expr) => {
+        warn!(
+            event = EVENT_ADMIN_OPERATION_BLOCKED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_NOTIFICATION_TARGET,
+            operation = $operation,
+            result = "blocked",
+            reason = $reason,
+            "admin request rejected"
+        );
+    };
+}
+
+macro_rules! log_notification_target_body_read_failed {
+    ($target_type:expr, $target_name:expr, $err:expr) => {
+        warn!(
+            event = EVENT_ADMIN_REQUEST_REJECTED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_NOTIFICATION_TARGET,
+            operation = "set_target_config",
+            result = "rejected",
+            reason = "request_body_read_failed",
+            target_type = $target_type,
+            target_name = $target_name,
+            error = %$err,
+            "admin request rejected"
+        );
+    };
+}
+
+macro_rules! log_notification_target_body_decode_failed {
+    ($target_type:expr, $target_name:expr, $err:expr) => {
+        warn!(
+            event = EVENT_ADMIN_REQUEST_REJECTED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_NOTIFICATION_TARGET,
+            operation = "set_target_config",
+            result = "rejected",
+            reason = "request_body_decode_failed",
+            target_type = $target_type,
+            target_name = $target_name,
+            error = %$err,
+            "admin request rejected"
+        );
+    };
+}
+
+macro_rules! log_notification_target_config_updated {
+    ($operation:expr, $target_type:expr, $target_name:expr) => {
+        info!(
+            event = EVENT_ADMIN_RESPONSE_EMITTED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_NOTIFICATION_TARGET,
+            operation = $operation,
+            result = "success",
+            target_type = $target_type,
+            target_name = $target_name,
+            "admin response emitted"
+        );
+    };
+}
+
+macro_rules! log_notification_target_request_failed {
+    ($operation:expr, $reason:expr, Some($target_type:expr), Some($target_name:expr), $err:expr) => {
+        error!(
+            event = EVENT_ADMIN_REQUEST_FAILED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_NOTIFICATION_TARGET,
+            operation = $operation,
+            result = "failed",
+            reason = $reason,
+            target_type = $target_type,
+            target_name = $target_name,
+            error = %$err,
+            "admin request failed"
+        );
+    };
+    ($operation:expr, $reason:expr, None, None, $err:expr) => {
+        error!(
+            event = EVENT_ADMIN_REQUEST_FAILED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_NOTIFICATION_TARGET,
+            operation = $operation,
+            result = "failed",
+            reason = $reason,
+            error = %$err,
+            "admin request failed"
+        );
+    };
+}
 
 pub fn register_notification_target_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
@@ -61,7 +233,111 @@ pub fn register_notification_target_route(r: &mut S3Router<AdminOperation>) -> s
         AdminOperation(&ListTargetsArns {}),
     )?;
 
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/target/{target_type}/{target_name}/subscriptions").as_str(),
+        AdminOperation(&ListTargetSubscriptions {}),
+    )?;
+
     Ok(())
+}
+
+#[derive(Serialize, Debug)]
+struct TargetSubscription {
+    bucket: String,
+    id: Option<String>,
+    events: Vec<String>,
+    prefix: Option<String>,
+    suffix: Option<String>,
+}
+
+pub struct ListTargetSubscriptions {}
+
+fn subscription_target_arn(params: &Params<'_, '_>, region: &str) -> S3Result<String> {
+    let target_type = params
+        .get("target_type")
+        .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidArgument, "missing required parameter: 'target_type'"))?;
+    // Published consoles use the service name; admin routes use the subsystem name.
+    let spec = notification_target_specs()
+        .iter()
+        .find(|spec| spec.subsystem == target_type || spec.service == target_type)
+        .ok_or_else(|| {
+            S3Error::with_message(
+                S3ErrorCode::InvalidArgument,
+                format!("unsupported notification target type: '{target_type}'"),
+            )
+        })?;
+    let target_name = params
+        .get("target_name")
+        .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidArgument, "missing required parameter: 'target_name'"))?;
+    Ok(rustfs_targets::arn::TargetID::new(target_name.to_string(), spec.service.to_string())
+        .to_arn(region)
+        .to_string())
+}
+
+fn collect_target_subscriptions(
+    bucket: &str,
+    config: &PersistedNotificationConfiguration,
+    target_arn: &str,
+) -> Vec<TargetSubscription> {
+    let routes = config.behavior();
+    [routes.queue_routes, routes.topic_routes, routes.lambda_routes]
+        .into_iter()
+        .flatten()
+        .filter(|route| route.destination == target_arn)
+        .map(|route| {
+            let filter_value = |name: &str| {
+                route
+                    .filter_rules
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .find_map(|(rule_name, value)| (rule_name.as_deref() == Some(name)).then(|| value.clone()).flatten())
+            };
+            let prefix = filter_value("Prefix").or_else(|| filter_value("prefix"));
+            let suffix = filter_value("Suffix").or_else(|| filter_value("suffix"));
+            TargetSubscription {
+                bucket: bucket.to_string(),
+                id: route.id,
+                events: route.events,
+                prefix,
+                suffix,
+            }
+        })
+        .collect()
+}
+
+#[async_trait::async_trait]
+impl Operation for ListTargetSubscriptions {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        authorize_notification_admin_request(&req, AdminAction::GetBucketTargetAction).await?;
+        let region = req.region().map(ToString::to_string).unwrap_or_default();
+        let target_arn = subscription_target_arn(&params, &region)?;
+        let Some(store) = object_store_from_envelope(req.envelope()) else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "object store is not initialized"));
+        };
+        let buckets = store
+            .list_bucket(&BucketOptions::default())
+            .await
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to list buckets: {e}")))?;
+        let mut subscriptions = Vec::new();
+        for bucket in buckets {
+            let Some(config) = get_notification_config(&bucket.name).await.map_err(|e| {
+                S3Error::with_message(S3ErrorCode::InternalError, format!("failed to load notification config: {e}"))
+            })?
+            else {
+                continue;
+            };
+            subscriptions.extend(collect_target_subscriptions(&bucket.name, &config, &target_arn));
+        }
+        let data = serde_json::to_vec(&subscriptions)
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize subscriptions: {e}")))?;
+        Ok(owned_build_json_response(
+            StatusCode::OK,
+            Body::from(data),
+            req.headers().get("x-request-id"),
+        ))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,79 +356,91 @@ struct NotificationEndpoint {
     account_id: String,
     service: String,
     status: String,
+    health_state: String,
+    health_reason: String,
+    source: TargetEndpointSource,
 }
 
 #[derive(Serialize, Debug)]
 struct NotificationEndpointsResponse {
+    notify_enabled: bool,
     notification_endpoints: Vec<NotificationEndpoint>,
+}
+
+static NOTIFICATION_TARGET_SPECS: LazyLock<Vec<AdminTargetSpec>> = LazyLock::new(|| {
+    builtin_notify_target_admin_descriptors()
+        .into_iter()
+        .map(|descriptor| admin_target_spec_from_builtin(&descriptor))
+        .collect()
+});
+
+fn notification_target_specs() -> &'static [AdminTargetSpec] {
+    &NOTIFICATION_TARGET_SPECS
 }
 
 // --- Helper Functions ---
 
-async fn check_permissions(req: &S3Request<Body>) -> S3Result<()> {
-    let Some(input_cred) = &req.credentials else {
+/// The pre-check keeps these endpoints' historical missing-credentials message;
+/// the shared gate reports "get cred failed".
+async fn authorize_notification_admin_request(req: &AdminRequest, action: AdminAction) -> S3Result<()> {
+    if req.credentials().is_none() {
         return Err(s3_error!(InvalidRequest, "credentials not found"));
-    };
-    check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+    }
+    authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(action)]).await?;
     Ok(())
 }
 
-fn get_notification_system() -> S3Result<Arc<rustfs_notify::NotificationSystem>> {
-    rustfs_notify::notification_system().ok_or_else(|| s3_error!(InternalError, "notification system not initialized"))
+fn target_mutation_block_reason(config: &Config, target_type: &str, target_name: &str) -> S3Result<Option<String>> {
+    shared_target_mutation_block_reason(
+        notification_target_specs(),
+        NOTIFY_ROUTE_PREFIX,
+        config,
+        target_type,
+        target_name,
+        "target",
+    )
 }
 
-fn build_response(status: StatusCode, body: Body, request_id: Option<&http::HeaderValue>) -> S3Response<(StatusCode, Body)> {
-    let mut header = HeaderMap::new();
-    header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-    if let Some(v) = request_id {
-        header.insert("x-request-id", v.clone());
+async fn notification_target_operation_block_reason(action: &str) -> Option<String> {
+    if let Err(err) = refresh_persisted_module_switches_from_store().await {
+        warn!(
+            event = EVENT_ADMIN_REQUEST_REJECTED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_NOTIFICATION_TARGET,
+            operation = "reload_persisted_module_switches",
+            result = "failed",
+            error = %err,
+            "admin request rejected"
+        );
     }
-    S3Response::with_headers((status, body), header)
+    refresh_notify_module_enabled();
+    target_module_disabled_reason("notify", rustfs_config::ENV_NOTIFY_ENABLE, is_notify_module_enabled(), action)
 }
 
-async fn retry_with_backoff<F, Fut, T>(mut operation: F, max_attempts: usize, base_delay: Duration) -> Result<T, Error>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, Error>>,
-{
-    let mut attempts = 0;
-    let mut delay = base_delay;
-    let mut last_err = None;
-
-    while attempts < max_attempts {
-        match operation().await {
-            Ok(result) => return Ok(result),
-            Err(e) => {
-                last_err = Some(e);
-                attempts += 1;
-                if attempts < max_attempts {
-                    sleep(delay).await;
-                    delay = delay.saturating_mul(2);
-                }
-            }
-        }
-    }
-    Err(last_err.unwrap_or_else(|| Error::other("retry_with_backoff: unknown error")))
+fn merge_notification_endpoints(
+    config: &Config,
+    runtime_statuses: HashMap<EndpointKey, RuntimeHealthStatus>,
+) -> S3Result<Vec<NotificationEndpoint>> {
+    Ok(
+        shared_merge_target_endpoints(notification_target_specs(), NOTIFY_ROUTE_PREFIX, config, runtime_statuses)?
+            .into_iter()
+            .map(|endpoint| NotificationEndpoint {
+                account_id: endpoint.account_id,
+                service: endpoint.service,
+                status: endpoint.status,
+                health_state: endpoint.health_state,
+                health_reason: endpoint.health_reason,
+                source: endpoint.source,
+            })
+            .collect(),
+    )
 }
 
-async fn validate_queue_dir(queue_dir: &str) -> S3Result<()> {
-    if !queue_dir.is_empty() {
-        if !Path::new(queue_dir).is_absolute() {
-            return Err(s3_error!(InvalidArgument, "queue_dir must be absolute path"));
-        }
-        retry_with_backoff(
-            || async { tokio::fs::metadata(queue_dir).await.map(|_| ()) },
-            3,
-            Duration::from_millis(100),
-        )
-        .await
-        .map_err(|e| match e.kind() {
-            ErrorKind::NotFound => s3_error!(InvalidArgument, "queue_dir does not exist"),
-            ErrorKind::PermissionDenied => s3_error!(InvalidArgument, "queue_dir exists but permission denied"),
-            _ => s3_error!(InvalidArgument, "failed to access queue_dir: {}", e),
-        })?;
-    }
-    Ok(())
+fn collect_online_target_arns(region: &str, target_statuses: Vec<(rustfs_targets::arn::TargetID, String)>) -> Vec<String> {
+    target_statuses
+        .into_iter()
+        .filter_map(|(target_id, status)| (status == "online").then(|| target_id.to_arn(region).to_string()))
+        .collect()
 }
 
 // --- Operations ---
@@ -160,213 +448,1435 @@ async fn validate_queue_dir(queue_dir: &str) -> S3Result<()> {
 pub struct NotificationTarget {}
 #[async_trait::async_trait]
 impl Operation for NotificationTarget {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let span = Span::current();
-        let _enter = span.enter();
+    async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let (target_type, target_name) = extract_target_params(&params)?;
+        let context = app_context_from_envelope(req.envelope());
 
-        check_permissions(&req).await?;
-        let ns = get_notification_system()?;
+        authorize_notification_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
+        if let Some(reason) = notification_target_operation_block_reason("managing notification targets from the console").await {
+            log_notification_target_operation_blocked!("set_target_config", Some(target_type), Some(target_name), &reason);
+            return Err(s3_error!(InvalidRequest, "{reason}"));
+        }
+        let (ns, config_snapshot) = load_notification_mutation_snapshot().await?;
+        if let Some(reason) = target_mutation_block_reason(&config_snapshot, target_type, target_name)? {
+            log_notification_target_operation_blocked!("set_target_config", Some(target_type), Some(target_name), &reason);
+            return Err(s3_error!(InvalidRequest, "{reason}"));
+        }
 
-        let mut input = req.input;
+        let mut input = req.take_body();
         let body_bytes = input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await.map_err(|e| {
-            warn!("failed to read request body: {:?}", e);
+            log_notification_target_body_read_failed!(target_type, target_name, e);
             s3_error!(InvalidRequest, "failed to read request body")
         })?;
 
-        let notification_body: NotificationTargetBody = serde_json::from_slice(&body_bytes)
-            .map_err(|e| s3_error!(InvalidArgument, "invalid json body for target config: {}", e))?;
+        let notification_body: NotificationTargetBody = serde_json::from_slice(&body_bytes).map_err(|e| {
+            log_notification_target_body_decode_failed!(target_type, target_name, e);
+            s3_error!(InvalidArgument, "invalid json body for target config: {}", e)
+        })?;
 
-        let allowed_keys: HashSet<&str> = match target_type {
-            NOTIFY_WEBHOOK_SUB_SYS => rustfs_config::notify::NOTIFY_WEBHOOK_KEYS.iter().cloned().collect(),
-            NOTIFY_MQTT_SUB_SYS => rustfs_config::notify::NOTIFY_MQTT_KEYS.iter().cloned().collect(),
-            _ => unreachable!(),
-        };
+        let specs = notification_target_specs();
+        let kvs = build_enabled_target_kvs(
+            specs,
+            notification_body
+                .key_values
+                .iter()
+                .map(|kv| (kv.key.as_str(), kv.value.as_str())),
+            target_type,
+            EVENT_DEFAULT_DIR,
+            "target",
+        )
+        .await?;
 
-        let kv_map: HashMap<&str, &str> = notification_body
-            .key_values
-            .iter()
-            .map(|kv| (kv.key.as_str(), kv.value.as_str()))
-            .collect();
+        let mutation_target_type = target_type.to_owned();
+        let mutation_target_name = target_name.to_owned();
+        supervise_admin_mutation("notification target mutation", async move {
+            preflight_target_mutation_on_cluster(context.as_deref(), &mutation_target_type).await?;
+            let local_result = ns.set_target_config(&mutation_target_type, &mutation_target_name, kvs).await;
+            converge_target_mutation_on_cluster(context.as_deref(), &mutation_target_type, local_result).await
+        })
+        .await
+        .map_err(|e| {
+            log_notification_target_request_failed!(
+                "set_target_config",
+                "set_target_config_failed",
+                Some(target_type),
+                Some(target_name),
+                e
+            );
+            e
+        })?;
+        log_notification_target_config_updated!("set_target_config", target_type, target_name);
 
-        // Validate keys
-        for key in kv_map.keys() {
-            if !allowed_keys.contains(key) {
-                return Err(s3_error!(InvalidArgument, "key '{}' not allowed for target type '{}'", key, target_type));
-            }
-        }
-
-        // Type-specific validation
-        if target_type == NOTIFY_WEBHOOK_SUB_SYS {
-            let endpoint = kv_map
-                .get("endpoint")
-                .ok_or_else(|| s3_error!(InvalidArgument, "endpoint is required"))?;
-            let url = Url::parse(endpoint).map_err(|e| s3_error!(InvalidArgument, "invalid endpoint url: {}", e))?;
-            let host = url
-                .host_str()
-                .ok_or_else(|| s3_error!(InvalidArgument, "endpoint missing host"))?;
-            let port = url
-                .port_or_known_default()
-                .ok_or_else(|| s3_error!(InvalidArgument, "endpoint missing port"))?;
-            let addr = format!("{host}:{port}");
-            if addr.parse::<SocketAddr>().is_err() && lookup_host(&addr).await.is_err() {
-                return Err(s3_error!(InvalidArgument, "invalid or unresolvable endpoint address"));
-            }
-            if let Some(queue_dir) = kv_map.get("queue_dir") {
-                validate_queue_dir(queue_dir).await?;
-            }
-            if kv_map.contains_key("client_cert") != kv_map.contains_key("client_key") {
-                return Err(s3_error!(InvalidArgument, "client_cert and client_key must be specified as a pair"));
-            }
-        } else if target_type == NOTIFY_MQTT_SUB_SYS {
-            let endpoint = kv_map
-                .get(rustfs_config::MQTT_BROKER)
-                .ok_or_else(|| s3_error!(InvalidArgument, "broker endpoint is required"))?;
-            let topic = kv_map
-                .get(rustfs_config::MQTT_TOPIC)
-                .ok_or_else(|| s3_error!(InvalidArgument, "topic is required"))?;
-            check_mqtt_broker_available(endpoint, topic)
-                .await
-                .map_err(|e| s3_error!(InvalidArgument, "MQTT Broker unavailable: {}", e))?;
-
-            if let Some(queue_dir) = kv_map.get("queue_dir") {
-                validate_queue_dir(queue_dir).await?;
-                if let Some(qos) = kv_map.get("qos") {
-                    match qos.parse::<u8>() {
-                        Ok(1) | Ok(2) => {}
-                        Ok(0) => return Err(s3_error!(InvalidArgument, "qos should be 1 or 2 if queue_dir is set")),
-                        _ => return Err(s3_error!(InvalidArgument, "qos must be an integer 0, 1, or 2")),
-                    }
-                }
-            }
-        }
-
-        let mut kvs_vec: Vec<_> = notification_body
-            .key_values
-            .into_iter()
-            .map(|kv| rustfs_ecstore::config::KV {
-                key: kv.key,
-                value: kv.value,
-                hidden_if_empty: false,
-            })
-            .collect();
-
-        kvs_vec.push(rustfs_ecstore::config::KV {
-            key: ENABLE_KEY.to_string(),
-            value: EnableState::On.to_string(),
-            hidden_if_empty: false,
-        });
-
-        info!("Setting target config for type '{}', name '{}'", target_type, target_name);
-        ns.set_target_config(target_type, target_name, rustfs_ecstore::config::KVS(kvs_vec))
-            .await
-            .map_err(|e| s3_error!(InternalError, "failed to set target config: {}", e))?;
-
-        Ok(build_response(StatusCode::OK, Body::empty(), req.headers.get("x-request-id")))
+        Ok(owned_build_json_response(
+            StatusCode::OK,
+            Body::empty(),
+            req.headers().get("x-request-id"),
+        ))
     }
 }
 
 pub struct ListNotificationTargets {}
 #[async_trait::async_trait]
 impl Operation for ListNotificationTargets {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let span = Span::current();
-        let _enter = span.enter();
-        check_permissions(&req).await?;
-        let ns = get_notification_system()?;
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        authorize_notification_admin_request(&req, AdminAction::GetBucketTargetAction).await?;
+        refresh_persisted_module_switches_from_store().await.map_err(|err| {
+            warn!(
+                event = EVENT_ADMIN_REQUEST_FAILED,
+                component = LOG_COMPONENT_ADMIN_API,
+                subsystem = LOG_SUBSYSTEM_NOTIFICATION_TARGET,
+                operation = "list_targets",
+                result = "failed",
+                reason = "module_switch_refresh_failed",
+                error = %err,
+                "admin request failed"
+            );
+            s3_error!(InternalError, "failed to refresh notification module state")
+        })?;
+        let notify_enabled = refresh_notify_module_enabled();
+        let (config, runtime_statuses) = load_target_read_snapshot(collect_notification_runtime_statuses()).await?;
+        let notification_endpoints = merge_notification_endpoints(&config, runtime_statuses)?;
 
-        let targets = ns.get_target_values().await;
-        let target_count = targets.len();
+        let data = serde_json::to_vec(&NotificationEndpointsResponse {
+            notify_enabled,
+            notification_endpoints,
+        })
+        .map_err(|e| {
+            log_notification_target_request_failed!("list_targets", "serialize_targets_failed", None, None, e);
+            s3_error!(InternalError, "failed to serialize targets: {}", e)
+        })?;
 
-        let semaphore = Arc::new(Semaphore::new(10));
-        let mut futures = FuturesUnordered::new();
-
-        for target in targets {
-            let sem = Arc::clone(&semaphore);
-            futures.push(async move {
-                let _permit = sem.acquire().await;
-                let status = match timeout(Duration::from_secs(3), target.is_active()).await {
-                    Ok(Ok(true)) => "online",
-                    _ => "offline",
-                };
-                NotificationEndpoint {
-                    account_id: target.id().id.clone(),
-                    service: target.id().name.to_string(),
-                    status: status.to_string(),
-                }
-            });
-        }
-
-        let mut notification_endpoints = Vec::with_capacity(target_count);
-        while let Some(endpoint) = futures.next().await {
-            notification_endpoints.push(endpoint);
-        }
-
-        let data = serde_json::to_vec(&NotificationEndpointsResponse { notification_endpoints })
-            .map_err(|e| s3_error!(InternalError, "failed to serialize targets: {}", e))?;
-
-        Ok(build_response(StatusCode::OK, Body::from(data), req.headers.get("x-request-id")))
+        Ok(owned_build_json_response(
+            StatusCode::OK,
+            Body::from(data),
+            req.headers().get("x-request-id"),
+        ))
     }
 }
 
 pub struct ListTargetsArns {}
 #[async_trait::async_trait]
 impl Operation for ListTargetsArns {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let span = Span::current();
-        let _enter = span.enter();
-        check_permissions(&req).await?;
-        let ns = get_notification_system()?;
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        authorize_notification_admin_request(&req, AdminAction::GetBucketTargetAction).await?;
+        if let Some(reason) = notification_target_operation_block_reason(
+            "querying notification target ARNs for bucket associations from the console",
+        )
+        .await
+        {
+            log_notification_target_operation_blocked!("list_target_arns", None, None, &reason);
+            return Err(s3_error!(InvalidRequest, "{reason}"));
+        }
+        let ns = get_notification_system().await?;
 
-        let active_targets = ns.get_active_targets().await;
-        let region = req
-            .region
-            .clone()
-            .ok_or_else(|| s3_error!(InvalidRequest, "region not found"))?;
-
-        let data_target_arn_list: Vec<_> = active_targets
-            .iter()
-            .map(|id| id.to_arn(region.as_str()).to_string())
+        let region = req.region().map(str::to_owned).ok_or_else(|| {
+            warn!(
+                event = EVENT_ADMIN_REQUEST_REJECTED,
+                component = LOG_COMPONENT_ADMIN_API,
+                subsystem = LOG_SUBSYSTEM_NOTIFICATION_TARGET,
+                operation = "list_target_arns",
+                result = "rejected",
+                reason = "region_not_found",
+                "admin request rejected"
+            );
+            s3_error!(InvalidRequest, "region not found")
+        })?;
+        let target_statuses = collect_runtime_statuses(ns.get_target_values().await)
+            .await
+            .into_iter()
+            .map(|((account_id, service), health)| (rustfs_targets::arn::TargetID::new(account_id, service), health.status))
             .collect();
 
-        let data = serde_json::to_vec(&data_target_arn_list)
-            .map_err(|e| s3_error!(InternalError, "failed to serialize targets: {}", e))?;
+        let data_target_arn_list = collect_online_target_arns(region.as_str(), target_statuses);
 
-        Ok(build_response(StatusCode::OK, Body::from(data), req.headers.get("x-request-id")))
+        let data = serde_json::to_vec(&data_target_arn_list).map_err(|e| {
+            log_notification_target_request_failed!("list_target_arns", "serialize_targets_failed", None, None, e);
+            s3_error!(InternalError, "failed to serialize targets: {}", e)
+        })?;
+
+        Ok(owned_build_json_response(
+            StatusCode::OK,
+            Body::from(data),
+            req.headers().get("x-request-id"),
+        ))
     }
 }
 
 pub struct RemoveNotificationTarget {}
 #[async_trait::async_trait]
 impl Operation for RemoveNotificationTarget {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let span = Span::current();
-        let _enter = span.enter();
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let (target_type, target_name) = extract_target_params(&params)?;
+        let context = app_context_from_envelope(req.envelope());
 
-        check_permissions(&req).await?;
-        let ns = get_notification_system()?;
+        authorize_notification_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
+        if let Some(reason) = notification_target_operation_block_reason("managing notification targets from the console").await {
+            log_notification_target_operation_blocked!("remove_target_config", Some(target_type), Some(target_name), &reason);
+            return Err(s3_error!(InvalidRequest, "{reason}"));
+        }
+        let (ns, config_snapshot) = load_notification_mutation_snapshot().await?;
+        if let Some(reason) = target_mutation_block_reason(&config_snapshot, target_type, target_name)? {
+            log_notification_target_operation_blocked!("remove_target_config", Some(target_type), Some(target_name), &reason);
+            return Err(s3_error!(InvalidRequest, "{reason}"));
+        }
 
-        info!("Removing target config for type '{}', name '{}'", target_type, target_name);
-        ns.remove_target_config(target_type, target_name)
-            .await
-            .map_err(|e| s3_error!(InternalError, "failed to remove target config: {}", e))?;
+        let mutation_target_type = target_type.to_owned();
+        let mutation_target_name = target_name.to_owned();
+        supervise_admin_mutation("notification target mutation", async move {
+            preflight_target_mutation_on_cluster(context.as_deref(), &mutation_target_type).await?;
+            let local_result = ns.remove_target_config(&mutation_target_type, &mutation_target_name).await;
+            converge_target_mutation_on_cluster(context.as_deref(), &mutation_target_type, local_result).await
+        })
+        .await
+        .map_err(|e| {
+            log_notification_target_request_failed!(
+                "remove_target_config",
+                "remove_target_config_failed",
+                Some(target_type),
+                Some(target_name),
+                e
+            );
+            e
+        })?;
+        log_notification_target_config_updated!("remove_target_config", target_type, target_name);
 
-        Ok(build_response(StatusCode::OK, Body::empty(), req.headers.get("x-request-id")))
+        Ok(owned_build_json_response(
+            StatusCode::OK,
+            Body::empty(),
+            req.headers().get("x-request-id"),
+        ))
     }
-}
-
-fn extract_param<'a>(params: &'a Params<'_, '_>, key: &str) -> S3Result<&'a str> {
-    params
-        .get(key)
-        .ok_or_else(|| s3_error!(InvalidArgument, "missing required parameter: '{}'", key))
 }
 
 fn extract_target_params<'a>(params: &'a Params<'_, '_>) -> S3Result<(&'a str, &'a str)> {
-    let target_type = extract_param(params, "target_type")?;
-    if target_type != NOTIFY_WEBHOOK_SUB_SYS && target_type != NOTIFY_MQTT_SUB_SYS {
-        return Err(s3_error!(InvalidArgument, "unsupported target type: '{}'", target_type));
+    extract_supported_target_params(notification_target_specs(), params, "notification")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::admin::handlers::target_descriptor::{
+        allowed_target_keys, collect_validated_key_values as shared_collect_validated_key_values,
+    };
+    use matchit::Router;
+    use rustfs_config::notify::{NOTIFY_AMQP_SUB_SYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS};
+    use rustfs_config::server_config::{KV, KVS};
+    use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY};
+    use rustfs_targets::arn::TargetID;
+    use serde_json::Value;
+    use serial_test::serial;
+    use std::collections::{HashMap, HashSet};
+    use temp_env::{with_var, with_vars};
+
+    fn enabled_kvs(value: &str) -> KVS {
+        KVS(vec![KV {
+            key: ENABLE_KEY.to_string(),
+            value: value.to_string(),
+            hidden_if_empty: false,
+        }])
     }
-    let target_name = extract_param(params, "target_name")?;
-    Ok((target_type, target_name))
+
+    fn runtime_health(status: &str) -> RuntimeHealthStatus {
+        let online = status == "online";
+        RuntimeHealthStatus {
+            status: status.to_string(),
+            state: if online { "online" } else { "offline" }.to_string(),
+            reason: if online { "reachable" } else { "unreachable" }.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn target_list_reads_durable_config_without_runtime_reconciliation() {
+        use crate::admin::handlers::{
+            audit::ListAuditTargets,
+            extensions::ListExtensionInstancesHandler,
+            plugins_instances::{GetPluginInstanceHandler, ListPluginInstancesHandler, PutPluginInstanceHandler},
+            target_read::load_target_read_snapshot,
+        };
+        use crate::admin::storage_api::config::{
+            read_admin_config, save_admin_config, save_admin_server_config, with_admin_server_config_write_lock,
+        };
+        use crate::server::{mark_event_notifier_unreconciled, with_notify_runtime_reconcile_lock};
+        use http_body_util::BodyExt as _;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        async fn response_json(
+            call: impl std::future::Future<Output = S3Result<crate::admin::operation::AdminResponse>>,
+        ) -> S3Result<Value> {
+            let response = tokio::time::timeout(Duration::from_secs(10), call)
+                .await
+                .expect("destination inventory must not wait for runtime reconciliation")?;
+            let (status, _headers, body) = response.into_parts();
+            assert_eq!(status, StatusCode::OK);
+            let body = body.collect().await.expect("collect inventory response").to_bytes();
+            Ok(serde_json::from_slice(&body).expect("decode inventory response"))
+        }
+
+        let _ = rustfs_credentials::init_global_action_credentials(
+            Some("notification-list-root".to_string()),
+            Some("notification-list-secret".to_string()),
+        );
+        let temp_dir = tempfile::tempdir().expect("create notification list test directory");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(temp_dir.path())
+            .disk_count(1)
+            .init_bucket_metadata(false)
+            .build()
+            .await;
+        crate::runtime_sources::install_test_app_context(Arc::clone(&env.ecstore)).await;
+
+        let credentials = crate::runtime_sources::current_action_credentials().expect("test root credentials");
+        let request = |uri: &str| {
+            crate::admin::operation::test_support::TestRequest::new(Method::GET, uri)
+                .credentials(&credentials.access_key, &credentials.secret_key, None)
+                .build()
+        };
+        let unsigned_request = |uri: &str| crate::admin::operation::test_support::TestRequest::new(Method::GET, uri).build();
+
+        temp_env::async_with_vars([(rustfs_config::ENV_NOTIFY_ENABLE, Some("true"))], async {
+            let mut config = Config::new();
+            let mut kvs = enabled_kvs("on");
+            kvs.insert(rustfs_config::WEBHOOK_ENDPOINT.to_string(), "http://127.0.0.1:9/hook".to_string());
+            kvs.insert(rustfs_config::WEBHOOK_AUTH_TOKEN.to_string(), "inventory-secret-token".to_string());
+            config
+                .0
+                .entry(rustfs_config::audit::AUDIT_WEBHOOK_SUB_SYS.to_string())
+                .or_default()
+                .insert("audit-unavailable".to_string(), kvs.clone());
+            config
+                .0
+                .entry(NOTIFY_WEBHOOK_SUB_SYS.to_string())
+                .or_default()
+                .insert("unavailable".to_string(), kvs);
+            save_admin_server_config(env.ecstore.clone(), &config)
+                .await
+                .expect("persist target without loading it into the runtime");
+
+            // A concurrent credential rotation must be observed under the commit transaction.
+            let initial = crate::admin::storage_api::config::read_admin_config_without_migrate(env.ecstore.clone())
+                .await
+                .expect("read initial notify config");
+            let generation_before = {
+                let snapshot = crate::admin::storage_api::config::read_admin_server_config_snapshot(env.ecstore.clone())
+                    .await
+                    .expect("read initial generation");
+                snapshot.generation().expect("test config has an object generation")
+            };
+            let expected = initial.0[NOTIFY_WEBHOOK_SUB_SYS]["unavailable"].clone();
+            let expected_default = initial.0[NOTIFY_WEBHOOK_SUB_SYS]
+                .get(rustfs_config::DEFAULT_DELIMITER)
+                .cloned();
+            let mut rotated = initial.clone();
+            rotated
+                .0
+                .get_mut(NOTIFY_WEBHOOK_SUB_SYS)
+                .expect("subsystem")
+                .get_mut("unavailable")
+                .expect("target")
+                .insert(rustfs_config::WEBHOOK_AUTH_TOKEN.to_owned(), "rotated-secret".to_owned());
+            save_admin_server_config(env.ecstore.clone(), &rotated)
+                .await
+                .expect("persist concurrent rotation");
+            let generation_after = {
+                let snapshot = crate::admin::storage_api::config::read_admin_server_config_snapshot(env.ecstore.clone())
+                    .await
+                    .expect("read rotated generation");
+                snapshot.generation().expect("rotated config has an object generation")
+            };
+            assert_ne!(generation_before, generation_after, "content change must publish a new generation");
+            let system = rustfs_notify::NotificationSystem::new(Config::default());
+            let result = system
+                .set_target_config_if_unchanged(
+                    NOTIFY_WEBHOOK_SUB_SYS,
+                    "unavailable",
+                    Some(expected.clone()),
+                    expected_default,
+                    None,
+                    expected,
+                )
+                .await;
+            assert!(matches!(result, Err(rustfs_notify::NotificationError::ConfigurationConflict)));
+            let actual = crate::admin::storage_api::config::read_admin_config_without_migrate(env.ecstore.clone())
+                .await
+                .expect("read rotated config");
+            assert_eq!(
+                actual.0[NOTIFY_WEBHOOK_SUB_SYS]["unavailable"]
+                    .lookup(rustfs_config::WEBHOOK_AUTH_TOKEN)
+                    .as_deref(),
+                Some("rotated-secret")
+            );
+            save_admin_server_config(env.ecstore.clone(), &initial)
+                .await
+                .expect("restore inventory config");
+            let generation = {
+                let snapshot = crate::admin::storage_api::config::read_admin_server_config_snapshot(env.ecstore.clone())
+                    .await
+                    .expect("read revision baseline");
+                snapshot.generation().expect("baseline generation").to_string()
+            };
+            let mut unrelated = initial.clone();
+            let mut other = KVS::new();
+            other.insert("enable".into(), "off".into());
+            other.insert("endpoint".into(), "http://127.0.0.1:9/other".into());
+            unrelated
+                .0
+                .entry(NOTIFY_WEBHOOK_SUB_SYS.to_owned())
+                .or_default()
+                .insert("other".to_owned(), other);
+            save_admin_server_config(env.ecstore.clone(), &unrelated)
+                .await
+                .expect("persist unrelated update");
+            let target = initial.0[NOTIFY_WEBHOOK_SUB_SYS]["unavailable"].clone();
+            let default = initial.0[NOTIFY_WEBHOOK_SUB_SYS]
+                .get(rustfs_config::DEFAULT_DELIMITER)
+                .cloned();
+            let result = system
+                .set_target_config_if_unchanged(
+                    NOTIFY_WEBHOOK_SUB_SYS,
+                    "unavailable",
+                    Some(target.clone()),
+                    default,
+                    Some(generation),
+                    target,
+                )
+                .await;
+            assert!(
+                matches!(result, Err(rustfs_notify::NotificationError::ConfigurationConflict)),
+                "revision changes must reject even when target remains unchanged"
+            );
+            save_admin_server_config(env.ecstore.clone(), &initial)
+                .await
+                .expect("restore after unrelated update");
+
+            let mut with_default = initial.clone();
+            let mut default = KVS::new();
+            default.insert("queue_limit".into(), "15".into());
+            with_default
+                .0
+                .get_mut(NOTIFY_WEBHOOK_SUB_SYS)
+                .expect("subsystem")
+                .insert("_".into(), default.clone());
+            save_admin_server_config(env.ecstore.clone(), &with_default)
+                .await
+                .expect("persist inherited default");
+            let saved = crate::admin::storage_api::config::read_admin_config_without_migrate(env.ecstore.clone())
+                .await
+                .expect("read inherited config");
+            let original = saved.0[NOTIFY_WEBHOOK_SUB_SYS]["unavailable"].clone();
+            let old_default = saved.0[NOTIFY_WEBHOOK_SUB_SYS].get("_").cloned();
+            let expected = std::collections::HashMap::from([
+                ("endpoint".to_owned(), "http://127.0.0.1:9/hook".to_owned()),
+                ("queue_limit".to_owned(), "15".to_owned()),
+            ]);
+            let mut validated = original.clone();
+            validated.insert("endpoint".into(), "http://127.0.0.1:9/changed".into());
+            validated.insert("queue_limit".into(), "15".into());
+            let update = crate::admin::handlers::plugins_instances::merge_conditional_target_update(
+                &original,
+                &expected,
+                &["endpoint".into()],
+                &validated,
+            )
+            .expect("merge only edited field");
+            let result = system
+                .set_target_config_if_unchanged(NOTIFY_WEBHOOK_SUB_SYS, "unavailable", Some(original), old_default, None, update)
+                .await;
+            assert!(
+                result.is_ok()
+                    || matches!(
+                        result,
+                        Err(rustfs_notify::NotificationError::ConfigurationConvergence { persisted: true, .. })
+                    )
+            );
+            let saved = crate::admin::storage_api::config::read_admin_config_without_migrate(env.ecstore.clone())
+                .await
+                .expect("read conditional update");
+            assert_eq!(
+                saved.0[NOTIFY_WEBHOOK_SUB_SYS]["unavailable"].lookup("endpoint").as_deref(),
+                Some("http://127.0.0.1:9/changed")
+            );
+            assert_eq!(saved.0[NOTIFY_WEBHOOK_SUB_SYS]["unavailable"].lookup("queue_limit"), None);
+            assert_eq!(saved.0[NOTIFY_WEBHOOK_SUB_SYS]["_"].lookup("queue_limit").as_deref(), Some("15"));
+            save_admin_server_config(env.ecstore.clone(), &initial)
+                .await
+                .expect("restore inventory config");
+            let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let store = env.ecstore.clone();
+            let writer = tokio::spawn(async move {
+                with_admin_server_config_write_lock(store, move |_guard| async move {
+                    locked_tx.send(()).expect("signal config write lock acquisition");
+                    release_rx.await.expect("release config writer");
+                })
+                .await
+                .expect("hold config write lock");
+            });
+            locked_rx.await.expect("config write lock should be held");
+            let (observing_tx, observing_rx) = tokio::sync::oneshot::channel();
+            let snapshot = tokio::spawn(load_target_read_snapshot(async move {
+                observing_tx.send(()).expect("signal runtime observation");
+            }));
+            tokio::time::timeout(Duration::from_secs(10), observing_rx)
+                .await
+                .expect("runtime observation must start while the durable read is blocked")
+                .expect("runtime observer should start");
+            assert!(!snapshot.is_finished(), "the snapshot must still await its blocked durable read");
+            release_tx.send(()).expect("release config write lock");
+            writer.await.expect("config writer task");
+            let (observed_config, ()) = snapshot.await.expect("snapshot task").expect("read durable snapshot");
+            assert!(observed_config.0[NOTIFY_WEBHOOK_SUB_SYS].contains_key("unavailable"));
+            mark_event_notifier_unreconciled();
+
+            // Conditional edits reject stale revisions before target validation or persistence.
+            let mut router = Router::new();
+            router.insert("/{id}", ()).expect("plugin detail route");
+            let matched = router.at("/builtin:webhook:notify:unavailable").expect("plugin params");
+            let transaction_guard = crate::admin::storage_api::config::read_admin_server_config_snapshot(env.ecstore.clone())
+                .await
+                .expect("hold config transaction lock");
+            let generation = transaction_guard.generation().expect("config generation").to_string();
+            let detail = response_json(GetPluginInstanceHandler {}.call(
+                request("/rustfs/admin/v4/plugins/instances/builtin:webhook:notify:unavailable"),
+                matched.params,
+            ))
+            .await
+            .expect("read conditional edit baseline");
+            let revision = detail["config_revision"].as_str().expect("GET includes opaque revision");
+            assert_eq!(
+                revision,
+                crate::admin::handlers::plugins_instances::config_revision("builtin:webhook:notify:unavailable", &generation)
+            );
+            assert_eq!(detail["config"]["auth_token"], "***redacted***");
+            drop(transaction_guard);
+            let put = crate::admin::operation::test_support::TestRequest::new(
+                Method::PUT,
+                "/rustfs/admin/v4/plugins/instances/builtin:webhook:notify:unavailable",
+            )
+            .credentials(&credentials.access_key, &credentials.secret_key, None)
+            .body(
+                serde_json::to_vec(&serde_json::json!({
+                    "expected_config": detail["config"],
+                    "expected_revision": "stale",
+                    "key_values": [{"key":"auth_token", "value":"replacement-secret"}]
+                }))
+                .expect("encode conditional edit"),
+            )
+            .build();
+            let matched = router.at("/builtin:webhook:notify:unavailable").expect("plugin params");
+            let err = PutPluginInstanceHandler {}
+                .call(put, matched.params)
+                .await
+                .expect_err("stale revision must be rejected");
+            assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
+            let after = crate::admin::storage_api::config::read_admin_config_without_migrate(env.ecstore.clone())
+                .await
+                .expect("read unchanged config");
+            assert_eq!(
+                after.0[NOTIFY_WEBHOOK_SUB_SYS]["unavailable"]
+                    .lookup(rustfs_config::WEBHOOK_AUTH_TOKEN)
+                    .as_deref(),
+                Some("inventory-secret-token")
+            );
+
+            with_notify_runtime_reconcile_lock(async {
+                for initialize_runtime in [false, true] {
+                    if initialize_runtime {
+                        rustfs_notify::ensure_live_events();
+                    }
+                    let value =
+                        response_json(ListNotificationTargets {}.call(request("/rustfs/admin/v3/target/list"), Params::new()))
+                            .await
+                            .expect("read configured destinations while the runtime is unavailable");
+                    assert_eq!(value["notify_enabled"], true);
+                    let endpoints = value["notification_endpoints"].as_array().expect("destination inventory");
+                    let endpoint = endpoints
+                        .iter()
+                        .find(|endpoint| endpoint["account_id"] == "unavailable" && endpoint["service"] == "webhook")
+                        .expect("persisted destination remains visible");
+                    assert_eq!(endpoint["status"], "offline");
+                    assert_eq!(endpoint["health_state"], "offline");
+                    assert_eq!(endpoint["health_reason"], "not_loaded_in_runtime");
+                    assert_eq!(endpoint["source"], "config");
+
+                    let audit =
+                        response_json(ListAuditTargets {}.call(request("/rustfs/admin/v3/audit/target/list"), Params::new()))
+                            .await
+                            .expect("read audit destinations without runtime initialization");
+                    assert!(
+                        audit["audit_endpoints"]
+                            .as_array()
+                            .expect("audit inventory")
+                            .iter()
+                            .any(|entry| {
+                                entry["account_id"] == "audit-unavailable" && entry["health_reason"] == "not_loaded_in_runtime"
+                            })
+                    );
+
+                    for value in [
+                        response_json(
+                            ListPluginInstancesHandler {}.call(request("/rustfs/admin/v4/plugins/instances"), Params::new()),
+                        )
+                        .await
+                        .expect("read plugin inventory without runtime reconciliation"),
+                        response_json(
+                            ListExtensionInstancesHandler {}
+                                .call(request("/rustfs/admin/v4/extensions/instances"), Params::new()),
+                        )
+                        .await
+                        .expect("read extension inventory without runtime reconciliation"),
+                    ] {
+                        let instances = value["instances"].as_array().expect("instance inventory");
+                        for (domain, account_id) in [("notify", "unavailable"), ("audit", "audit-unavailable")] {
+                            let entry = instances
+                                .iter()
+                                .find(|entry| entry["domain"] == domain && entry["account_id"] == account_id)
+                                .expect("both target domains remain visible");
+                            assert_eq!(entry["status"], "offline");
+                            assert_eq!(entry["config"][rustfs_config::WEBHOOK_AUTH_TOKEN], "***redacted***");
+                        }
+                        assert!(!value.to_string().contains("inventory-secret-token"));
+                    }
+
+                    let mut router = Router::new();
+                    router.insert("/{id}", ()).expect("plugin detail route");
+                    let matched = router
+                        .at("/builtin:webhook:notify:unavailable")
+                        .expect("plugin detail params");
+                    let detail = response_json(GetPluginInstanceHandler {}.call(
+                        request("/rustfs/admin/v4/plugins/instances/builtin:webhook:notify:unavailable"),
+                        matched.params,
+                    ))
+                    .await
+                    .expect("read plugin details without runtime reconciliation");
+                    assert_eq!(detail["config"][rustfs_config::WEBHOOK_AUTH_TOKEN], "***redacted***");
+                    assert!(!detail.to_string().contains("inventory-secret-token"));
+                    assert!(!crate::server::is_event_notifier_reconciled());
+                    if let Some(system) = rustfs_notify::notification_system() {
+                        assert_eq!(system.runtime_lifecycle_state(), rustfs_notify::NotificationRuntimeState::LiveOnly);
+                    }
+                }
+
+                let target = config.0[NOTIFY_WEBHOOK_SUB_SYS]["unavailable"].clone();
+                let targets = config.0.get_mut(NOTIFY_WEBHOOK_SUB_SYS).expect("notification target config");
+                targets.remove("unavailable");
+                targets.insert("latest".to_string(), target);
+                save_admin_server_config(env.ecstore.clone(), &config)
+                    .await
+                    .expect("persist a newer target configuration while runtime stays unreconciled");
+                let latest = response_json(
+                    ListPluginInstancesHandler {}.call(request("/rustfs/admin/v4/plugins/instances"), Params::new()),
+                )
+                .await
+                .expect("inventory must read the latest durable config");
+                let instances = latest["instances"].as_array().expect("latest inventory");
+                assert!(instances.iter().any(|entry| entry["account_id"] == "latest"));
+                assert!(!instances.iter().any(|entry| entry["account_id"] == "unavailable"));
+
+                let valid_config = read_admin_config(env.ecstore.clone(), "config/config.json")
+                    .await
+                    .expect("read valid config bytes for restoration");
+                save_admin_config(env.ecstore.clone(), "config/config.json", b"invalid-server-config".to_vec())
+                    .await
+                    .expect("inject corrupt persisted configuration");
+                let error = ListNotificationTargets {}
+                    .call(request("/rustfs/admin/v3/target/list"), Params::new())
+                    .await
+                    .expect_err("unreadable persisted config must not become an empty inventory");
+                assert_eq!(error.code(), &S3ErrorCode::InternalError);
+
+                let error = response_json(
+                    ListPluginInstancesHandler {}.call(request("/rustfs/admin/v4/plugins/instances"), Params::new()),
+                )
+                .await
+                .expect_err("plugin inventory must not hide corrupt durable config");
+                assert_eq!(error.code(), &S3ErrorCode::InternalError);
+                let error =
+                    tokio::time::timeout(Duration::from_secs(10), load_target_read_snapshot(std::future::pending::<()>()))
+                        .await
+                        .expect("a config read failure must cancel stalled runtime observations")
+                        .expect_err("config read failure must remain visible");
+                assert_eq!(error.code(), &S3ErrorCode::InternalError);
+
+                let unsigned = unsigned_request("/rustfs/admin/v3/target/list");
+                let error = ListNotificationTargets {}
+                    .call(unsigned, Params::new())
+                    .await
+                    .expect_err("authorization must precede persisted configuration access");
+                assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+                assert_eq!(error.message(), Some("credentials not found"));
+
+                save_admin_config(env.ecstore.clone(), "config/config.json", valid_config)
+                    .await
+                    .expect("restore valid target configuration");
+                save_admin_config(env.ecstore.clone(), "config/module_switches.json", b"invalid-module-switches".to_vec())
+                    .await
+                    .expect("inject corrupt persisted module switches");
+                let error = response_json(
+                    ListPluginInstancesHandler {}.call(request("/rustfs/admin/v4/plugins/instances"), Params::new()),
+                )
+                .await
+                .expect_err("plugin diagnostics must not silently reuse stale module switches");
+                assert_eq!(error.code(), &S3ErrorCode::InternalError);
+                let unsigned = unsigned_request("/rustfs/admin/v4/plugins/instances");
+                let error = response_json(ListPluginInstancesHandler {}.call(unsigned, Params::new()))
+                    .await
+                    .expect_err("plugin authorization must precede module and config access");
+                assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+                assert_eq!(error.message(), Some("authentication required"));
+            })
+            .await;
+        })
+        .await;
+    }
+
+    fn subscription_router() -> Router<()> {
+        let mut router = Router::new();
+        router
+            .insert("/v3/target/{target_type}/{target_name}/subscriptions", ())
+            .expect("subscription route should insert");
+        router
+    }
+
+    #[test]
+    fn target_subscriptions_resolve_legacy_and_admin_types_to_service_arns() {
+        let router = subscription_router();
+        for spec in notification_target_specs() {
+            for target_type in [spec.service, spec.subsystem] {
+                let path = format!("/v3/target/{target_type}/primary/subscriptions");
+                let params = router.at(&path).expect("subscription route should match").params;
+                for region in ["", "us-east-1", "eu-west-1"] {
+                    assert_eq!(
+                        subscription_target_arn(&params, region).expect("target type should resolve"),
+                        format!("arn:rustfs:sqs:{region}:primary:{}", spec.service)
+                    );
+                }
+                if target_type == spec.service {
+                    assert!(
+                        extract_target_params(&params).is_err(),
+                        "mutation routes must still require subsystem names"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn target_subscriptions_reject_unknown_and_other_domain_types() {
+        let router = subscription_router();
+        for target_type in ["unknown", "notify_unknown", "audit_webhook"] {
+            let path = format!("/v3/target/{target_type}/primary/subscriptions");
+            let params = router.at(&path).expect("subscription route should match").params;
+            let err = subscription_target_arn(&params, "us-east-1").expect_err("unsupported type must be rejected");
+            assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+            assert_eq!(
+                err.message(),
+                Some(format!("unsupported notification target type: '{target_type}'").as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn target_subscriptions_require_both_route_parameters() {
+        for (pattern, path, missing) in [
+            ("/v3/target/{target_name}", "/v3/target/primary", "target_type"),
+            ("/v3/target/{target_type}", "/v3/target/notify_webhook", "target_name"),
+        ] {
+            let mut router = Router::new();
+            router.insert(pattern, ()).expect("route should insert");
+            let params = router.at(path).expect("route should match").params;
+            let err = subscription_target_arn(&params, "us-east-1").expect_err("missing parameter must be rejected");
+            assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+            assert_eq!(err.message(), Some(format!("missing required parameter: '{missing}'").as_str()));
+        }
+    }
+
+    /// A stored configuration as the handler loads it from bucket metadata.
+    fn stored_notification(xml: &str) -> PersistedNotificationConfiguration {
+        rustfs_gateway_types::persistence::parse_notification(xml.as_bytes()).expect("stored notification XML should parse")
+    }
+
+    fn subscriptions_json(bucket: &str, xml: &str, target_arn: &str) -> Value {
+        let config = stored_notification(xml);
+        let subscriptions = collect_target_subscriptions(bucket, &config, target_arn);
+        serde_json::to_value(subscriptions).expect("subscriptions should serialize")
+    }
+
+    #[test]
+    fn target_subscriptions_match_all_config_kinds_without_crossing_target_identity() {
+        let xml = r#"<NotificationConfiguration>
+            <QueueConfiguration><Id>uploads</Id><Queue>arn:rustfs:sqs:eu-west-1:primary:webhook</Queue>
+                <Event>s3:ObjectCreated:*</Event><Event>s3:ObjectRemoved:*</Event>
+                <Filter><S3Key>
+                    <FilterRule><Name>prefix</Name><Value>photos/</Value></FilterRule>
+                    <FilterRule><Name>suffix</Name><Value>.jpg</Value></FilterRule>
+                </S3Key></Filter></QueueConfiguration>
+            <QueueConfiguration><Id>other-service</Id><Queue>arn:rustfs:sqs:eu-west-1:primary:kafka</Queue><Event>s3:ObjectCreated:*</Event></QueueConfiguration>
+            <QueueConfiguration><Id>other-target</Id><Queue>arn:rustfs:sqs:eu-west-1:secondary:webhook</Queue><Event>s3:ObjectCreated:*</Event></QueueConfiguration>
+            <QueueConfiguration><Id>other-region</Id><Queue>arn:rustfs:sqs:us-east-1:primary:webhook</Queue><Event>s3:ObjectCreated:*</Event></QueueConfiguration>
+            <TopicConfiguration><Id>topic</Id><Topic>arn:rustfs:sqs:eu-west-1:primary:webhook</Topic><Event>s3:ObjectCreated:Put</Event></TopicConfiguration>
+            <CloudFunctionConfiguration><CloudFunction>arn:rustfs:sqs:eu-west-1:primary:webhook</CloudFunction><Event>s3:ObjectRemoved:Delete</Event></CloudFunctionConfiguration>
+        </NotificationConfiguration>"#;
+        let router = subscription_router();
+        for target_type in ["webhook", "notify_webhook"] {
+            let path = format!("/v3/target/{target_type}/primary/subscriptions");
+            let params = router.at(&path).expect("subscription route should match").params;
+            let arn = subscription_target_arn(&params, "eu-west-1").expect("webhook ARN should resolve");
+            assert_eq!(
+                subscriptions_json("photos", xml, &arn),
+                serde_json::json!([
+                    { "bucket": "photos", "id": "uploads", "events": ["s3:ObjectCreated:*", "s3:ObjectRemoved:*"], "prefix": "photos/", "suffix": ".jpg" },
+                    { "bucket": "photos", "id": "topic", "events": ["s3:ObjectCreated:Put"], "prefix": null, "suffix": null },
+                    { "bucket": "photos", "id": null, "events": ["s3:ObjectRemoved:Delete"], "prefix": null, "suffix": null }
+                ])
+            );
+            assert_eq!(
+                subscriptions_json("photos", xml, "arn:rustfs:sqs:eu-west-1:unused:webhook"),
+                serde_json::json!([])
+            );
+        }
+        assert_eq!(
+            subscriptions_json("empty", "<NotificationConfiguration/>", "arn:rustfs:sqs::primary:webhook"),
+            serde_json::json!([])
+        );
+    }
+
+    /// The capitalized rule name wins over the lowercase one wherever it
+    /// stands, a rule without a value never supplies one, and the destination
+    /// is compared exactly.
+    #[test]
+    fn target_subscriptions_read_filter_rules_by_exact_name_and_skip_valueless_rules() {
+        const ARN: &str = "arn:rustfs:sqs:eu-west-1:primary:webhook";
+        let xml = format!(
+            r#"<NotificationConfiguration>
+            <QueueConfiguration><Id>ordered</Id><Queue>{ARN}</Queue><Event>s3:ObjectCreated:*</Event>
+                <Filter><S3Key>
+                    <FilterRule><Name>prefix</Name><Value>lower/</Value></FilterRule>
+                    <FilterRule><Name>Prefix</Name></FilterRule>
+                    <FilterRule><Name>Prefix</Name><Value>upper/</Value></FilterRule>
+                    <FilterRule><Name>SUFFIX</Name><Value>.shout</Value></FilterRule>
+                    <FilterRule><Value>.nameless</Value></FilterRule>
+                </S3Key></Filter></QueueConfiguration>
+            <QueueConfiguration><Id>valueless</Id><Queue>{ARN}</Queue><Event>s3:ObjectCreated:*</Event>
+                <Filter><S3Key><FilterRule><Name>suffix</Name></FilterRule></S3Key></Filter></QueueConfiguration>
+            <QueueConfiguration><Id>case</Id><Queue>ARN:rustfs:sqs:eu-west-1:primary:webhook</Queue><Event>s3:ObjectCreated:*</Event></QueueConfiguration>
+            <QueueConfiguration><Id>padded</Id><Queue>{ARN} </Queue><Event>s3:ObjectCreated:*</Event></QueueConfiguration>
+        </NotificationConfiguration>"#
+        );
+        assert_eq!(
+            subscriptions_json("photos", &xml, ARN),
+            serde_json::json!([
+                { "bucket": "photos", "id": "ordered", "events": ["s3:ObjectCreated:*"], "prefix": "upper/", "suffix": null },
+                { "bucket": "photos", "id": "valueless", "events": ["s3:ObjectCreated:*"], "prefix": null, "suffix": null }
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn target_subscriptions_authorize_before_resolving_either_type_form() {
+        let router = subscription_router();
+        for target_type in ["webhook", "notify_webhook", "unknown"] {
+            let path = format!("/v3/target/{target_type}/primary/subscriptions");
+            let params = router.at(&path).expect("subscription route should match").params;
+            let req = crate::admin::operation::test_support::TestRequest::new(
+                Method::GET,
+                path.parse::<http::Uri>().expect("subscription path should parse"),
+            )
+            .headers(http::HeaderMap::new())
+            .extensions(http::Extensions::new())
+            .body(Body::empty())
+            .build();
+            let err = ListTargetSubscriptions {}
+                .call(req, params)
+                .await
+                .expect_err("credentials must be required");
+            assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+            assert_eq!(err.message(), Some("credentials not found"));
+        }
+    }
+
+    #[test]
+    fn notification_target_subsystem_resolves_admin_route_type() {
+        assert_eq!(
+            notification_target_subsystem(NOTIFY_WEBHOOK_SUB_SYS).expect("webhook subsystem should resolve"),
+            NOTIFY_WEBHOOK_SUB_SYS
+        );
+        assert!(notification_target_subsystem("webhook").is_err());
+    }
+
+    #[test]
+    fn notification_endpoints_response_includes_required_module_state() {
+        let response = NotificationEndpointsResponse {
+            notify_enabled: true,
+            notification_endpoints: vec![NotificationEndpoint {
+                account_id: "primary".to_string(),
+                service: "webhook".to_string(),
+                status: "online".to_string(),
+                health_state: "online".to_string(),
+                health_reason: "reachable".to_string(),
+                source: TargetEndpointSource::Config,
+            }],
+        };
+
+        assert_eq!(
+            serde_json::to_value(response).expect("notification target response should serialize"),
+            serde_json::json!({
+                "notify_enabled": true,
+                "notification_endpoints": [{
+                    "account_id": "primary",
+                    "service": "webhook",
+                    "status": "online",
+                    "health_state": "online",
+                    "health_reason": "reachable",
+                    "source": "config"
+                }]
+            })
+        );
+    }
+
+    #[test]
+    fn merge_notification_endpoints_keeps_configured_targets_after_runtime_loss() {
+        let mut cfg_map = HashMap::new();
+        cfg_map.insert(
+            NOTIFY_WEBHOOK_SUB_SYS.to_string(),
+            HashMap::from([("webhook-a".to_string(), enabled_kvs("on"))]),
+        );
+        cfg_map.insert(
+            NOTIFY_MQTT_SUB_SYS.to_string(),
+            HashMap::from([("mqtt-a".to_string(), enabled_kvs("on"))]),
+        );
+        let config = Config(cfg_map);
+
+        let runtime = HashMap::from([(
+            ("webhook-a".to_string(), "webhook".to_string()),
+            RuntimeHealthStatus {
+                status: "offline".to_string(),
+                state: "error".to_string(),
+                reason: "timed_out".to_string(),
+            },
+        )]);
+        let merged = merge_notification_endpoints(&config, runtime).expect("merge notification endpoints");
+
+        let mqtt = merged
+            .iter()
+            .find(|entry| entry.account_id == "mqtt-a" && entry.service == "mqtt")
+            .expect("mqtt-a should be present");
+        assert_eq!(mqtt.status, "offline");
+        assert_eq!(mqtt.source, TargetEndpointSource::Config);
+
+        let webhook = merged
+            .iter()
+            .find(|entry| entry.account_id == "webhook-a" && entry.service == "webhook")
+            .expect("webhook-a should be present");
+        assert_eq!(webhook.status, "offline");
+        assert_eq!(webhook.health_state, "error");
+        assert_eq!(webhook.health_reason, "timed_out");
+        assert_eq!(webhook.source, TargetEndpointSource::Config);
+    }
+
+    #[test]
+    fn merge_notification_endpoints_skips_disabled_and_default_entries() {
+        let mut webhook_targets = HashMap::new();
+        webhook_targets.insert(DEFAULT_DELIMITER.to_string(), enabled_kvs("on"));
+        webhook_targets.insert("webhook-disabled".to_string(), enabled_kvs("off"));
+        webhook_targets.insert("webhook-enabled".to_string(), enabled_kvs("on"));
+        let config = Config(HashMap::from([(NOTIFY_WEBHOOK_SUB_SYS.to_string(), webhook_targets)]));
+
+        let runtime = HashMap::from([
+            (("webhook-enabled".to_string(), "webhook".to_string()), runtime_health("online")),
+            (("env-only".to_string(), "mqtt".to_string()), runtime_health("offline")),
+        ]);
+        let merged = merge_notification_endpoints(&config, runtime).expect("merge notification endpoints");
+
+        let env_only = merged
+            .iter()
+            .find(|entry| entry.account_id == "env-only" && entry.service == "mqtt")
+            .expect("env-only should be present");
+        assert_eq!(env_only.status, "offline");
+        assert_eq!(env_only.source, TargetEndpointSource::Runtime);
+
+        let enabled = merged
+            .iter()
+            .find(|entry| entry.account_id == "webhook-enabled" && entry.service == "webhook")
+            .expect("webhook-enabled should be present");
+        assert_eq!(enabled.status, "online");
+        assert_eq!(enabled.source, TargetEndpointSource::Config);
+    }
+
+    #[test]
+    #[serial]
+    fn merge_notification_endpoints_marks_env_and_mixed_sources() {
+        let config = Config(HashMap::from([
+            (
+                NOTIFY_WEBHOOK_SUB_SYS.to_string(),
+                HashMap::from([("mixed-target".to_string(), enabled_kvs("on"))]),
+            ),
+            (
+                NOTIFY_MQTT_SUB_SYS.to_string(),
+                HashMap::from([("config-target".to_string(), enabled_kvs("on"))]),
+            ),
+        ]));
+
+        with_vars(
+            [
+                ("RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_MIXED-TARGET", Some("https://example.com/hook")),
+                ("RUSTFS_NOTIFY_WEBHOOK_ENABLE_ENV-ONLY", Some("on")),
+                ("RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_ENV-ONLY", Some("https://example.com/env")),
+            ],
+            || {
+                let runtime = HashMap::from([
+                    (("mixed-target".to_string(), "webhook".to_string()), runtime_health("online")),
+                    (("env-only".to_string(), "webhook".to_string()), runtime_health("online")),
+                ]);
+                let merged = merge_notification_endpoints(&config, runtime).expect("merge notification endpoints");
+
+                let mixed = merged
+                    .iter()
+                    .find(|entry| entry.account_id == "mixed-target")
+                    .expect("mixed target should be present");
+                assert_eq!(mixed.source, TargetEndpointSource::Mixed);
+
+                let env_only = merged
+                    .iter()
+                    .find(|entry| entry.account_id == "env-only")
+                    .expect("env-only target should be present");
+                assert_eq!(env_only.source, TargetEndpointSource::Env);
+
+                let config_only = merged
+                    .iter()
+                    .find(|entry| entry.account_id == "config-target")
+                    .expect("config target should be present");
+                assert_eq!(config_only.source, TargetEndpointSource::Config);
+            },
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn merge_notification_endpoints_marks_kafka_env_and_mixed_sources() {
+        let config = Config(HashMap::from([(
+            NOTIFY_KAFKA_SUB_SYS.to_string(),
+            HashMap::from([("mixed-kafka".to_string(), enabled_kvs("on"))]),
+        )]));
+
+        with_vars(
+            [
+                ("RUSTFS_NOTIFY_KAFKA_ENABLE_MIXED-KAFKA", Some("on")),
+                ("RUSTFS_NOTIFY_KAFKA_BROKERS_MIXED-KAFKA", Some("127.0.0.1:9092")),
+                ("RUSTFS_NOTIFY_KAFKA_ENABLE_ENV-KAFKA", Some("on")),
+                ("RUSTFS_NOTIFY_KAFKA_BROKERS_ENV-KAFKA", Some("127.0.0.1:9093")),
+            ],
+            || {
+                let runtime = HashMap::from([
+                    (("mixed-kafka".to_string(), "kafka".to_string()), runtime_health("online")),
+                    (("env-kafka".to_string(), "kafka".to_string()), runtime_health("online")),
+                ]);
+                let merged = merge_notification_endpoints(&config, runtime).expect("merge notification endpoints");
+
+                let mixed = merged
+                    .iter()
+                    .find(|entry| entry.account_id == "mixed-kafka" && entry.service == "kafka")
+                    .expect("mixed kafka target should be present");
+                assert_eq!(mixed.source, TargetEndpointSource::Mixed);
+
+                let env_only = merged
+                    .iter()
+                    .find(|entry| entry.account_id == "env-kafka" && entry.service == "kafka")
+                    .expect("env kafka target should be present");
+                assert_eq!(env_only.source, TargetEndpointSource::Env);
+            },
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn merge_notification_endpoints_marks_amqp_env_and_mixed_sources() {
+        let config = Config(HashMap::from([(
+            NOTIFY_AMQP_SUB_SYS.to_string(),
+            HashMap::from([("mixed-amqp".to_string(), enabled_kvs("on"))]),
+        )]));
+
+        with_vars(
+            [
+                ("RUSTFS_NOTIFY_AMQP_ENABLE_MIXED-AMQP", Some("on")),
+                ("RUSTFS_NOTIFY_AMQP_URL_MIXED-AMQP", Some("amqp://127.0.0.1:5672/%2f")),
+                ("RUSTFS_NOTIFY_AMQP_ENABLE_ENV-AMQP", Some("on")),
+                ("RUSTFS_NOTIFY_AMQP_URL_ENV-AMQP", Some("amqp://127.0.0.1:5672/%2f")),
+            ],
+            || {
+                let runtime = HashMap::from([
+                    (("mixed-amqp".to_string(), "amqp".to_string()), runtime_health("online")),
+                    (("env-amqp".to_string(), "amqp".to_string()), runtime_health("online")),
+                ]);
+                let merged = merge_notification_endpoints(&config, runtime).expect("merge notification endpoints");
+
+                let mixed = merged
+                    .iter()
+                    .find(|entry| entry.account_id == "mixed-amqp" && entry.service == "amqp")
+                    .expect("mixed amqp target should be present");
+                assert_eq!(mixed.source, TargetEndpointSource::Mixed);
+
+                let env_only = merged
+                    .iter()
+                    .find(|entry| entry.account_id == "env-amqp" && entry.service == "amqp")
+                    .expect("env amqp target should be present");
+                assert_eq!(env_only.source, TargetEndpointSource::Env);
+            },
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn target_mutation_block_reason_rejects_env_managed_target() {
+        with_vars(
+            [
+                ("RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY", Some("on")),
+                ("RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_PRIMARY", Some("https://example.com/hook")),
+            ],
+            || {
+                let config = Config(HashMap::new());
+                let reason = target_mutation_block_reason(&config, NOTIFY_WEBHOOK_SUB_SYS, "primary")
+                    .expect("target mutation block reason");
+                assert!(reason.is_some());
+                assert!(reason.unwrap().contains("managed by environment variables"));
+            },
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn notification_target_operation_block_reason_requires_notify_module_enable() {
+        with_var(rustfs_config::ENV_NOTIFY_ENABLE, Some("false"), || {
+            let reason = futures::executor::block_on(notification_target_operation_block_reason(
+                "managing notification targets from the console",
+            ));
+            assert!(reason.is_some());
+            assert!(reason.unwrap().contains("set RUSTFS_NOTIFY_ENABLE=true"));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn notification_target_operation_block_reason_allows_when_notify_module_enabled() {
+        with_var(rustfs_config::ENV_NOTIFY_ENABLE, Some("true"), || {
+            assert!(
+                futures::executor::block_on(notification_target_operation_block_reason(
+                    "managing notification targets from the console"
+                ))
+                .is_none()
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn target_mutation_block_reason_rejects_mixed_target() {
+        with_var("RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_PRIMARY", Some("https://example.com/hook"), || {
+            let config = Config(HashMap::from([(
+                NOTIFY_WEBHOOK_SUB_SYS.to_string(),
+                HashMap::from([("primary".to_string(), enabled_kvs("on"))]),
+            )]));
+            let reason =
+                target_mutation_block_reason(&config, NOTIFY_WEBHOOK_SUB_SYS, "primary").expect("target mutation block reason");
+            assert!(reason.is_some());
+            assert!(reason.unwrap().contains("both persisted config and environment variables"));
+        });
+    }
+
+    #[test]
+    fn target_mutation_block_reason_allows_config_only_target() {
+        let target_name = "config-only-target";
+        let config = Config(HashMap::from([(
+            NOTIFY_WEBHOOK_SUB_SYS.to_string(),
+            HashMap::from([(target_name.to_string(), enabled_kvs("on"))]),
+        )]));
+        assert!(
+            target_mutation_block_reason(&config, NOTIFY_WEBHOOK_SUB_SYS, target_name)
+                .expect("target mutation block reason")
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn merge_notification_endpoints_marks_disabled_config_with_env_override_as_mixed() {
+        let config = Config(HashMap::from([(
+            NOTIFY_WEBHOOK_SUB_SYS.to_string(),
+            HashMap::from([("mixed-disabled".to_string(), enabled_kvs("off"))]),
+        )]));
+
+        with_vars(
+            [
+                ("RUSTFS_NOTIFY_WEBHOOK_ENABLE_MIXED-DISABLED", Some("on")),
+                ("RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_MIXED-DISABLED", Some("https://example.com/hook")),
+            ],
+            || {
+                let merged = merge_notification_endpoints(&config, HashMap::new()).expect("merge notification endpoints");
+                let mixed = merged
+                    .iter()
+                    .find(|entry| entry.account_id == "mixed-disabled")
+                    .expect("mixed target should be present");
+                assert_eq!(mixed.source, TargetEndpointSource::Mixed);
+                assert_eq!(mixed.status, "offline");
+            },
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn merge_notification_endpoints_includes_env_only_target_without_runtime_status() {
+        let config = Config(HashMap::new());
+
+        with_vars(
+            [
+                ("RUSTFS_NOTIFY_WEBHOOK_ENABLE_ENV-ONLY", Some("on")),
+                ("RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_ENV-ONLY", Some("https://example.com/env")),
+            ],
+            || {
+                let merged = merge_notification_endpoints(&config, HashMap::new()).expect("merge notification endpoints");
+                let env_only = merged
+                    .iter()
+                    .find(|entry| entry.account_id == "env-only")
+                    .expect("env-only target should be present");
+                assert_eq!(env_only.source, TargetEndpointSource::Env);
+                assert_eq!(env_only.status, "offline");
+            },
+        );
+    }
+
+    #[test]
+    fn collect_validated_key_values_rejects_duplicate_keys() {
+        let allowed_keys: HashSet<&str> = ["endpoint", "auth_token"].into_iter().collect();
+        let key_values = [
+            KeyValue {
+                key: "endpoint".to_string(),
+                value: "https://example.com/one".to_string(),
+            },
+            KeyValue {
+                key: "endpoint".to_string(),
+                value: "https://example.com/two".to_string(),
+            },
+        ];
+
+        let err = shared_collect_validated_key_values(
+            key_values.iter().map(|kv| (kv.key.as_str(), kv.value.as_str())),
+            &allowed_keys,
+            NOTIFY_WEBHOOK_SUB_SYS,
+            "target",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("duplicate key"));
+    }
+
+    #[test]
+    #[serial]
+    fn merge_notification_endpoints_marks_mixed_with_case_insensitive_instance_id() {
+        let config = Config(HashMap::from([(
+            NOTIFY_WEBHOOK_SUB_SYS.to_string(),
+            HashMap::from([("PrimaryCase".to_string(), enabled_kvs("on"))]),
+        )]));
+
+        with_vars(
+            [
+                ("RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARYCASE", Some("on")),
+                ("RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_PRIMARYCASE", Some("https://example.com/hook")),
+            ],
+            || {
+                let runtime = HashMap::from([(("PrimaryCase".to_string(), "webhook".to_string()), runtime_health("online"))]);
+                let merged = merge_notification_endpoints(&config, runtime).expect("merge notification endpoints");
+                let mixed = merged
+                    .iter()
+                    .find(|entry| entry.account_id == "PrimaryCase" && entry.service == "webhook")
+                    .expect("mixed target should be present");
+                assert_eq!(mixed.source, TargetEndpointSource::Mixed);
+            },
+        );
+    }
+
+    #[test]
+    fn collect_online_target_arns_filters_offline_targets() {
+        let arns = collect_online_target_arns(
+            "us-east-1",
+            vec![
+                (TargetID::new("webhook-a".to_string(), "webhook".to_string()), "online".to_string()),
+                (TargetID::new("mqtt-a".to_string(), "mqtt".to_string()), "offline".to_string()),
+            ],
+        );
+
+        assert_eq!(arns, vec!["arn:rustfs:sqs:us-east-1:webhook-a:webhook".to_string()]);
+    }
+
+    #[test]
+    #[serial]
+    fn target_mutation_block_reason_allows_case_insensitive_config_target_lookup() {
+        let config = Config(HashMap::from([(
+            NOTIFY_WEBHOOK_SUB_SYS.to_string(),
+            HashMap::from([("PrimaryCase".to_string(), enabled_kvs("on"))]),
+        )]));
+
+        with_vars(
+            [
+                ("RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARYCASE", None::<&str>),
+                ("RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_PRIMARYCASE", None::<&str>),
+            ],
+            || {
+                assert!(
+                    target_mutation_block_reason(&config, NOTIFY_WEBHOOK_SUB_SYS, "primarycase")
+                        .expect("target mutation block reason")
+                        .is_none()
+                );
+            },
+        );
+    }
+
+    /// These endpoints authorize through the shared admin gate, which reports
+    /// "get cred failed" for a credential-less request. The pre-check keeps the
+    /// message they have always returned (rustfs/backlog#1829).
+    #[tokio::test]
+    async fn notification_target_gate_keeps_its_missing_credentials_message() {
+        let req = crate::admin::operation::test_support::TestRequest::new(Method::PUT, "/rustfs/admin/v3/notification/target")
+            .headers(http::HeaderMap::new())
+            .extensions(http::Extensions::new())
+            .body(Body::from(String::new()))
+            .build();
+
+        let err = authorize_notification_admin_request(&req, AdminAction::SetBucketTargetAction)
+            .await
+            .expect_err("a request without credentials must be rejected");
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("credentials not found"));
+    }
+
+    #[test]
+    fn notification_target_handlers_require_admin_authorization_contract() {
+        let src = include_str!("event.rs");
+        let put_block =
+            extract_block_between_markers(src, "impl Operation for NotificationTarget", "pub struct ListNotificationTargets");
+        let list_block =
+            extract_block_between_markers(src, "impl Operation for ListNotificationTargets", "pub struct ListTargetsArns");
+        let arns_block =
+            extract_block_between_markers(src, "impl Operation for ListTargetsArns", "pub struct RemoveNotificationTarget");
+        let delete_block = extract_block_between_markers(src, "impl Operation for RemoveNotificationTarget", "fn extract_param");
+
+        for block in [put_block, list_block, arns_block, delete_block] {
+            assert!(
+                !block.contains(".enter()"),
+                "async notification handlers must rely on request-future instrumentation instead of holding span guards across awaits"
+            );
+        }
+
+        assert!(
+            put_block.contains("authorize_notification_admin_request(&req, AdminAction::SetBucketTargetAction).await?;"),
+            "notification target writes should require SetBucketTargetAction"
+        );
+        assert!(
+            put_block.contains("notification_target_operation_block_reason(")
+                && put_block.contains("\"managing notification targets from the console\""),
+            "notification target writes should reject requests when the notify module is disabled"
+        );
+        assert!(
+            list_block.contains("authorize_notification_admin_request(&req, AdminAction::GetBucketTargetAction).await?;"),
+            "notification target list should require GetBucketTargetAction"
+        );
+        let authorize_index = list_block
+            .find("authorize_notification_admin_request")
+            .expect("target list should authorize the request");
+        let refresh_index = list_block
+            .find("refresh_persisted_module_switches_from_store().await.map_err")
+            .expect("target list should fail when persisted module state cannot be refreshed");
+        let effective_state_index = list_block
+            .find("let notify_enabled = refresh_notify_module_enabled();")
+            .expect("target list should resolve the effective env and persisted module state");
+        let load_index = list_block
+            .find("load_target_read_snapshot(collect_notification_runtime_statuses()).await?")
+            .expect("target list should load notification config");
+        assert!(
+            authorize_index < refresh_index && refresh_index < effective_state_index && effective_state_index < load_index,
+            "target list should authorize, refresh persisted state, resolve effective state, then load targets"
+        );
+        assert!(
+            arns_block.contains("authorize_notification_admin_request(&req, AdminAction::GetBucketTargetAction).await?;"),
+            "notification target arn listing should require GetBucketTargetAction"
+        );
+        assert!(
+            arns_block.contains("notification_target_operation_block_reason(")
+                && arns_block.contains("\"querying notification target ARNs for bucket associations from the console\""),
+            "notification target arn listing should reject requests when the notify module is disabled"
+        );
+        assert!(
+            delete_block.contains("authorize_notification_admin_request(&req, AdminAction::SetBucketTargetAction).await?;"),
+            "notification target deletion should require SetBucketTargetAction"
+        );
+        assert!(
+            delete_block.contains("notification_target_operation_block_reason(")
+                && delete_block.contains("\"managing notification targets from the console\""),
+            "notification target deletion should reject requests when the notify module is disabled"
+        );
+    }
+
+    #[test]
+    fn extract_target_params_accepts_kafka_target_type() {
+        let mut router = Router::new();
+        router
+            .insert("/v3/target/{target_type}/{target_name}", ())
+            .expect("route should insert");
+
+        let params = router
+            .at("/v3/target/notify_kafka/streaming")
+            .expect("route should match")
+            .params;
+        let (target_type, target_name) = extract_target_params(&params).expect("kafka target type should be accepted");
+        assert_eq!(target_type, NOTIFY_KAFKA_SUB_SYS);
+        assert_eq!(target_name, "streaming");
+    }
+
+    #[test]
+    fn extract_target_params_accepts_amqp_target_type() {
+        let mut router = Router::new();
+        router
+            .insert("/v3/target/{target_type}/{target_name}", ())
+            .expect("route should insert");
+
+        let params = router
+            .at("/v3/target/notify_amqp/rabbitmq")
+            .expect("route should match")
+            .params;
+        let (target_type, target_name) = extract_target_params(&params).expect("amqp target type should be accepted");
+        assert_eq!(target_type, NOTIFY_AMQP_SUB_SYS);
+        assert_eq!(target_name, "rabbitmq");
+    }
+
+    #[test]
+    fn collect_validated_key_values_accepts_amqp_keys() {
+        let specs = notification_target_specs();
+        let allowed_keys = allowed_target_keys(specs, NOTIFY_AMQP_SUB_SYS);
+
+        let kv_map = shared_collect_validated_key_values(
+            [
+                (rustfs_config::AMQP_URL, "amqp://127.0.0.1:5672/%2f"),
+                (rustfs_config::AMQP_EXCHANGE, "rustfs.events"),
+                (rustfs_config::AMQP_ROUTING_KEY, "objects"),
+            ],
+            &allowed_keys,
+            NOTIFY_AMQP_SUB_SYS,
+            "target",
+        )
+        .expect("amqp keys should be accepted");
+
+        assert_eq!(kv_map.get(rustfs_config::AMQP_URL).map(String::as_str), Some("amqp://127.0.0.1:5672/%2f"));
+        assert!(allowed_keys.contains(rustfs_config::AMQP_MANDATORY));
+        assert!(allowed_keys.contains(rustfs_config::AMQP_PERSISTENT));
+    }
+
+    fn extract_block_between_markers<'a>(src: &'a str, start_marker: &str, end_marker: &str) -> &'a str {
+        let start = src
+            .find(start_marker)
+            .unwrap_or_else(|| panic!("Expected marker `{start_marker}` in source"));
+        let after_start = &src[start..];
+        let end = after_start
+            .find(end_marker)
+            .unwrap_or_else(|| panic!("Expected end marker `{end_marker}` in source"));
+        &after_start[..end]
+    }
 }

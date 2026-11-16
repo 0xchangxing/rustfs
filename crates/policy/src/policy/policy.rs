@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{Effect, Error as IamError, ID, Statement, action::Action, statement::BPStatement};
+use super::{
+    ClaimLookup, Effect, Error as IamError, Functions, ID, Statement, action::Action, get_claim_case_insensitive,
+    statement::BPStatement, statement::variable_resolver_for_policy_args,
+};
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -52,12 +55,13 @@ impl Args<'_> {
 }
 
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct Policy {
-    #[serde(default, rename = "ID")]
+    #[serde(default, rename = "ID", skip_serializing_if = "ID::is_empty")]
     pub id: ID,
-    #[serde(rename = "Version")]
+    #[serde(default, rename = "Version")]
     pub version: String,
-    #[serde(rename = "Statement")]
+    #[serde(default, rename = "Statement")]
     pub statements: Vec<Statement>,
 }
 
@@ -137,7 +141,7 @@ impl Policy {
                 merged.version = p.version.clone();
             }
             for st in p.statements {
-                merged.statements.push(st.clone());
+                merged.statements.push(st);
             }
         }
         merged.drop_duplicate_statements();
@@ -189,8 +193,10 @@ pub struct BucketPolicyArgs<'a> {
 /// Bucket Policy with AWS S3-compatible JSON serialization.
 /// Empty optional fields are omitted from output to match AWS format.
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct BucketPolicy {
-    #[serde(default, rename = "Id", skip_serializing_if = "ID::is_empty")]
+    // RUSTFS_COMPAT_TODO(rustfs-6339): accept bucket policies persisted with the legacy "ID" key. Remove after migration tooling rewrites every retained legacy bucket policy.
+    #[serde(default, rename = "Id", alias = "ID", skip_serializing_if = "ID::is_empty")]
     pub id: ID,
     #[serde(rename = "Version")]
     pub version: String,
@@ -238,29 +244,35 @@ impl Validator for BucketPolicy {
 
 fn get_values_from_claims(claims: &HashMap<String, Value>, claim_name: &str) -> (HashSet<String>, bool) {
     let mut s = HashSet::new();
-    if let Some(pname) = claims.get(claim_name) {
-        if let Some(pnames) = pname.as_array() {
-            for pname in pnames {
-                if let Some(pname_str) = pname.as_str() {
-                    for pname in pname_str.split(',') {
-                        let pname = pname.trim();
-                        if !pname.is_empty() {
-                            s.insert(pname.to_string());
+    match get_claim_case_insensitive(claims, claim_name) {
+        ClaimLookup::Found(pname) => {
+            if let Some(pnames) = pname.as_array() {
+                for pname in pnames {
+                    if let Some(pname_str) = pname.as_str() {
+                        for pname in pname_str.split(',') {
+                            let pname = pname.trim();
+                            if !pname.is_empty() {
+                                s.insert(pname.to_string());
+                            }
                         }
                     }
                 }
+                return (s, true);
             }
-            return (s, true);
-        } else if let Some(pname_str) = pname.as_str() {
-            for pname in pname_str.split(',') {
-                let pname = pname.trim();
-                if !pname.is_empty() {
-                    s.insert(pname.to_string());
+
+            if let Some(pname_str) = pname.as_str() {
+                for pname in pname_str.split(',') {
+                    let pname = pname.trim();
+                    if !pname.is_empty() {
+                        s.insert(pname.to_string());
+                    }
                 }
+                return (s, true);
             }
-            return (s, true);
         }
+        ClaimLookup::Missing | ClaimLookup::Ambiguous => {}
     }
+
     (s, false)
 }
 
@@ -272,42 +284,156 @@ pub fn iam_policy_claim_name_sa() -> String {
     rustfs_credentials::IAM_POLICY_CLAIM_NAME_SA.to_string()
 }
 
+#[inline]
+pub fn is_existing_object_tag_condition_key(key: &str) -> bool {
+    matches!(key, "ExistingObjectTag" | "s3:ExistingObjectTag")
+        || key.starts_with("ExistingObjectTag/")
+        || key.starts_with("s3:ExistingObjectTag/")
+}
+
+pub fn value_uses_existing_object_tag_condition_key(value: &Value) -> bool {
+    match value {
+        Value::Object(obj) => obj
+            .iter()
+            .any(|(key, value)| is_existing_object_tag_condition_key(key) || value_uses_existing_object_tag_condition_key(value)),
+        Value::Array(items) => items.iter().any(value_uses_existing_object_tag_condition_key),
+        _ => false,
+    }
+}
+
+/// True if `conditions` JSON references `s3:ExistingObjectTag` / `ExistingObjectTag/...` keys.
+pub fn functions_use_existing_object_tag(conditions: &Functions) -> bool {
+    serde_json::to_value(conditions)
+        .map(|v| value_uses_existing_object_tag_condition_key(&v))
+        .unwrap_or(false)
+}
+
+pub fn policy_uses_existing_object_tag_conditions(policy: &Policy) -> bool {
+    policy
+        .statements
+        .iter()
+        .any(|statement| functions_use_existing_object_tag(&statement.conditions))
+}
+
+pub fn bucket_policy_uses_existing_object_tag_conditions(policy: &BucketPolicy) -> bool {
+    policy
+        .statements
+        .iter()
+        .any(|statement| functions_use_existing_object_tag(&statement.conditions))
+}
+
+/// True when at least one statement that applies to `args` may evaluate ExistingObjectTag conditions.
+pub async fn policy_needs_existing_object_tag_for_args(policy: &Policy, args: &Args<'_>) -> bool {
+    if !policy_uses_existing_object_tag_conditions(policy) {
+        return false;
+    }
+    let resolver = variable_resolver_for_policy_args(args);
+    for statement in &policy.statements {
+        if !functions_use_existing_object_tag(&statement.conditions) {
+            continue;
+        }
+        if statement.request_reaches_condition_eval(args, &resolver).await {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when at least one bucket-policy statement that applies to `args` may evaluate ExistingObjectTag conditions.
+pub async fn bucket_policy_needs_existing_object_tag_for_args(policy: &BucketPolicy, args: &BucketPolicyArgs<'_>) -> bool {
+    if !bucket_policy_uses_existing_object_tag_conditions(policy) {
+        return false;
+    }
+    for statement in &policy.statements {
+        if !functions_use_existing_object_tag(&statement.conditions) {
+            continue;
+        }
+        if statement.request_reaches_condition_eval(args).await {
+            return true;
+        }
+    }
+    false
+}
+
 pub mod default {
-    use std::{collections::HashSet, sync::LazyLock};
+    use std::sync::LazyLock;
 
     use crate::policy::{
         ActionSet, DEFAULT_VERSION, Effect, Functions, ResourceSet, Statement,
-        action::{Action, AdminAction, KmsAction, S3Action},
+        action::{Action, AdminAction, KmsAction, S3Action, StsAction},
         resource::Resource,
     };
 
     use super::Policy;
 
+    /// Name of the built-in policy granting KMS key lifecycle management.
+    pub const KMS_KEY_ADMINISTRATOR: &str = "KMSKeyAdministrator";
+    /// Name of the built-in policy granting cryptographic use of KMS keys.
+    pub const KMS_KEY_USER: &str = "KMSKeyUser";
+    /// Name of the built-in policy granting read-only visibility into KMS keys.
+    pub const KMS_AUDITOR: &str = "KMSAuditor";
+
+    /// Every KMS key, in the resource grammar identity policies use.
+    ///
+    /// The built-in KMS policies ship unscoped so they behave like the other canned
+    /// policies; an operator narrows a copy to `arn:aws:kms:::key/<key_id>` per workload.
+    const ALL_KMS_KEYS: &str = "*";
+
+    /// A KMS statement allowing `actions` on every key.
+    fn kms_allow(actions: Vec<Action>) -> Statement {
+        Statement {
+            sid: "".into(),
+            effect: Effect::Allow,
+            actions: ActionSet(actions),
+            not_actions: ActionSet(Default::default()),
+            resources: ResourceSet(vec![Resource::Kms(ALL_KMS_KEYS.into())]),
+            conditions: Functions::default(),
+            ..Default::default()
+        }
+    }
+
+    /// The `sts:AssumeRole` grant every canned policy carries so an STS session may
+    /// assume it.
+    fn assume_role_allow() -> Statement {
+        Statement {
+            sid: "".into(),
+            effect: Effect::Allow,
+            actions: ActionSet(vec![Action::StsAction(StsAction::AssumeRoleAction)]),
+            not_actions: ActionSet(Default::default()),
+            resources: ResourceSet(Default::default()),
+            conditions: Functions::default(),
+            ..Default::default()
+        }
+    }
+
     #[allow(clippy::incompatible_msrv)]
-    pub static DEFAULT_POLICIES: LazyLock<[(&'static str, Policy); 6]> = LazyLock::new(|| {
+    pub static DEFAULT_POLICIES: LazyLock<[(&'static str, Policy); 8]> = LazyLock::new(|| {
         [
             (
                 "readwrite",
                 Policy {
                     id: "".into(),
                     version: DEFAULT_VERSION.into(),
-                    statements: vec![Statement {
-                        sid: "".into(),
-                        effect: Effect::Allow,
-                        actions: ActionSet({
-                            let mut hash_set = HashSet::new();
-                            hash_set.insert(Action::S3Action(S3Action::AllActions));
-                            hash_set
-                        }),
-                        not_actions: ActionSet(Default::default()),
-                        resources: ResourceSet({
-                            let mut hash_set = HashSet::new();
-                            hash_set.insert(Resource::S3("*".into()));
-                            hash_set
-                        }),
-                        conditions: Functions::default(),
-                        ..Default::default()
-                    }],
+                    statements: vec![
+                        Statement {
+                            sid: "".into(),
+                            effect: Effect::Allow,
+                            actions: ActionSet(vec![Action::S3Action(S3Action::AllActions)]),
+                            not_actions: ActionSet(Default::default()),
+                            resources: ResourceSet(vec![Resource::S3("*".into())]),
+                            conditions: Functions::default(),
+                            ..Default::default()
+                        },
+                        Statement {
+                            sid: "".into(),
+                            effect: Effect::Allow,
+                            actions: ActionSet(vec![Action::StsAction(StsAction::AssumeRoleAction)]),
+                            not_actions: ActionSet(Default::default()),
+                            resources: ResourceSet(Default::default()),
+                            conditions: Functions::default(),
+                            ..Default::default()
+                        },
+                    ],
                 },
             ),
             (
@@ -315,25 +441,30 @@ pub mod default {
                 Policy {
                     id: "".into(),
                     version: DEFAULT_VERSION.into(),
-                    statements: vec![Statement {
-                        sid: "".into(),
-                        effect: Effect::Allow,
-                        actions: ActionSet({
-                            let mut hash_set = HashSet::new();
-                            hash_set.insert(Action::S3Action(S3Action::GetBucketLocationAction));
-                            hash_set.insert(Action::S3Action(S3Action::GetObjectAction));
-                            hash_set.insert(Action::S3Action(S3Action::GetBucketQuotaAction));
-                            hash_set
-                        }),
-                        not_actions: ActionSet(Default::default()),
-                        resources: ResourceSet({
-                            let mut hash_set = HashSet::new();
-                            hash_set.insert(Resource::S3("*".into()));
-                            hash_set
-                        }),
-                        conditions: Functions::default(),
-                        ..Default::default()
-                    }],
+                    statements: vec![
+                        Statement {
+                            sid: "".into(),
+                            effect: Effect::Allow,
+                            actions: ActionSet(vec![
+                                Action::S3Action(S3Action::GetBucketLocationAction),
+                                Action::S3Action(S3Action::GetObjectAction),
+                                Action::S3Action(S3Action::GetBucketQuotaAction),
+                            ]),
+                            not_actions: ActionSet(Default::default()),
+                            resources: ResourceSet(vec![Resource::S3("*".into())]),
+                            conditions: Functions::default(),
+                            ..Default::default()
+                        },
+                        Statement {
+                            sid: "".into(),
+                            effect: Effect::Allow,
+                            actions: ActionSet(vec![Action::StsAction(StsAction::AssumeRoleAction)]),
+                            not_actions: ActionSet(Default::default()),
+                            resources: ResourceSet(Default::default()),
+                            conditions: Functions::default(),
+                            ..Default::default()
+                        },
+                    ],
                 },
             ),
             (
@@ -341,47 +472,26 @@ pub mod default {
                 Policy {
                     id: "".into(),
                     version: DEFAULT_VERSION.into(),
-                    statements: vec![Statement {
-                        sid: "".into(),
-                        effect: Effect::Allow,
-                        actions: ActionSet({
-                            let mut hash_set = HashSet::new();
-                            hash_set.insert(Action::S3Action(S3Action::PutObjectAction));
-                            hash_set
-                        }),
-                        not_actions: ActionSet(Default::default()),
-                        resources: ResourceSet({
-                            let mut hash_set = HashSet::new();
-                            hash_set.insert(Resource::S3("*".into()));
-                            hash_set
-                        }),
-                        conditions: Functions::default(),
-                        ..Default::default()
-                    }],
-                },
-            ),
-            (
-                "writeonly",
-                Policy {
-                    id: "".into(),
-                    version: DEFAULT_VERSION.into(),
-                    statements: vec![Statement {
-                        sid: "".into(),
-                        effect: Effect::Allow,
-                        actions: ActionSet({
-                            let mut hash_set = HashSet::new();
-                            hash_set.insert(Action::S3Action(S3Action::PutObjectAction));
-                            hash_set
-                        }),
-                        not_actions: ActionSet(Default::default()),
-                        resources: ResourceSet({
-                            let mut hash_set = HashSet::new();
-                            hash_set.insert(Resource::S3("*".into()));
-                            hash_set
-                        }),
-                        conditions: Functions::default(),
-                        ..Default::default()
-                    }],
+                    statements: vec![
+                        Statement {
+                            sid: "".into(),
+                            effect: Effect::Allow,
+                            actions: ActionSet(vec![Action::S3Action(S3Action::PutObjectAction)]),
+                            not_actions: ActionSet(Default::default()),
+                            resources: ResourceSet(vec![Resource::S3("*".into())]),
+                            conditions: Functions::default(),
+                            ..Default::default()
+                        },
+                        Statement {
+                            sid: "".into(),
+                            effect: Effect::Allow,
+                            actions: ActionSet(vec![Action::StsAction(StsAction::AssumeRoleAction)]),
+                            not_actions: ActionSet(Default::default()),
+                            resources: ResourceSet(Default::default()),
+                            conditions: Functions::default(),
+                            ..Default::default()
+                        },
+                    ],
                 },
             ),
             (
@@ -389,30 +499,35 @@ pub mod default {
                 Policy {
                     id: "".into(),
                     version: DEFAULT_VERSION.into(),
-                    statements: vec![Statement {
-                        sid: "".into(),
-                        effect: Effect::Allow,
-                        actions: ActionSet({
-                            let mut hash_set = HashSet::new();
-                            hash_set.insert(Action::AdminAction(AdminAction::ProfilingAdminAction));
-                            hash_set.insert(Action::AdminAction(AdminAction::TraceAdminAction));
-                            hash_set.insert(Action::AdminAction(AdminAction::ConsoleLogAdminAction));
-                            hash_set.insert(Action::AdminAction(AdminAction::ServerInfoAdminAction));
-                            hash_set.insert(Action::AdminAction(AdminAction::TopLocksAdminAction));
-                            hash_set.insert(Action::AdminAction(AdminAction::HealthInfoAdminAction));
-                            hash_set.insert(Action::AdminAction(AdminAction::PrometheusAdminAction));
-                            hash_set.insert(Action::AdminAction(AdminAction::BandwidthMonitorAction));
-                            hash_set
-                        }),
-                        not_actions: ActionSet(Default::default()),
-                        resources: ResourceSet({
-                            let mut hash_set = HashSet::new();
-                            hash_set.insert(Resource::S3("*".into()));
-                            hash_set
-                        }),
-                        conditions: Functions::default(),
-                        ..Default::default()
-                    }],
+                    statements: vec![
+                        Statement {
+                            sid: "".into(),
+                            effect: Effect::Allow,
+                            actions: ActionSet(vec![
+                                Action::AdminAction(AdminAction::ProfilingAdminAction),
+                                Action::AdminAction(AdminAction::TraceAdminAction),
+                                Action::AdminAction(AdminAction::ConsoleLogAdminAction),
+                                Action::AdminAction(AdminAction::ServerInfoAdminAction),
+                                Action::AdminAction(AdminAction::TopLocksAdminAction),
+                                Action::AdminAction(AdminAction::HealthInfoAdminAction),
+                                Action::AdminAction(AdminAction::PrometheusAdminAction),
+                                Action::AdminAction(AdminAction::BandwidthMonitorAction),
+                            ]),
+                            not_actions: ActionSet(Default::default()),
+                            resources: ResourceSet(vec![Resource::S3("*".into())]),
+                            conditions: Functions::default(),
+                            ..Default::default()
+                        },
+                        Statement {
+                            sid: "".into(),
+                            effect: Effect::Allow,
+                            actions: ActionSet(vec![Action::StsAction(StsAction::AssumeRoleAction)]),
+                            not_actions: ActionSet(Default::default()),
+                            resources: ResourceSet(Default::default()),
+                            conditions: Functions::default(),
+                            ..Default::default()
+                        },
+                    ],
                 },
             ),
             (
@@ -424,46 +539,98 @@ pub mod default {
                         Statement {
                             sid: "".into(),
                             effect: Effect::Allow,
-                            actions: ActionSet({
-                                let mut hash_set = HashSet::new();
-                                hash_set.insert(Action::AdminAction(AdminAction::AllAdminActions));
-                                hash_set
-                            }),
+                            actions: ActionSet(vec![Action::AdminAction(AdminAction::AllAdminActions)]),
                             not_actions: ActionSet(Default::default()),
-                            resources: ResourceSet(HashSet::new()),
+                            resources: ResourceSet(Vec::new()),
                             conditions: Functions::default(),
                             ..Default::default()
                         },
                         Statement {
                             sid: "".into(),
                             effect: Effect::Allow,
-                            actions: ActionSet({
-                                let mut hash_set = HashSet::new();
-                                hash_set.insert(Action::KmsAction(KmsAction::AllActions));
-                                hash_set
-                            }),
+                            actions: ActionSet(vec![Action::KmsAction(KmsAction::AllActions)]),
                             not_actions: ActionSet(Default::default()),
-                            resources: ResourceSet(HashSet::new()),
+                            resources: ResourceSet(Vec::new()),
                             conditions: Functions::default(),
                             ..Default::default()
                         },
                         Statement {
                             sid: "".into(),
                             effect: Effect::Allow,
-                            actions: ActionSet({
-                                let mut hash_set = HashSet::new();
-                                hash_set.insert(Action::S3Action(S3Action::AllActions));
-                                hash_set
-                            }),
+                            actions: ActionSet(vec![Action::S3Action(S3Action::AllActions)]),
                             not_actions: ActionSet(Default::default()),
-                            resources: ResourceSet({
-                                let mut hash_set = HashSet::new();
-                                hash_set.insert(Resource::S3("*".into()));
-                                hash_set
-                            }),
+                            resources: ResourceSet(vec![Resource::S3("*".into())]),
                             conditions: Functions::default(),
                             ..Default::default()
                         },
+                        Statement {
+                            sid: "".into(),
+                            effect: Effect::Allow,
+                            actions: ActionSet(vec![Action::StsAction(StsAction::AssumeRoleAction)]),
+                            not_actions: ActionSet(Default::default()),
+                            resources: ResourceSet(Vec::new()),
+                            conditions: Functions::default(),
+                            ..Default::default()
+                        },
+                    ],
+                },
+            ),
+            // KMS role templates. They deliberately carry no S3 or admin grants, so an
+            // operator combines one with a data-plane policy ("readwrite,KMSKeyUser").
+            //
+            // None of them grants kms:Configure, kms:ServiceControl, kms:ClearCache,
+            // kms:Backup or kms:Restore: those act on the KMS service or on the material
+            // of every key at once, which is a cluster-administration power rather than a
+            // key-management one, and they stay with consoleAdmin. Key creation currently
+            // shares kms:Configure with backend configuration, so it stays there too.
+            (
+                KMS_KEY_ADMINISTRATOR,
+                Policy {
+                    id: "".into(),
+                    version: DEFAULT_VERSION.into(),
+                    statements: vec![
+                        // Separation of duties: a key administrator governs a key's
+                        // lifecycle but is never able to encrypt or decrypt with it.
+                        kms_allow(vec![
+                            Action::KmsAction(KmsAction::DescribeKeyAction),
+                            Action::KmsAction(KmsAction::ListKeysAction),
+                            Action::KmsAction(KmsAction::EnableKeyAction),
+                            Action::KmsAction(KmsAction::DisableKeyAction),
+                            Action::KmsAction(KmsAction::RotateKeyAction),
+                            Action::KmsAction(KmsAction::DeleteKeyAction),
+                        ]),
+                        assume_role_allow(),
+                    ],
+                },
+            ),
+            (
+                KMS_KEY_USER,
+                Policy {
+                    id: "".into(),
+                    version: DEFAULT_VERSION.into(),
+                    statements: vec![
+                        // The two actions the SSE-KMS data path evaluates, plus the
+                        // metadata read a client needs to tell which key it is using.
+                        kms_allow(vec![
+                            Action::KmsAction(KmsAction::GenerateDataKeyAction),
+                            Action::KmsAction(KmsAction::DecryptAction),
+                            Action::KmsAction(KmsAction::DescribeKeyAction),
+                        ]),
+                        assume_role_allow(),
+                    ],
+                },
+            ),
+            (
+                KMS_AUDITOR,
+                Policy {
+                    id: "".into(),
+                    version: DEFAULT_VERSION.into(),
+                    statements: vec![
+                        kms_allow(vec![
+                            Action::KmsAction(KmsAction::DescribeKeyAction),
+                            Action::KmsAction(KmsAction::ListKeysAction),
+                        ]),
+                        assume_role_allow(),
                     ],
                 },
             ),
@@ -475,6 +642,59 @@ pub mod default {
 mod test {
     use super::*;
     use crate::error::Result;
+    use crate::policy::action::{AdminAction, KmsAction, S3Action};
+
+    #[tokio::test]
+    async fn delegated_service_account_obeys_admin_wildcards_and_target_conditions() -> Result<()> {
+        let conditions = HashMap::from([("TargetUser".into(), vec!["backup".into()])]);
+        let args = Args {
+            account: "operator",
+            groups: &None,
+            action: Action::AdminAction(AdminAction::CreateServiceAccountForUserAdminAction),
+            bucket: "",
+            object: "",
+            conditions: &conditions,
+            claims: &HashMap::new(),
+            is_owner: false,
+            deny_only: false,
+        };
+        for (statement, allowed) in [
+            (serde_json::json!({"Effect":"Allow","Action":"admin:*"}), true),
+            (serde_json::json!({"Effect":"Allow","Action":"admin:CreateServiceAccount"}), false),
+            (serde_json::json!({"Effect":"Allow","NotAction":"admin:DeleteUser","Resource":"*"}), true),
+            (
+                serde_json::json!({"Effect":"Allow","NotAction":"admin:CreateServiceAccountForUser","Resource":"*"}),
+                false,
+            ),
+            (
+                serde_json::json!({"Effect":"Allow","Action":"admin:CreateServiceAccountForUser","Condition":{"StringEquals":{"svc:TargetUser":"backup"}}}),
+                true,
+            ),
+            (
+                serde_json::json!({"Effect":"Allow","Action":"admin:CreateServiceAccountForUser","Condition":{"StringEquals":{"svc:TargetUser":"archive"}}}),
+                false,
+            ),
+        ] {
+            let policy = Policy::parse_config(
+                &serde_json::to_vec(&serde_json::json!({"Version":DEFAULT_VERSION,"Statement":[statement]}))
+                    .expect("encode policy"),
+            )?;
+            assert_eq!(policy.is_allowed(&args).await, allowed, "{statement}");
+        }
+        let admin = default::DEFAULT_POLICIES
+            .iter()
+            .find(|(name, _)| *name == "consoleAdmin")
+            .expect("built-in admin policy");
+        assert!(admin.1.is_allowed(&args).await);
+        for denied_action in ["admin:*", "admin:CreateServiceAccountForUser"] {
+            let deny = Policy::parse_config(&serde_json::to_vec(&serde_json::json!({
+                "Version": DEFAULT_VERSION,
+                "Statement": [{"Effect": "Deny", "Action": denied_action}]
+            }))?)?;
+            assert!(!Policy::merge_policies(vec![admin.1.clone(), deny]).is_allowed(&args).await);
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_parse_policy() -> Result<()> {
@@ -605,6 +825,225 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_default_policies_allow_sts_assume_role() {
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let args = Args {
+            account: "testuser",
+            groups: &None,
+            action: Action::StsAction(crate::policy::action::StsAction::AssumeRoleAction),
+            bucket: "",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        for (name, policy) in default::DEFAULT_POLICIES.iter() {
+            assert!(policy.is_allowed(&args).await, "default policy {name} should allow sts:AssumeRole");
+        }
+    }
+
+    #[test]
+    fn test_default_policy_names_are_unique() {
+        let mut names = HashSet::new();
+        for (name, _) in default::DEFAULT_POLICIES.iter() {
+            assert!(names.insert(*name), "duplicate default policy name: {name}");
+        }
+    }
+
+    #[test]
+    fn test_default_policies_validate() {
+        for (name, policy) in default::DEFAULT_POLICIES.iter() {
+            policy
+                .validate()
+                .unwrap_or_else(|err| panic!("default policy {name} should validate: {err}"));
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Built-in KMS role templates
+    // ------------------------------------------------------------------------
+
+    fn default_policy(name: &str) -> &'static Policy {
+        default::DEFAULT_POLICIES
+            .iter()
+            .find_map(|(candidate, policy)| (*candidate == name).then_some(policy))
+            .unwrap_or_else(|| panic!("built-in policy {name} should exist"))
+    }
+
+    /// Evaluate `policy` for `account` against `action` on `key_id`.
+    ///
+    /// Mirrors the admin and SSE call sites: the requested key identifier travels in
+    /// `object` with `bucket` left empty. An empty `key_id` is the unscoped call.
+    async fn kms_allows(policy: &Policy, account: &str, action: KmsAction, key_id: &str) -> bool {
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        policy
+            .is_allowed(&Args {
+                account,
+                groups: &None,
+                action: Action::KmsAction(action),
+                bucket: "",
+                conditions: &conditions,
+                is_owner: false,
+                object: key_id,
+                claims: &claims,
+                deny_only: false,
+            })
+            .await
+    }
+
+    const KMS_LIFECYCLE_ACTIONS: [KmsAction; 4] = [
+        KmsAction::EnableKeyAction,
+        KmsAction::DisableKeyAction,
+        KmsAction::RotateKeyAction,
+        KmsAction::DeleteKeyAction,
+    ];
+
+    const KMS_CRYPTO_ACTIONS: [KmsAction; 2] = [KmsAction::GenerateDataKeyAction, KmsAction::DecryptAction];
+
+    /// Actions that act on the service or on every key's material at once. No role
+    /// template may confer them.
+    const KMS_CLUSTER_ADMIN_ACTIONS: [KmsAction; 7] = [
+        KmsAction::AllActions,
+        KmsAction::ConfigureAction,
+        KmsAction::ServiceControlAction,
+        KmsAction::ClearCacheAction,
+        KmsAction::BackupAction,
+        KmsAction::RestoreAction,
+        KmsAction::RekeyAction,
+    ];
+
+    const KMS_ROLE_TEMPLATES: [&str; 3] = [default::KMS_KEY_ADMINISTRATOR, default::KMS_KEY_USER, default::KMS_AUDITOR];
+
+    #[tokio::test]
+    async fn kms_key_administrator_manages_keys_but_cannot_use_them() {
+        let policy = default_policy(default::KMS_KEY_ADMINISTRATOR);
+
+        for action in KMS_LIFECYCLE_ACTIONS {
+            assert!(
+                kms_allows(policy, "keyadmin", action, "app-key").await,
+                "KMSKeyAdministrator should allow {action:?}"
+            );
+        }
+        assert!(kms_allows(policy, "keyadmin", KmsAction::DescribeKeyAction, "app-key").await);
+        assert!(kms_allows(policy, "keyadmin", KmsAction::ListKeysAction, "").await);
+
+        for action in KMS_CRYPTO_ACTIONS {
+            assert!(
+                !kms_allows(policy, "keyadmin", action, "app-key").await,
+                "KMSKeyAdministrator must not allow {action:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn kms_key_user_uses_keys_but_cannot_manage_them() {
+        let policy = default_policy(default::KMS_KEY_USER);
+
+        for action in KMS_CRYPTO_ACTIONS {
+            assert!(
+                kms_allows(policy, "appuser", action, "app-key").await,
+                "KMSKeyUser should allow {action:?}"
+            );
+        }
+        assert!(kms_allows(policy, "appuser", KmsAction::DescribeKeyAction, "app-key").await);
+
+        for action in KMS_LIFECYCLE_ACTIONS {
+            assert!(
+                !kms_allows(policy, "appuser", action, "app-key").await,
+                "KMSKeyUser must not allow {action:?}"
+            );
+        }
+        assert!(!kms_allows(policy, "appuser", KmsAction::ListKeysAction, "").await);
+    }
+
+    #[tokio::test]
+    async fn kms_auditor_only_reads_key_metadata() {
+        let policy = default_policy(default::KMS_AUDITOR);
+
+        assert!(kms_allows(policy, "auditor", KmsAction::DescribeKeyAction, "app-key").await);
+        assert!(kms_allows(policy, "auditor", KmsAction::ListKeysAction, "").await);
+
+        for action in KMS_LIFECYCLE_ACTIONS.iter().chain(KMS_CRYPTO_ACTIONS.iter()) {
+            assert!(
+                !kms_allows(policy, "auditor", *action, "app-key").await,
+                "KMSAuditor must not allow {action:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn kms_role_templates_withhold_service_and_bundle_actions() {
+        for name in KMS_ROLE_TEMPLATES {
+            let policy = default_policy(name);
+            for action in KMS_CLUSTER_ADMIN_ACTIONS {
+                assert!(
+                    !kms_allows(policy, "someone", action, "app-key").await,
+                    "{name} must not allow {action:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn kms_role_templates_grant_nothing_outside_kms() {
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let foreign_actions = [
+            Action::S3Action(S3Action::GetObjectAction),
+            Action::S3Action(S3Action::PutObjectAction),
+            Action::AdminAction(AdminAction::ServerInfoAdminAction),
+        ];
+
+        for name in KMS_ROLE_TEMPLATES {
+            let policy = default_policy(name);
+            for action in &foreign_actions {
+                let allowed = policy
+                    .is_allowed(&Args {
+                        account: "someone",
+                        groups: &None,
+                        action: *action,
+                        bucket: "any-bucket",
+                        conditions: &conditions,
+                        is_owner: false,
+                        object: "any-object",
+                        claims: &claims,
+                        deny_only: false,
+                    })
+                    .await;
+                assert!(!allowed, "{name} must not allow {action:?}");
+            }
+        }
+    }
+
+    /// The narrowing an operator is told to apply must actually deny the other keys.
+    #[tokio::test]
+    async fn narrowed_kms_role_template_denies_other_keys() -> Result<()> {
+        let narrowed = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["kms:GenerateDataKey", "kms:Decrypt", "kms:DescribeKey"],
+      "Resource": ["arn:aws:kms:::key/reports-*"]
+    }
+  ]
+}"#,
+        )?;
+
+        assert!(kms_allows(&narrowed, "appuser", KmsAction::GenerateDataKeyAction, "reports-2026").await);
+        assert!(kms_allows(&narrowed, "appuser", KmsAction::DecryptAction, "reports-2026").await);
+        assert!(!kms_allows(&narrowed, "appuser", KmsAction::DecryptAction, "payroll-2026").await);
+        assert!(!kms_allows(&narrowed, "appuser", KmsAction::DisableKeyAction, "reports-2026").await);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_deny_only_checks_only_deny_statements() -> Result<()> {
         let data = r#"
 {
@@ -713,6 +1152,176 @@ mod test {
         assert!(
             policy.is_allowed(&args_owner_deny_only).await,
             "deny_only should allow when no Deny statement matches, including owner requests"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_bucket_prefix_condition_uses_bucket_resource() -> Result<()> {
+        let policy = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::polaris-test-bucket"],
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "polaris_test/snowflake_catalog/db1/schema/iceberg_table/*"
+          ]
+        }
+      }
+    }
+  ]
+}"#,
+        )?;
+
+        let mut conditions = HashMap::new();
+        conditions.insert(
+            "prefix".to_string(),
+            vec!["polaris_test/snowflake_catalog/db1/schema/iceberg_table/metadata/".to_string()],
+        );
+        let claims = HashMap::new();
+        let args = Args {
+            account: "polaris-session",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::ListBucketAction),
+            bucket: "polaris-test-bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "polaris_test/snowflake_catalog/db1/schema/iceberg_table/metadata/",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        assert!(
+            policy.is_allowed(&args).await,
+            "ListBucket should match the bucket resource and apply the prefix through the condition, not by converting the prefix into an object resource"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_bucket_versions_prefix_condition_uses_bucket_resource() -> Result<()> {
+        let policy = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucketVersions"],
+      "Resource": ["arn:aws:s3:::polaris-test-bucket"],
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "polaris_test/snowflake_catalog/db1/schema/iceberg_table/*"
+          ]
+        }
+      }
+    }
+  ]
+}"#,
+        )?;
+
+        let mut conditions = HashMap::new();
+        conditions.insert(
+            "prefix".to_string(),
+            vec!["polaris_test/snowflake_catalog/db1/schema/iceberg_table/metadata/".to_string()],
+        );
+        let claims = HashMap::new();
+        let args = Args {
+            account: "polaris-session",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::ListBucketVersionsAction),
+            bucket: "polaris-test-bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "polaris_test/snowflake_catalog/db1/schema/iceberg_table/metadata/",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        assert!(
+            policy.is_allowed(&args).await,
+            "ListBucketVersions should match the bucket resource and apply the prefix through the condition"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_bucket_gateway_prefix_uses_object_resource_when_condition_missing() -> Result<()> {
+        let policy = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::polaris-test-bucket/home/alice/*"]
+    }
+  ]
+}"#,
+        )?;
+
+        let mut conditions = HashMap::new();
+        conditions.insert("prefix".to_string(), vec!["home/alice/projects/".to_string()]);
+        let claims = HashMap::new();
+        let args = Args {
+            account: "polaris-session",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::ListBucketAction),
+            bucket: "polaris-test-bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "home/alice/projects/",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        assert!(
+            policy.is_allowed(&args).await,
+            "Gateway ListBucket auth without an s3:prefix condition should continue matching prefix-scoped resources via args.object"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bucket_policy_gateway_prefix_uses_object_resource_when_condition_missing() -> Result<()> {
+        let bucket_policy: BucketPolicy = serde_json::from_str(
+            r#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {"AWS": "*"},
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::polaris-test-bucket/home/alice/*"]
+    }
+  ]
+}"#,
+        )?;
+
+        let mut conditions = HashMap::new();
+        conditions.insert("prefix".to_string(), vec!["home/alice/projects/".to_string()]);
+        let args = BucketPolicyArgs {
+            account: "polaris-session",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::ListBucketAction),
+            bucket: "polaris-test-bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "home/alice/projects/",
+        };
+
+        assert!(
+            bucket_policy.is_allowed(&args).await,
+            "Bucket policy ListBucket without an s3:prefix condition should continue matching prefix-scoped resources via args.object"
         );
 
         Ok(())
@@ -1085,6 +1694,14 @@ mod test {
     }
 
     #[test]
+    fn test_parse_empty_policy_object_as_implied_policy() {
+        let policy = Policy::parse_config(b"{}").expect("empty JSON object should parse");
+
+        assert!(policy.version.is_empty());
+        assert!(policy.statements.is_empty());
+    }
+
+    #[test]
     fn test_statement_with_both_action_and_notaction_is_invalid() {
         // Test: A statement with both Action and NotAction returns BothActionAndNotAction error
         let data = r#"
@@ -1162,6 +1779,1349 @@ mod test {
     }
 
     #[test]
+    fn test_admin_statement_without_resource_is_valid() {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["admin:ServerInfo"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(
+            result.is_ok(),
+            "Admin-only Action statement without Resource should be valid, got: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_table_location_claim_is_limited_to_the_physical_prefix() -> Result<()> {
+        use crate::policy::action::{Action, AdminAction};
+
+        let policy = Policy::parse_config(
+            br#"{
+                "Version": "2012-10-17",
+                "Statement": [
+                    {"Effect": "Allow", "Action": "admin:CreateTable", "Resource": "arn:aws:s3:::warehouse/namespaces/lab"},
+                    {"Effect": "Allow", "Action": "admin:ClaimTableLocation", "Resource": [
+                        "arn:aws:s3:::warehouse/owned", "arn:aws:s3:::warehouse/owned/*"
+                    ]},
+                    {"Effect": "Deny", "Action": "admin:ClaimTableLocation", "Resource": [
+                        "arn:aws:s3:::warehouse/owned/private", "arn:aws:s3:::warehouse/owned/private/*"
+                    ]}
+                ]
+            }"#,
+        )?;
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let groups = None;
+        for (bucket, object, allowed) in [
+            ("warehouse", "owned", true),
+            ("warehouse", "owned/", true),
+            ("warehouse", "owned/child/", true),
+            ("warehouse", "owned/private/", false),
+            ("warehouse", "owned2/", false),
+            ("warehouse", "shared/", false),
+            ("warehouse", "namespaces/lab", false),
+            ("another-warehouse", "owned/", false),
+        ] {
+            let args = Args {
+                account: "creator",
+                groups: &groups,
+                action: Action::AdminAction(AdminAction::ClaimTableLocationAction),
+                bucket,
+                conditions: &conditions,
+                is_owner: false,
+                object,
+                claims: &claims,
+                deny_only: false,
+            };
+            assert_eq!(policy.is_allowed(&args).await, allowed, "{bucket}/{object}");
+        }
+        Ok(())
+    }
+
+    async fn assert_catalog_migration_policy_matrix(data: &[u8], cases: &[(&str, AdminAction, bool)]) -> Result<()> {
+        let policy = Policy::parse_config(data)?;
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let groups = None;
+        for (bucket, action, expected) in cases {
+            let args = Args {
+                account: "catalog-migration-operator",
+                groups: &groups,
+                action: Action::AdminAction(*action),
+                bucket,
+                conditions: &conditions,
+                is_owner: false,
+                object: "",
+                claims: &claims,
+                deny_only: false,
+            };
+            assert_eq!(policy.is_allowed(&args).await, *expected, "{action:?} on warehouse {bucket:?}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catalog_migration_allow_resource_is_limited_to_the_requested_warehouse() -> Result<()> {
+        assert_catalog_migration_policy_matrix(
+            br#"{
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Action": "admin:MigrateTableCatalog",
+                    "Resource": "arn:aws:s3:::warehouse-a"
+                }]
+            }"#,
+            &[
+                ("warehouse-a", AdminAction::MigrateTableCatalogAction, true),
+                ("warehouse-b", AdminAction::MigrateTableCatalogAction, false),
+                ("", AdminAction::MigrateTableCatalogAction, false),
+            ],
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn catalog_migration_allow_not_resource_excludes_only_the_named_warehouse() -> Result<()> {
+        assert_catalog_migration_policy_matrix(
+            br#"{
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Action": "admin:MigrateTableCatalog",
+                    "NotResource": "arn:aws:s3:::warehouse-b"
+                }]
+            }"#,
+            &[
+                ("warehouse-a", AdminAction::MigrateTableCatalogAction, true),
+                ("warehouse-b", AdminAction::MigrateTableCatalogAction, false),
+                ("warehouse-c", AdminAction::MigrateTableCatalogAction, true),
+            ],
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn catalog_migration_explicit_deny_resource_does_not_spread_to_other_warehouses() -> Result<()> {
+        assert_catalog_migration_policy_matrix(
+            br#"{
+                "Version": "2012-10-17",
+                "Statement": [
+                    {"Effect": "Allow", "Action": "admin:*", "Resource": "*"},
+                    {"Effect": "Deny", "Action": "admin:MigrateTableCatalog", "Resource": "arn:aws:s3:::warehouse-b"}
+                ]
+            }"#,
+            &[
+                ("warehouse-a", AdminAction::MigrateTableCatalogAction, true),
+                ("warehouse-b", AdminAction::MigrateTableCatalogAction, false),
+                ("warehouse-c", AdminAction::MigrateTableCatalogAction, true),
+                ("warehouse-b", AdminAction::ServerInfoAdminAction, true),
+            ],
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn catalog_migration_explicit_deny_not_resource_preserves_its_exception() -> Result<()> {
+        assert_catalog_migration_policy_matrix(
+            br#"{
+                "Version": "2012-10-17",
+                "Statement": [
+                    {"Effect": "Allow", "Action": "admin:*", "Resource": "*"},
+                    {"Effect": "Deny", "Action": "admin:MigrateTableCatalog", "NotResource": "arn:aws:s3:::warehouse-a"}
+                ]
+            }"#,
+            &[
+                ("warehouse-a", AdminAction::MigrateTableCatalogAction, true),
+                ("warehouse-b", AdminAction::MigrateTableCatalogAction, false),
+                ("warehouse-c", AdminAction::MigrateTableCatalogAction, false),
+                ("warehouse-b", AdminAction::ServerInfoAdminAction, true),
+            ],
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn catalog_migration_admin_wildcard_still_honors_the_requested_action_scope() -> Result<()> {
+        assert_catalog_migration_policy_matrix(
+            br#"{
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Action": "admin:*",
+                    "Resource": "arn:aws:s3:::warehouse-a"
+                }]
+            }"#,
+            &[
+                ("warehouse-a", AdminAction::MigrateTableCatalogAction, true),
+                ("warehouse-b", AdminAction::MigrateTableCatalogAction, false),
+                ("", AdminAction::MigrateTableCatalogAction, false),
+                ("warehouse-b", AdminAction::ServerInfoAdminAction, true),
+                ("", AdminAction::GetTableCatalogAction, true),
+            ],
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn catalog_migration_resource_free_admin_grants_keep_their_global_behavior() -> Result<()> {
+        assert_catalog_migration_policy_matrix(
+            br#"{
+                "Version": "2012-10-17",
+                "Statement": [{"Effect": "Allow", "Action": "admin:MigrateTableCatalog"}]
+            }"#,
+            &[
+                ("warehouse-a", AdminAction::MigrateTableCatalogAction, true),
+                ("warehouse-b", AdminAction::MigrateTableCatalogAction, true),
+                ("", AdminAction::MigrateTableCatalogAction, true),
+            ],
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_table_admin_action_with_resource_is_limited_to_bucket() -> Result<()> {
+        use crate::policy::action::{Action, AdminAction};
+
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["admin:GetTableMetadata"],
+      "Resource": ["arn:aws:s3:::warehouse-a"]
+    }
+  ]
+}
+"#;
+
+        let policy = Policy::parse_config(data.as_bytes())?;
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let groups = None;
+
+        let matching_args = Args {
+            account: "testuser",
+            groups: &groups,
+            action: Action::AdminAction(AdminAction::GetTableMetadataAction),
+            bucket: "warehouse-a",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        };
+        assert!(
+            policy.is_allowed(&matching_args).await,
+            "table admin action should allow the explicitly granted warehouse bucket"
+        );
+
+        let mismatched_args = Args {
+            account: "testuser",
+            groups: &groups,
+            action: Action::AdminAction(AdminAction::GetTableMetadataAction),
+            bucket: "warehouse-b",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        };
+        assert!(
+            !policy.is_allowed(&mismatched_args).await,
+            "table admin action must not ignore Resource when the request targets a different warehouse bucket"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_table_admin_action_with_resource_is_limited_to_table_object_scope() -> Result<()> {
+        use crate::policy::action::{Action, AdminAction};
+
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["admin:GetTableMetadata"],
+      "Resource": ["arn:aws:s3:::warehouse-a/namespaces/analytics/tables/events"]
+    }
+  ]
+}
+"#;
+
+        let policy = Policy::parse_config(data.as_bytes())?;
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let groups = None;
+
+        let matching_args = Args {
+            account: "testuser",
+            groups: &groups,
+            action: Action::AdminAction(AdminAction::GetTableMetadataAction),
+            bucket: "warehouse-a",
+            conditions: &conditions,
+            is_owner: false,
+            object: "namespaces/analytics/tables/events",
+            claims: &claims,
+            deny_only: false,
+        };
+        assert!(
+            policy.is_allowed(&matching_args).await,
+            "table admin action should allow the explicitly granted table resource"
+        );
+
+        let namespace_only_args = Args {
+            account: "testuser",
+            groups: &groups,
+            action: Action::AdminAction(AdminAction::GetTableMetadataAction),
+            bucket: "warehouse-a",
+            conditions: &conditions,
+            is_owner: false,
+            object: "namespaces/analytics",
+            claims: &claims,
+            deny_only: false,
+        };
+        assert!(
+            !policy.is_allowed(&namespace_only_args).await,
+            "table admin action must not match a namespace-only resource when a table resource is required"
+        );
+
+        let other_table_args = Args {
+            account: "testuser",
+            groups: &groups,
+            action: Action::AdminAction(AdminAction::GetTableMetadataAction),
+            bucket: "warehouse-a",
+            conditions: &conditions,
+            is_owner: false,
+            object: "namespaces/analytics/tables/orders",
+            claims: &claims,
+            deny_only: false,
+        };
+        assert!(
+            !policy.is_allowed(&other_table_args).await,
+            "table admin action must not match a different table resource"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_table_admin_action_with_not_resource_excludes_bucket() -> Result<()> {
+        use crate::policy::action::{Action, AdminAction};
+
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["admin:GetTableMetadata"],
+      "NotResource": ["arn:aws:s3:::warehouse-b"]
+    }
+  ]
+}
+"#;
+
+        let policy = Policy::parse_config(data.as_bytes())?;
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let groups = None;
+
+        let allowed_args = Args {
+            account: "testuser",
+            groups: &groups,
+            action: Action::AdminAction(AdminAction::GetTableMetadataAction),
+            bucket: "warehouse-a",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        };
+        assert!(
+            policy.is_allowed(&allowed_args).await,
+            "table admin NotResource should allow a warehouse outside the excluded bucket"
+        );
+
+        let excluded_args = Args {
+            account: "testuser",
+            groups: &groups,
+            action: Action::AdminAction(AdminAction::GetTableMetadataAction),
+            bucket: "warehouse-b",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        };
+        assert!(
+            !policy.is_allowed(&excluded_args).await,
+            "table admin NotResource should deny the excluded warehouse bucket"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_non_table_admin_action_keeps_unscoped_resource_behavior() -> Result<()> {
+        use crate::policy::action::{Action, AdminAction};
+
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["admin:ServerInfo"],
+      "Resource": ["arn:aws:s3:::warehouse-a"]
+    }
+  ]
+}
+"#;
+
+        let policy = Policy::parse_config(data.as_bytes())?;
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let groups = None;
+
+        let args = Args {
+            account: "testuser",
+            groups: &groups,
+            action: Action::AdminAction(AdminAction::ServerInfoAdminAction),
+            bucket: "warehouse-b",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        };
+        assert!(
+            policy.is_allowed(&args).await,
+            "existing non-table admin actions should preserve resource-independent evaluation"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sts_statement_without_resource_is_valid() {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["sts:AssumeRole"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(
+            result.is_ok(),
+            "STS-only Action statement without Resource should be valid, got: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_kms_statement_without_resource_is_valid() {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["kms:*"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(
+            result.is_ok(),
+            "KMS-only Action statement without Resource should be valid, got: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_dedicated_kms_statement_without_resource_is_valid() {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["kms:GenerateDataKey"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(
+            result.is_ok(),
+            "KMS-only dedicated Action statement without Resource should be valid, got: {:?}",
+            result.err()
+        );
+    }
+
+    fn kms_args<'a>(
+        action: Action,
+        key_id: &'a str,
+        conditions: &'a HashMap<String, Vec<String>>,
+        claims: &'a HashMap<String, Value>,
+    ) -> Args<'a> {
+        Args {
+            account: "testuser",
+            groups: &None,
+            action,
+            bucket: "",
+            conditions,
+            is_owner: false,
+            object: key_id,
+            claims,
+            deny_only: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_kms_statement_with_key_resource_scopes_by_key() -> Result<()> {
+        use crate::policy::action::{Action, KmsAction};
+
+        let policy = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["kms:DisableKey"],
+      "Resource": ["arn:aws:kms:::key/key-a"]
+    }
+  ]
+}"#,
+        )?;
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let action = Action::KmsAction(KmsAction::DisableKeyAction);
+
+        assert!(
+            policy.is_allowed(&kms_args(action, "key-a", &conditions, &claims)).await,
+            "the granted key must be allowed"
+        );
+        assert!(
+            !policy.is_allowed(&kms_args(action, "key-b", &conditions, &claims)).await,
+            "a key outside the granted resource must be denied"
+        );
+        assert!(
+            !policy
+                .is_allowed(&kms_args(Action::KmsAction(KmsAction::EnableKeyAction), "key-a", &conditions, &claims))
+                .await,
+            "an action outside the grant must stay denied even for the granted key"
+        );
+        assert!(
+            policy.is_allowed(&kms_args(action, "", &conditions, &claims)).await,
+            "call sites that do not pass a key resource keep the legacy match-every-key behaviour"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_kms_statement_with_wildcard_key_resource() -> Result<()> {
+        use crate::policy::action::{Action, KmsAction};
+
+        let policy = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["kms:GenerateDataKey"],
+      "Resource": ["arn:aws:kms:::key/app-*"]
+    }
+  ]
+}"#,
+        )?;
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let action = Action::KmsAction(KmsAction::GenerateDataKeyAction);
+
+        assert!(
+            policy
+                .is_allowed(&kms_args(action, "app-primary", &conditions, &claims))
+                .await
+        );
+        assert!(
+            !policy
+                .is_allowed(&kms_args(action, "backup-primary", &conditions, &claims))
+                .await
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_kms_bundle_actions_require_an_unscoped_statement() -> Result<()> {
+        use crate::policy::action::{Action, KmsAction};
+
+        let scoped = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["kms:*"],
+      "Resource": ["arn:aws:kms:::key/key-a"]
+    }
+  ]
+}"#,
+        )?;
+        let unscoped = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["kms:Backup", "kms:Restore"]
+    }
+  ]
+}"#,
+        )?;
+        let partially_scoped = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["kms:Backup", "kms:Restore"],
+      "NotResource": ["arn:aws:kms:::key/protected"]
+    }
+  ]
+}"#,
+        )?;
+        let scoped_deny = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["kms:Backup", "kms:Restore"]
+    },
+    {
+      "Effect": "Deny",
+      "Action": ["kms:Backup", "kms:Restore"],
+      "Resource": ["arn:aws:kms:::key/protected"]
+    }
+  ]
+}"#,
+        )?;
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+
+        for action in [KmsAction::BackupAction, KmsAction::RestoreAction] {
+            let args = kms_args(Action::KmsAction(action), "", &conditions, &claims);
+            assert!(
+                !scoped.is_allowed(&args).await,
+                "a single-key grant must not authorize the all-key {action:?} operation"
+            );
+            assert!(
+                !partially_scoped.is_allowed(&args).await,
+                "a grant excluding one key must not authorize the all-key {action:?} operation"
+            );
+            assert!(
+                unscoped.is_allowed(&args).await,
+                "an action-only grant must continue authorizing {action:?}"
+            );
+            assert!(
+                !scoped_deny.is_allowed(&args).await,
+                "a deny for included key material must block the all-key {action:?} operation"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_kms_statement_without_resource_matches_every_key() -> Result<()> {
+        use crate::policy::action::{Action, KmsAction};
+
+        let policy = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["kms:*"]
+    }
+  ]
+}"#,
+        )?;
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+
+        for key_id in ["", "key-a", "any-other-key"] {
+            assert!(
+                policy
+                    .is_allowed(&kms_args(Action::KmsAction(KmsAction::DisableKeyAction), key_id, &conditions, &claims))
+                    .await,
+                "resource-less KMS statement must keep matching every key (key_id: {key_id:?})"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_kms_deny_with_wildcard_resource_overrides_allow() -> Result<()> {
+        use crate::policy::action::{Action, KmsAction};
+
+        let policy = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["kms:*"],
+      "Resource": ["arn:aws:kms:::key/key-a"]
+    },
+    {
+      "Effect": "Deny",
+      "Action": ["kms:DisableKey"],
+      "Resource": ["arn:aws:kms:::key/*"]
+    }
+  ]
+}"#,
+        )?;
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+
+        assert!(
+            !policy
+                .is_allowed(&kms_args(Action::KmsAction(KmsAction::DisableKeyAction), "key-a", &conditions, &claims))
+                .await,
+            "a wildcard Deny must override the narrower Allow"
+        );
+        assert!(
+            policy
+                .is_allowed(&kms_args(Action::KmsAction(KmsAction::RotateKeyAction), "key-a", &conditions, &claims))
+                .await,
+            "actions outside the Deny keep the Allow"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_kms_statement_with_not_resource_excludes_keys() -> Result<()> {
+        use crate::policy::action::{Action, KmsAction};
+
+        let policy = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["kms:DescribeKey"],
+      "NotResource": ["arn:aws:kms:::key/prod-*"]
+    }
+  ]
+}"#,
+        )?;
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let action = Action::KmsAction(KmsAction::DescribeKeyAction);
+
+        assert!(policy.is_allowed(&kms_args(action, "dev-key", &conditions, &claims)).await);
+        assert!(!policy.is_allowed(&kms_args(action, "prod-key", &conditions, &claims)).await);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_kms_statement_with_s3_resource_is_treated_as_unscoped() -> Result<()> {
+        use crate::policy::action::{Action, KmsAction};
+
+        // Statements combining KMS actions with S3 resources predate KMS resource
+        // support and were always evaluated as if unscoped. Pin that they still
+        // match every key (a warning is logged during evaluation).
+        let policy = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["kms:DisableKey"],
+      "Resource": ["arn:aws:s3:::somebucket/*"]
+    }
+  ]
+}"#,
+        )?;
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let action = Action::KmsAction(KmsAction::DisableKeyAction);
+
+        for key_id in ["", "key-a"] {
+            assert!(
+                policy.is_allowed(&kms_args(action, key_id, &conditions, &claims)).await,
+                "malformed KMS statement with S3 resources must keep matching every key (key_id: {key_id:?})"
+            );
+        }
+
+        Ok(())
+    }
+
+    const AWS_KEY_ID: &str = "74e5921e-107a-4584-bfda-a5dadeb3e13e";
+    const AWS_KEY_ARN: &str = "arn:aws:kms:eu-north-1:111122223333:key/74e5921e-107a-4584-bfda-a5dadeb3e13e";
+    const OTHER_AWS_KEY_ARN: &str = "arn:aws:kms:eu-north-1:111122223333:key/00000000-0000-4000-8000-000000000000";
+
+    /// A key-scoped statement has to hold however the request spells the key.
+    /// Matched literally, a `Deny` written on the key id let the same key
+    /// through when the request named it by its ARN — on the write and on the
+    /// read of an SSE-KMS object alike.
+    #[tokio::test]
+    async fn test_kms_key_statement_covers_the_aws_arn_spelling_of_the_key() -> Result<()> {
+        use crate::policy::action::{Action, KmsAction};
+
+        let deny = Policy::parse_config(
+            format!(
+                r#"{{
+  "Version": "2012-10-17",
+  "Statement": [
+    {{ "Effect": "Allow", "Action": ["kms:*"], "Resource": ["arn:aws:kms:::*"] }},
+    {{ "Effect": "Deny", "Action": ["kms:Decrypt", "kms:GenerateDataKey"], "Resource": ["arn:aws:kms:::key/{AWS_KEY_ID}"] }}
+  ]
+}}"#
+            )
+            .as_bytes(),
+        )?;
+        let allow = Policy::parse_config(
+            format!(
+                r#"{{
+  "Version": "2012-10-17",
+  "Statement": [
+    {{ "Effect": "Allow", "Action": ["kms:Decrypt"], "Resource": ["arn:aws:kms:::key/{AWS_KEY_ID}"] }}
+  ]
+}}"#
+            )
+            .as_bytes(),
+        )?;
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let decrypt = Action::KmsAction(KmsAction::DecryptAction);
+
+        for spelling in [AWS_KEY_ID, AWS_KEY_ARN] {
+            assert!(
+                !deny.is_allowed(&kms_args(decrypt, spelling, &conditions, &claims)).await,
+                "a Deny on the key id must cover the key named as {spelling}"
+            );
+            assert!(
+                allow.is_allowed(&kms_args(decrypt, spelling, &conditions, &claims)).await,
+                "an Allow on the key id must cover the key named as {spelling}"
+            );
+        }
+        assert!(
+            deny.is_allowed(&kms_args(decrypt, OTHER_AWS_KEY_ARN, &conditions, &claims))
+                .await,
+            "a Deny on one key must not spread to another key's ARN"
+        );
+        assert!(
+            !allow
+                .is_allowed(&kms_args(decrypt, OTHER_AWS_KEY_ARN, &conditions, &claims))
+                .await,
+            "an Allow on one key must not spread to another key's ARN"
+        );
+
+        // Shapes the AWS KMS API would not accept as a key are not reinterpreted.
+        for not_a_key_arn in [
+            format!("arn:aws:s3:::key/{AWS_KEY_ID}"),
+            format!("arn:aws:kms:eu-north-1:111122223333:key/nested/{AWS_KEY_ID}"),
+            format!("prefix-{AWS_KEY_ARN}"),
+        ] {
+            assert!(
+                !allow
+                    .is_allowed(&kms_args(decrypt, &not_a_key_arn, &conditions, &claims))
+                    .await,
+                "{not_a_key_arn} must not be taken for the key"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// An alias names a key only the backend can resolve, so it must not be a
+    /// way around a statement scoped to particular keys.
+    #[tokio::test]
+    async fn test_kms_alias_request_fails_closed_against_key_scoped_statements() -> Result<()> {
+        use crate::policy::action::{Action, KmsAction};
+
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let decrypt = Action::KmsAction(KmsAction::DecryptAction);
+        let aliases = ["alias/payroll", "arn:aws:kms:eu-north-1:111122223333:alias/payroll"];
+        let policy = |statements: &str| {
+            Policy::parse_config(format!(r#"{{ "Version": "2012-10-17", "Statement": [{statements}] }}"#).as_bytes())
+        };
+
+        let all_keys = policy(r#"{ "Effect": "Allow", "Action": ["kms:*"], "Resource": ["arn:aws:kms:::*"] }"#)?;
+        let unscoped = policy(r#"{ "Effect": "Allow", "Action": ["kms:*"] }"#)?;
+        let one_key = policy(&format!(
+            r#"{{ "Effect": "Allow", "Action": ["kms:*"], "Resource": ["arn:aws:kms:::key/{AWS_KEY_ID}"] }}"#
+        ))?;
+        let all_but_one = policy(&format!(
+            r#"{{ "Effect": "Allow", "Action": ["kms:*"], "NotResource": ["arn:aws:kms:::key/{AWS_KEY_ID}"] }}"#
+        ))?;
+        let all_with_key_deny = policy(&format!(
+            r#"{{ "Effect": "Allow", "Action": ["kms:*"], "Resource": ["arn:aws:kms:::*"] }},
+               {{ "Effect": "Deny", "Action": ["kms:Decrypt"], "Resource": ["arn:aws:kms:::key/{AWS_KEY_ID}"] }}"#
+        ))?;
+
+        for alias in aliases {
+            assert!(
+                all_keys.is_allowed(&kms_args(decrypt, alias, &conditions, &claims)).await,
+                "an Allow on every key covers whatever key {alias} names"
+            );
+            assert!(
+                unscoped.is_allowed(&kms_args(decrypt, alias, &conditions, &claims)).await,
+                "an unscoped Allow covers whatever key {alias} names"
+            );
+            assert!(
+                !one_key.is_allowed(&kms_args(decrypt, alias, &conditions, &claims)).await,
+                "an Allow on one key cannot be shown to cover {alias}"
+            );
+            assert!(
+                !all_but_one.is_allowed(&kms_args(decrypt, alias, &conditions, &claims)).await,
+                "an Allow excluding one key cannot be shown to exclude {alias}"
+            );
+            assert!(
+                !all_with_key_deny
+                    .is_allowed(&kms_args(decrypt, alias, &conditions, &claims))
+                    .await,
+                "a Deny on one key must apply to {alias}, which may name it"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_kms_alias_resource_parses_but_matches_no_key() -> Result<()> {
+        use crate::policy::action::{Action, KmsAction};
+
+        let policy = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["kms:DescribeKey"],
+      "Resource": ["arn:aws:kms:::alias/app-alias"]
+    }
+  ]
+}"#,
+        )?;
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let action = Action::KmsAction(KmsAction::DescribeKeyAction);
+
+        assert!(
+            !policy.is_allowed(&kms_args(action, "app-alias", &conditions, &claims)).await,
+            "alias patterns are parse-only until alias resolution lands and must not match key requests"
+        );
+        assert!(
+            policy.is_allowed(&kms_args(action, "", &conditions, &claims)).await,
+            "call sites without a key resource keep the legacy match-every-key behaviour"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_kms_resource_policy_round_trips() {
+        let policy = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["kms:GenerateDataKey", "kms:Decrypt"],
+      "Resource": ["arn:aws:kms:::key/app-*", "arn:aws:kms:::alias/app-alias"]
+    }
+  ]
+}"#,
+        )
+        .expect("KMS resource policy should parse");
+
+        let json = serde_json::to_string(&policy).expect("policy should serialize");
+        let round_trip = Policy::parse_config(json.as_bytes()).expect("serialized KMS resource policy should re-parse");
+        assert_eq!(round_trip.statements[0].resources, policy.statements[0].resources);
+        assert_eq!(round_trip.statements[0].actions, policy.statements[0].actions);
+
+        let value: serde_json::Value = serde_json::from_str(&json).expect("JSON valid");
+        let resources: Vec<_> = value["Statement"][0]["Resource"]
+            .as_array()
+            .expect("Resource should serialize as an array")
+            .iter()
+            .map(|resource| resource.as_str().expect("Resource entries should be strings"))
+            .collect();
+        assert_eq!(resources, vec!["arn:aws:kms:::key/app-*", "arn:aws:kms:::alias/app-alias"]);
+    }
+
+    #[test]
+    fn test_kms_resource_with_non_kms_action_is_invalid() {
+        for action in ["s3:GetObject", "admin:ServerInfo", "sts:AssumeRole"] {
+            let data = format!(
+                r#"{{
+  "Version": "2012-10-17",
+  "Statement": [
+    {{
+      "Effect": "Allow",
+      "Action": ["{action}"],
+      "Resource": ["arn:aws:kms:::key/key-a"]
+    }}
+  ]
+}}"#
+            );
+
+            let result = Policy::parse_config(data.as_bytes());
+            assert!(
+                matches!(result.as_ref().unwrap_err(), Error::PolicyError(IamError::KmsResourceWithNonKmsAction)),
+                "{action} with a KMS resource should fail with KmsResourceWithNonKmsAction, got: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bucket_policy_with_kms_statement_is_invalid() {
+        for statement in [
+            r#"{"Effect":"Allow","Principal":{"AWS":"*"},"Action":["kms:GenerateDataKey"],"Resource":["arn:aws:s3:::bucket/*"]}"#,
+            r#"{"Effect":"Allow","Principal":{"AWS":"*"},"Action":["s3:GetObject"],"Resource":["arn:aws:kms:::key/key-a"]}"#,
+            r#"{"Effect":"Allow","Principal":{"AWS":"*"},"NotAction":["kms:*"],"Resource":["arn:aws:s3:::bucket/*"]}"#,
+        ] {
+            let data = format!(r#"{{"Version":"2012-10-17","Statement":[{statement}]}}"#);
+            let policy: BucketPolicy =
+                serde_json::from_str(&data).expect("bucket policy with KMS content should still deserialize");
+            let result = policy.is_valid();
+            assert!(
+                matches!(result.as_ref().unwrap_err(), Error::PolicyError(IamError::KmsUnsupportedInBucketPolicy)),
+                "bucket policy statement {statement} should fail with KmsUnsupportedInBucketPolicy, got: {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stored_bucket_policy_with_kms_statement_loads_and_is_ignored() -> Result<()> {
+        // Policies stored before KMS statements were rejected at validation must keep
+        // deserializing, and their KMS statements must not affect bucket traffic.
+        let bucket_policy: BucketPolicy = serde_json::from_str(
+            r#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {"AWS": "*"},
+      "Action": ["kms:GenerateDataKey"],
+      "Resource": ["arn:aws:s3:::bucket/*"]
+    },
+    {
+      "Effect": "Allow",
+      "Principal": {"AWS": "*"},
+      "Action": ["s3:GetObject"],
+      "Resource": ["arn:aws:s3:::bucket/*"]
+    }
+  ]
+}"#,
+        )?;
+
+        let conditions = HashMap::new();
+        let args = BucketPolicyArgs {
+            account: "testuser",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::GetObjectAction),
+            bucket: "bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "a.txt",
+        };
+        assert!(
+            bucket_policy.is_allowed(&args).await,
+            "the S3 statement must keep working alongside an ignored KMS statement"
+        );
+
+        let put_args = BucketPolicyArgs {
+            account: "testuser",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::PutObjectAction),
+            bucket: "bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "a.txt",
+        };
+        assert!(
+            !bucket_policy.is_allowed(&put_args).await,
+            "the ignored KMS statement must not grant anything"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_mixed_action_families_are_invalid_even_with_resource() {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["admin:*", "sts:AssumeRole"],
+      "Resource": ["arn:aws:s3:::*"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(result.is_err(), "Mixed action families should be rejected");
+        assert!(
+            matches!(result.as_ref().unwrap_err(), Error::PolicyError(IamError::MixedActionFamilies)),
+            "Error should be MixedActionFamilies, got: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn test_mixed_action_families_are_invalid_even_without_resource() {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["admin:*", "s3:GetObject"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(result.is_err(), "Mixed action families should be rejected even when Resource is missing");
+        assert!(
+            matches!(result.as_ref().unwrap_err(), Error::PolicyError(IamError::MixedActionFamilies)),
+            "Error should be MixedActionFamilies, got: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn test_mixed_action_families_with_wildcard_variants_are_invalid() {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:*", "admin:*", "sts:AssumeRole"],
+      "Resource": ["arn:aws:s3:::*"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(result.is_err(), "Mixed action families with wildcard variants should be rejected");
+        assert!(
+            matches!(result.as_ref().unwrap_err(), Error::PolicyError(IamError::MixedActionFamilies)),
+            "Error should be MixedActionFamilies, got: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn test_notaction_without_resource_remains_invalid() {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "NotAction": ["s3:DeleteObject"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(result.is_err(), "NotAction statement without Resource should remain invalid");
+        assert!(
+            matches!(result.as_ref().unwrap_err(), Error::PolicyError(IamError::NonResource)),
+            "Error should be NonResource, got: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn test_iam_policy_serialize_omits_empty_fields() {
+        let policy = Policy::parse_config(
+            br#"{
+  "Version":"2012-10-17",
+  "Statement":[{
+    "Effect":"Allow",
+    "Action":["s3:GetObject","s3:PutObject"],
+    "Resource":["arn:aws:s3:::example-bucket/*"]
+  }]
+}"#,
+        )
+        .expect("policy without optional fields should parse");
+
+        let value = serde_json::to_value(&policy).expect("policy should serialize");
+        let policy_object = value.as_object().expect("policy should serialize as an object");
+        assert!(!policy_object.contains_key("ID"), "empty ID should be omitted");
+
+        let statements = value["Statement"].as_array().expect("Statement should serialize as an array");
+        let statement = statements
+            .first()
+            .expect("serialized policy should include the statement")
+            .as_object()
+            .expect("statement should serialize as an object");
+        assert!(!statement.contains_key("Sid"), "empty Sid should be omitted");
+        assert!(!statement.contains_key("Condition"), "empty Condition should be omitted");
+    }
+
+    #[test]
+    fn test_policy_action_and_resource_serialization_preserves_input_order() {
+        let policy = Policy::parse_config(
+            br#"{
+  "Version":"2012-10-17",
+  "Statement":[{
+    "Effect":"Allow",
+    "Action":["s3:PutObject","s3:DeleteObject","s3:ListBucket","s3:GetObject"],
+    "Resource":["arn:aws:s3:::example-bucket/*","arn:aws:s3:::example-bucket"]
+  }]
+}"#,
+        )
+        .expect("policy with multiple actions and resources should parse");
+
+        let first = serde_json::to_value(&policy).expect("policy should serialize");
+        let second = serde_json::to_value(&policy).expect("policy should serialize consistently");
+        assert_eq!(first, second, "policy serialization should be deterministic");
+
+        let statement = first["Statement"][0]
+            .as_object()
+            .expect("statement should serialize as an object");
+        let actions: Vec<_> = statement["Action"]
+            .as_array()
+            .expect("Action should serialize as an array")
+            .iter()
+            .map(|action| action.as_str().expect("Action entries should be strings"))
+            .collect();
+        assert_eq!(
+            actions,
+            vec!["s3:PutObject", "s3:DeleteObject", "s3:ListBucket", "s3:GetObject"],
+            "Action serialization should preserve input order"
+        );
+
+        let resources: Vec<_> = statement["Resource"]
+            .as_array()
+            .expect("Resource should serialize as an array")
+            .iter()
+            .map(|resource| resource.as_str().expect("Resource entries should be strings"))
+            .collect();
+        assert_eq!(
+            resources,
+            vec!["arn:aws:s3:::example-bucket/*", "arn:aws:s3:::example-bucket"],
+            "Resource serialization should preserve input order"
+        );
+    }
+
+    #[test]
+    fn test_iam_policy_serialize_preserves_non_empty_optional_fields() {
+        let policy = Policy::parse_config(
+            br#"{
+  "Version":"2012-10-17",
+  "Statement":[{
+    "Sid":"keep-me",
+    "Effect":"Allow",
+    "NotAction":["s3:DeleteObject","s3:PutObject"],
+    "NotResource":["arn:aws:s3:::example-bucket/private/*","arn:aws:s3:::example-bucket/tmp/*"],
+    "Condition":{"StringEquals":{"s3:prefix":"home/"}}
+  }]
+}"#,
+        )
+        .expect("policy with non-empty optional fields should parse");
+
+        let value = serde_json::to_value(&policy).expect("policy should serialize");
+        let statement = value["Statement"][0]
+            .as_object()
+            .expect("statement should serialize as an object");
+        assert_eq!(statement.get("Sid").and_then(|sid| sid.as_str()), Some("keep-me"));
+        assert!(statement.contains_key("Condition"), "non-empty Condition should be preserved");
+        assert!(!statement.contains_key("Action"), "empty Action should be omitted for NotAction policy");
+        assert!(
+            !statement.contains_key("Resource"),
+            "empty Resource should be omitted for NotResource policy"
+        );
+
+        let not_actions: Vec<_> = statement["NotAction"]
+            .as_array()
+            .expect("NotAction should serialize as an array")
+            .iter()
+            .map(|action| action.as_str().expect("NotAction entries should be strings"))
+            .collect();
+        assert_eq!(not_actions, vec!["s3:DeleteObject", "s3:PutObject"]);
+
+        let not_resources: Vec<_> = statement["NotResource"]
+            .as_array()
+            .expect("NotResource should serialize as an array")
+            .iter()
+            .map(|resource| resource.as_str().expect("NotResource entries should be strings"))
+            .collect();
+        assert_eq!(
+            not_resources,
+            vec!["arn:aws:s3:::example-bucket/private/*", "arn:aws:s3:::example-bucket/tmp/*"]
+        );
+    }
+
+    #[test]
+    fn test_iam_policy_serialize_keeps_empty_resource_omitted_for_action_families() {
+        let policy = Policy::parse_config(
+            br#"{
+  "Version":"2012-10-17",
+  "Statement":[
+    {"Effect":"Allow","Action":["sts:AssumeRole"]},
+    {"Effect":"Allow","Action":["admin:*"]},
+    {"Effect":"Allow","Action":["kms:*"]}
+  ]
+}"#,
+        )
+        .expect("STS/Admin/KMS statements without resources should parse");
+
+        let value = serde_json::to_value(&policy).expect("policy should serialize");
+        let statements = value["Statement"].as_array().expect("Statement should serialize as an array");
+        assert_eq!(statements.len(), 3);
+
+        for statement in statements {
+            let statement = statement.as_object().expect("statement should serialize as an object");
+            assert!(!statement.contains_key("Resource"), "empty Resource should be omitted");
+            assert!(!statement.contains_key("NotResource"), "empty NotResource should be omitted");
+        }
+    }
+
+    #[test]
     fn test_bucket_policy_serialize_omits_empty_fields() {
         use crate::policy::action::{Action, ActionSet, S3Action};
         use crate::policy::resource::{Resource, ResourceSet};
@@ -1190,17 +3150,17 @@ mod test {
         policy.statements[0]
             .actions
             .0
-            .insert(Action::S3Action(S3Action::ListBucketAction));
+            .push(Action::S3Action(S3Action::ListBucketAction));
         policy.statements[0]
             .resources
             .0
-            .insert(Resource::try_from("arn:aws:s3:::test/*").unwrap());
+            .push(Resource::try_from("arn:aws:s3:::test/*").expect("test resource should parse"));
 
         let json = serde_json::to_string(&policy).expect("Should serialize");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("Should parse");
 
         // Verify empty fields are omitted
-        assert!(!parsed.as_object().unwrap().contains_key("ID"), "Empty ID should be omitted");
+        assert!(parsed.get("Id").is_none(), "Empty ID should be omitted");
 
         let statement = &parsed["Statement"][0];
         assert!(!statement.as_object().unwrap().contains_key("Sid"), "Empty Sid should be omitted");
@@ -1221,6 +3181,98 @@ mod test {
         assert_eq!(parsed["Version"], "2012-10-17");
         assert_eq!(statement["Effect"], "Allow");
         assert_eq!(statement["Principal"]["AWS"], "*");
+    }
+
+    #[test]
+    fn test_bucket_policy_deserializes_legacy_id() {
+        let legacy_policy = br#"{"ID":"","Version":"2012-10-17","Statement":[{"Sid":"","Effect":"Allow","Principal":{"AWS":["*"]},"Action":["s3:GetObject"],"NotAction":[],"Resource":["arn:aws:s3:::bucket/*"],"NotResource":[],"Condition":{}}]}"#;
+
+        let policy: BucketPolicy =
+            serde_json::from_slice(legacy_policy).expect("bucket policy with legacy ID should deserialize");
+        assert!(policy.id.is_empty());
+        policy.is_valid().expect("legacy bucket policy should remain valid");
+
+        let policy: BucketPolicy = serde_json::from_str(r#"{"ID":"legacy-policy","Version":"2012-10-17","Statement":[]}"#)
+            .expect("non-empty legacy ID should deserialize");
+        assert_eq!(policy.id.0, "legacy-policy");
+
+        let serialized = serde_json::to_value(&policy).expect("bucket policy should serialize");
+        assert_eq!(serialized["Id"], "legacy-policy");
+        assert!(serialized.get("ID").is_none(), "legacy ID spelling should not be serialized");
+    }
+
+    #[test]
+    fn test_bucket_policy_legacy_id_alias_remains_strict() {
+        let unknown_field = r#"{"Version":"2012-10-17","Statement":[],"Unexpected":true}"#;
+        let error =
+            serde_json::from_str::<BucketPolicy>(unknown_field).expect_err("unrelated unknown fields should remain rejected");
+        assert!(
+            error.to_string().contains("unknown field `Unexpected`"),
+            "unexpected deserialization error: {error}"
+        );
+
+        let duplicate_id = r#"{"Id":"current-policy","ID":"legacy-policy","Version":"2012-10-17","Statement":[]}"#;
+        let error = serde_json::from_str::<BucketPolicy>(duplicate_id)
+            .expect_err("canonical and legacy ID fields should not be accepted together");
+        assert!(
+            error.to_string().contains("duplicate field `Id`"),
+            "unexpected deserialization error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_existing_object_tag_condition_helpers() {
+        let identity_policy = Policy::parse_config(
+            br#"{
+  "Version":"2012-10-17",
+  "Statement":[{
+    "Effect":"Allow",
+    "Action":["s3:GetObject"],
+    "Resource":["arn:aws:s3:::bucket/*"],
+    "Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}
+  }]
+}"#,
+        )
+        .expect("identity policy with ExistingObjectTag key should parse");
+        assert!(
+            policy_uses_existing_object_tag_conditions(&identity_policy),
+            "identity policy ExistingObjectTag key should be detected"
+        );
+
+        let identity_value_only = Policy::parse_config(
+            br#"{
+  "Version":"2012-10-17",
+  "Statement":[{
+    "Effect":"Allow",
+    "Action":["s3:GetObject"],
+    "Resource":["arn:aws:s3:::bucket/*"],
+    "Condition":{"StringEquals":{"s3:prefix":"ExistingObjectTag/security"}}
+  }]
+}"#,
+        )
+        .expect("identity policy with value-only marker should parse");
+        assert!(
+            !policy_uses_existing_object_tag_conditions(&identity_value_only),
+            "value-only marker must not be treated as ExistingObjectTag condition key"
+        );
+
+        let bucket_policy: BucketPolicy = serde_json::from_str(
+            r#"{
+  "Version":"2012-10-17",
+  "Statement":[{
+    "Effect":"Allow",
+    "Principal":"*",
+    "Action":["s3:GetObject"],
+    "Resource":["arn:aws:s3:::bucket/*"],
+    "Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}
+  }]
+}"#,
+        )
+        .expect("bucket policy with ExistingObjectTag key should parse");
+        assert!(
+            bucket_policy_uses_existing_object_tag_conditions(&bucket_policy),
+            "bucket policy ExistingObjectTag key should be detected"
+        );
     }
 
     #[test]
@@ -1248,11 +3300,11 @@ mod test {
         policy.statements[0]
             .actions
             .0
-            .insert(Action::S3Action(S3Action::ListBucketAction));
+            .push(Action::S3Action(S3Action::ListBucketAction));
         policy.statements[0]
             .resources
             .0
-            .insert(Resource::try_from("arn:aws:s3:::test/*").unwrap());
+            .push(Resource::try_from("arn:aws:s3:::test/*").expect("test resource should parse"));
 
         let json = serde_json::to_string(&policy).expect("Should serialize");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("Should parse");
@@ -1263,6 +3315,52 @@ mod test {
         let arr = action.as_array().expect("Should be array");
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0].as_str().unwrap(), "s3:ListBucket");
+    }
+
+    #[tokio::test]
+    async fn test_bucket_policy_list_bucket_prefix_condition_uses_bucket_resource() -> Result<()> {
+        let bucket_policy: BucketPolicy = serde_json::from_str(
+            r#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {"AWS": "*"},
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::polaris-test-bucket"],
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "polaris_test/snowflake_catalog/db1/schema/iceberg_table/*"
+          ]
+        }
+      }
+    }
+  ]
+}"#,
+        )?;
+
+        let mut conditions = HashMap::new();
+        conditions.insert(
+            "prefix".to_string(),
+            vec!["polaris_test/snowflake_catalog/db1/schema/iceberg_table/metadata/".to_string()],
+        );
+        let args = BucketPolicyArgs {
+            account: "polaris-session",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::ListBucketAction),
+            bucket: "polaris-test-bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "polaris_test/snowflake_catalog/db1/schema/iceberg_table/metadata/",
+        };
+
+        assert!(
+            bucket_policy.is_allowed(&args).await,
+            "Bucket policy ListBucket should match the bucket resource and apply the prefix through the condition"
+        );
+
+        Ok(())
     }
 
     #[tokio::test]
@@ -1350,5 +3448,686 @@ mod test {
         assert!(!bp.is_allowed(&args_no_enc).await, "Should deny PutObject with no encryption header");
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_policy_needs_existing_object_tag_narrows_by_action() {
+        use crate::policy::Args;
+        use crate::policy::action::{Action, S3Action};
+        use std::collections::HashMap;
+
+        let split_policy = Policy::parse_config(
+            br#"{
+  "Version":"2012-10-17",
+  "Statement":[
+    {
+      "Effect":"Allow",
+      "Action":["s3:DeleteObject"],
+      "Resource":["arn:aws:s3:::bucket/*"]
+    },
+    {
+      "Effect":"Allow",
+      "Action":["s3:DeleteObjectVersion"],
+      "Resource":["arn:aws:s3:::bucket/*"],
+      "Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}
+    }
+  ]
+}"#,
+        )
+        .expect("split-action policy should parse");
+
+        let groups: Option<Vec<String>> = None;
+        let cond = HashMap::new();
+        let claims = HashMap::new();
+
+        let args_get = Args {
+            account: "user",
+            groups: &groups,
+            action: Action::S3Action(S3Action::GetObjectAction),
+            bucket: "bucket",
+            conditions: &cond,
+            is_owner: false,
+            object: "k",
+            claims: &claims,
+            deny_only: false,
+        };
+        assert!(
+            !policy_needs_existing_object_tag_for_args(&split_policy, &args_get).await,
+            "GetObject should not match statements with DeleteObject/DeleteObjectVersion"
+        );
+
+        let args_del = Args {
+            account: "user",
+            groups: &groups,
+            action: Action::S3Action(S3Action::DeleteObjectAction),
+            bucket: "bucket",
+            conditions: &cond,
+            is_owner: false,
+            object: "k",
+            claims: &claims,
+            deny_only: false,
+        };
+        assert!(
+            !policy_needs_existing_object_tag_for_args(&split_policy, &args_del).await,
+            "DeleteObject matches only the statement without ExistingObjectTag"
+        );
+
+        let args_delv = Args {
+            account: "user",
+            groups: &groups,
+            action: Action::S3Action(S3Action::DeleteObjectVersionAction),
+            bucket: "bucket",
+            conditions: &cond,
+            is_owner: false,
+            object: "k",
+            claims: &claims,
+            deny_only: false,
+        };
+        assert!(
+            policy_needs_existing_object_tag_for_args(&split_policy, &args_delv).await,
+            "DeleteObjectVersion matches the statement with ExistingObjectTag"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_policy_needs_existing_object_tag_narrows_by_resource() {
+        use crate::policy::Args;
+        use crate::policy::action::{Action, S3Action};
+        use std::collections::HashMap;
+
+        let policy = Policy::parse_config(
+            br#"{
+  "Version":"2012-10-17",
+  "Statement":[
+    {
+      "Effect":"Allow",
+      "Action":["s3:GetObject"],
+      "Resource":["arn:aws:s3:::bucket/private/*"],
+      "Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}
+    }
+  ]
+}"#,
+        )
+        .expect("policy should parse");
+
+        let groups: Option<Vec<String>> = None;
+        let cond = HashMap::new();
+        let claims = HashMap::new();
+
+        let args_public = Args {
+            account: "user",
+            groups: &groups,
+            action: Action::S3Action(S3Action::GetObjectAction),
+            bucket: "bucket",
+            conditions: &cond,
+            is_owner: false,
+            object: "public/a.txt",
+            claims: &claims,
+            deny_only: false,
+        };
+        assert!(
+            !policy_needs_existing_object_tag_for_args(&policy, &args_public).await,
+            "resource mismatch should skip ExistingObjectTag fetch hint"
+        );
+
+        let args_private = Args {
+            account: "user",
+            groups: &groups,
+            action: Action::S3Action(S3Action::GetObjectAction),
+            bucket: "bucket",
+            conditions: &cond,
+            is_owner: false,
+            object: "private/a.txt",
+            claims: &claims,
+            deny_only: false,
+        };
+        assert!(
+            policy_needs_existing_object_tag_for_args(&policy, &args_private).await,
+            "resource match should keep ExistingObjectTag fetch hint"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bucket_policy_needs_existing_object_tag_narrows_by_principal() {
+        use crate::policy::BucketPolicyArgs;
+        use crate::policy::action::{Action, S3Action};
+        use std::collections::HashMap;
+
+        let bucket_policy: BucketPolicy = serde_json::from_str(
+            r#"{
+  "Version":"2012-10-17",
+  "Statement":[
+    {
+      "Effect":"Allow",
+      "Principal":{"AWS":["alice"]},
+      "Action":["s3:GetObject"],
+      "Resource":["arn:aws:s3:::bucket/private/*"],
+      "Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}
+    }
+  ]
+}"#,
+        )
+        .expect("bucket policy should parse");
+
+        let groups: Option<Vec<String>> = None;
+        let cond = HashMap::new();
+
+        let args_bob = BucketPolicyArgs {
+            bucket: "bucket",
+            action: Action::S3Action(S3Action::GetObjectAction),
+            is_owner: false,
+            account: "bob",
+            groups: &groups,
+            conditions: &cond,
+            object: "private/a.txt",
+        };
+        assert!(
+            !bucket_policy_needs_existing_object_tag_for_args(&bucket_policy, &args_bob).await,
+            "principal mismatch should skip ExistingObjectTag fetch hint"
+        );
+
+        let args_alice_public = BucketPolicyArgs {
+            bucket: "bucket",
+            action: Action::S3Action(S3Action::GetObjectAction),
+            is_owner: false,
+            account: "alice",
+            groups: &groups,
+            conditions: &cond,
+            object: "public/a.txt",
+        };
+        assert!(
+            !bucket_policy_needs_existing_object_tag_for_args(&bucket_policy, &args_alice_public).await,
+            "resource mismatch should skip ExistingObjectTag fetch hint"
+        );
+
+        let args_alice_private = BucketPolicyArgs {
+            bucket: "bucket",
+            action: Action::S3Action(S3Action::GetObjectAction),
+            is_owner: false,
+            account: "alice",
+            groups: &groups,
+            conditions: &cond,
+            object: "private/a.txt",
+        };
+        assert!(
+            bucket_policy_needs_existing_object_tag_for_args(&bucket_policy, &args_alice_private).await,
+            "principal and resource match should keep ExistingObjectTag fetch hint"
+        );
+    }
+
+    #[test]
+    fn test_get_values_from_claims_case_insensitive() {
+        let mut claims = HashMap::new();
+        claims.insert("policyminio".to_string(), Value::Array(vec![Value::String("consoleAdmin".to_string())]));
+
+        let (policies, found) = get_values_from_claims(&claims, "policyMinio");
+        assert!(found);
+        assert!(policies.contains("consoleAdmin"));
+
+        let (policies, found) = get_values_from_claims(&claims, "POLICYMINIO");
+        assert!(found);
+        assert!(policies.contains("consoleAdmin"));
+
+        let (policies, found) = get_values_from_claims(&claims, "policyminio");
+        assert!(found);
+        assert!(policies.contains("consoleAdmin"));
+    }
+
+    #[test]
+    fn test_get_values_from_claims_exact_match_preferred() {
+        let mut claims = HashMap::new();
+        claims.insert("Policy".to_string(), Value::Array(vec![Value::String("exact_match".to_string())]));
+        claims.insert("policy".to_string(), Value::Array(vec![Value::String("lowercase".to_string())]));
+
+        let (policies, _) = get_values_from_claims(&claims, "Policy");
+        assert!(policies.contains("exact_match"));
+        assert!(!policies.contains("lowercase"));
+    }
+
+    #[test]
+    fn test_get_policies_from_claims_case_insensitive_string() {
+        let mut claims = HashMap::new();
+        claims.insert("policyminio".to_string(), Value::String("consoleAdmin,readwrite".to_string()));
+
+        let (policies, found) = get_policies_from_claims(&claims, "policyMinio");
+        assert!(found);
+        assert!(policies.contains("consoleAdmin"));
+        assert!(policies.contains("readwrite"));
+    }
+
+    #[test]
+    fn test_get_values_from_claims_ambiguous_case_insensitive_match_returns_missing() {
+        let mut claims = HashMap::new();
+        claims.insert("Policy".to_string(), Value::Array(vec![Value::String("exact_match".to_string())]));
+        claims.insert("policy".to_string(), Value::Array(vec![Value::String("lowercase".to_string())]));
+
+        let (policies, found) = get_values_from_claims(&claims, "POLICY");
+        assert!(!found);
+        assert!(policies.is_empty());
+    }
+
+    #[test]
+    fn test_get_policies_from_claims_ambiguous_case_insensitive_match_returns_missing() {
+        let mut claims = HashMap::new();
+        claims.insert("Policy".to_string(), Value::String("consoleAdmin".to_string()));
+        claims.insert("policy".to_string(), Value::String("readwrite".to_string()));
+
+        let (policies, found) = get_policies_from_claims(&claims, "POLICY");
+        assert!(!found);
+        assert!(policies.is_empty());
+    }
+
+    #[test]
+    fn test_policy_round_trips_through_json_value() {
+        let policy = Policy::parse_config(
+            br#"{
+  "Version":"2012-10-17",
+  "Statement":[
+    {
+      "Effect":"Allow",
+      "Action":["s3:GetObject"],
+      "Resource":["arn:aws:s3:::bucket/*"]
+    }
+  ]
+}"#,
+        )
+        .expect("policy should parse");
+
+        let value = serde_json::to_value(&policy).expect("policy should serialize");
+        let round_trip: Policy = serde_json::from_value(value).expect("policy should deserialize from serde_json::Value");
+
+        assert_eq!(round_trip.version, policy.version);
+        assert_eq!(round_trip.statements.len(), policy.statements.len());
+        assert_eq!(round_trip.statements[0].effect, policy.statements[0].effect);
+    }
+
+    #[tokio::test]
+    async fn global_wildcard_deny_covers_all_families_without_broadening_allow() {
+        for action in [
+            "s3:GetObject",
+            "s3:ForceDeleteObject",
+            "admin:CreateUser",
+            "sts:AssumeRole",
+            "kms:Configure",
+            "kms:Decrypt",
+        ] {
+            let parsed_action = Action::try_from(action).expect("action parses");
+            let conditions = HashMap::new();
+            let claims = HashMap::new();
+            let args = Args {
+                account: "user",
+                groups: &None,
+                action: parsed_action,
+                bucket: if action.starts_with("s3:") { "bucket" } else { "" },
+                object: if action.starts_with("s3:") { "object" } else { "" },
+                conditions: &conditions,
+                claims: &claims,
+                is_owner: false,
+                deny_only: false,
+            };
+            for (effect, selector, wildcard, expected) in [
+                ("Deny", "Action", "*", false),
+                ("Deny", "Action", "s3:*", !action.starts_with("s3:")),
+                ("Deny", "NotAction", "*", true),
+            ] {
+                let document = serde_json::json!({
+                    "Version": "2012-10-17", "Statement": [
+                        {"Effect": "Allow", "Action": action, "Resource": "*"},
+                        {"Effect": effect, selector: wildcard, "Resource": "*"}
+                    ]
+                });
+                let policy = Policy::parse_config(&serde_json::to_vec(&document).expect("serialize policy"))
+                    .expect("parse wildcard policy");
+                assert_eq!(policy.is_allowed(&args).await, expected, "{effect} {selector} {wildcard} for {action}");
+                let serialized = serde_json::to_value(&policy).expect("serialize policy");
+                assert_eq!(serialized["Statement"][1][selector][0], wildcard);
+            }
+            for selector in ["Action", "NotAction"] {
+                let document = serde_json::json!({
+                    "Version": "2012-10-17", "Statement": [{"Effect": "Allow", selector: "*", "Resource": "*"}]
+                });
+                let policy = Policy::parse_config(&serde_json::to_vec(&document).expect("serialize policy"))
+                    .expect("parse wildcard Allow");
+                assert_eq!(policy.is_allowed(&args).await, selector == "Action" && action == "s3:GetObject");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn global_wildcard_deny_still_obeys_resource_and_condition_scope() {
+        let document = serde_json::json!({
+            "Version": "2012-10-17", "Statement": [
+                {"Effect": "Allow", "Action": "admin:CreateUser", "Resource": "*"},
+                {"Effect": "Deny", "Action": "*", "Resource": "arn:aws:s3:::bucket/*"}
+            ]
+        });
+        let policy = Policy::parse_config(&serde_json::to_vec(&document).expect("serialize policy")).expect("parse scoped Deny");
+        let claims = HashMap::new();
+        let conditions = HashMap::new();
+        let mut args = Args {
+            account: "user",
+            groups: &None,
+            action: Action::try_from("admin:CreateUser").expect("admin action"),
+            bucket: "",
+            object: "",
+            conditions: &conditions,
+            claims: &claims,
+            is_owner: false,
+            deny_only: false,
+        };
+        assert!(policy.is_allowed(&args).await, "bucket-scoped Deny must not become a global admin Deny");
+        let mut document = document;
+        document["Statement"][1]["Resource"] = serde_json::json!("*");
+        document["Statement"][1]["Condition"] = serde_json::json!({"StringEquals": {"aws:username": "blocked"}});
+        let conditional =
+            Policy::parse_config(&serde_json::to_vec(&document).expect("serialize policy")).expect("parse conditional Deny");
+        assert!(conditional.is_allowed(&args).await);
+        let conditions = HashMap::from([("username".to_string(), vec!["blocked".to_string()])]);
+        args.conditions = &conditions;
+        assert!(!conditional.is_allowed(&args).await);
+    }
+
+    #[tokio::test]
+    async fn security_conditions_enforce_identity_and_bucket_denies() {
+        for (operator, key, policy_value, request_value, denied) in [
+            ("NumericNotEquals", "s3:object-lock-remaining-retention-days", "30", None, true),
+            ("NumericNotEquals", "s3:object-lock-remaining-retention-days", "30", Some("30"), false),
+            ("NumericNotEquals", "s3:object-lock-remaining-retention-days", "30", Some("10"), true),
+            ("DateNotEquals", "s3:object-lock-retain-until-date", "2030-01-01T00:00:00Z", None, true),
+            (
+                "DateNotEquals",
+                "s3:object-lock-retain-until-date",
+                "2030-01-01T00:00:00Z",
+                Some("2030-01-01T00:00:00Z"),
+                false,
+            ),
+            ("DateGreaterThan", "aws:EpochTime", "2020-01-01T00:00:00Z", Some("1577836801"), true),
+            ("DateGreaterThan", "aws:EpochTime", "2020-01-01T00:00:00Z", Some("1577836799"), false),
+            (
+                "NotIpAddress",
+                "aws:SourceIp",
+                "2001:db8:85a3::8a2e:370:7334",
+                Some("2001:db8:ffff::1"),
+                true,
+            ),
+            (
+                "NotIpAddress",
+                "aws:SourceIp",
+                "2001:db8:85a3::8a2e:370:7334",
+                Some("2001:db8:85a3::8a2e:370:7334"),
+                false,
+            ),
+            (
+                "IpAddress",
+                "aws:SourceIp",
+                "2001:db8:85a3::8a2e:370:7334",
+                Some("2001:db8:ffff::1"),
+                false,
+            ),
+            ("IpAddress", "aws:SourceIp", "2001:db8::/32", Some("2001:db8:ffff::1"), true),
+        ] {
+            let mut document = serde_json::json!({
+                "Version": "2012-10-17", "Statement": [
+                    {"Effect": "Allow", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::bucket/*"},
+                    {"Effect": "Deny", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::bucket/*",
+                     "Condition": {operator: {key: policy_value}}}
+                ]
+            });
+            let policy =
+                Policy::parse_config(&serde_json::to_vec(&document).expect("serialize policy")).expect("parse identity policy");
+            let conditions = request_value
+                .map(|value| {
+                    HashMap::from([(key.split_once(':').expect("condition prefix").1.to_string(), vec![value.to_string()])])
+                })
+                .unwrap_or_default();
+            let claims = HashMap::new();
+            let args = Args {
+                account: "user",
+                groups: &None,
+                action: Action::S3Action(S3Action::PutObjectAction),
+                bucket: "bucket",
+                object: "object",
+                conditions: &conditions,
+                claims: &claims,
+                is_owner: false,
+                deny_only: false,
+            };
+            assert_eq!(policy.is_allowed(&args).await, !denied, "identity {operator} {key} {request_value:?}");
+            for statement in document["Statement"].as_array_mut().expect("statements array") {
+                statement["Principal"] = serde_json::json!("*");
+            }
+            let policy: BucketPolicy = serde_json::from_slice(&serde_json::to_vec(&document).expect("serialize bucket policy"))
+                .expect("parse bucket policy");
+            assert_eq!(
+                policy
+                    .is_allowed(&BucketPolicyArgs {
+                        account: "user",
+                        groups: &None,
+                        action: args.action,
+                        bucket: "bucket",
+                        object: "object",
+                        conditions: &conditions,
+                        is_owner: false,
+                    })
+                    .await,
+                !denied,
+                "bucket {operator} {key} {request_value:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn service_principal_never_grants_access_to_a_named_access_key() {
+        for principal in [
+            serde_json::json!({"Service": "logging.s3.amazonaws.com"}),
+            serde_json::json!({"Service": "*"}),
+            serde_json::json!({"Service": "logging.s3.amazonaws.com", "AWS": "authorized-user"}),
+        ] {
+            let document = serde_json::json!({
+                "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": principal,
+                "Action": ["s3:GetObject", "s3:PutObject"], "Resource": "arn:aws:s3:::bucket/*"}]
+            });
+            let policy: BucketPolicy = serde_json::from_slice(&serde_json::to_vec(&document).unwrap()).unwrap();
+            for action in [S3Action::GetObjectAction, S3Action::PutObjectAction] {
+                for account in ["logging.s3.amazonaws.com", "authorized-user"] {
+                    let allowed = policy
+                        .is_allowed(&BucketPolicyArgs {
+                            account,
+                            groups: &None,
+                            action: Action::S3Action(action),
+                            bucket: "bucket",
+                            object: "log",
+                            conditions: &HashMap::new(),
+                            is_owner: false,
+                        })
+                        .await;
+                    assert_eq!(allowed, account == "authorized-user" && principal.get("AWS").is_some());
+                }
+            }
+            assert_eq!(serde_json::to_value(&policy).unwrap()["Statement"][0]["Principal"], principal);
+        }
+    }
+
+    #[tokio::test]
+    async fn directory_objects_obey_prefix_denies_in_identity_and_bucket_policies() {
+        let mut document = serde_json::json!({
+            "Version": "2012-10-17", "Statement": [
+                {"Effect": "Allow", "Action": "s3:*", "Resource": "arn:aws:s3:::bucket/*"},
+                {"Effect": "Deny", "Action": "s3:*", "Resource": "arn:aws:s3:::bucket/private/*"}
+            ]
+        });
+        let identity = Policy::parse_config(&serde_json::to_vec(&document).unwrap()).unwrap();
+        for statement in document["Statement"].as_array_mut().unwrap() {
+            statement["Principal"] = serde_json::json!("*");
+        }
+        let bucket: BucketPolicy = serde_json::from_slice(&serde_json::to_vec(&document).unwrap()).unwrap();
+        for action in [
+            S3Action::GetObjectAction,
+            S3Action::PutObjectAction,
+            S3Action::DeleteObjectAction,
+            S3Action::DeleteObjectVersionAction,
+        ] {
+            for (object, allowed) in [
+                ("private/", false),
+                ("private/child", false),
+                ("public/", true),
+                ("private", true),
+            ] {
+                let conditions = HashMap::new();
+                assert_eq!(
+                    identity
+                        .is_allowed(&Args {
+                            account: "user",
+                            groups: &None,
+                            action: Action::S3Action(action),
+                            bucket: "bucket",
+                            object,
+                            conditions: &conditions,
+                            claims: &HashMap::new(),
+                            is_owner: false,
+                            deny_only: false,
+                        })
+                        .await,
+                    allowed,
+                    "identity {action:?} {object}"
+                );
+                for account in ["user", ""] {
+                    assert_eq!(
+                        bucket
+                            .is_allowed(&BucketPolicyArgs {
+                                account,
+                                groups: &None,
+                                action: Action::S3Action(action),
+                                bucket: "bucket",
+                                object,
+                                conditions: &conditions,
+                                is_owner: false,
+                            })
+                            .await,
+                        allowed,
+                        "bucket {account} {action:?} {object}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn force_delete_actions_require_an_explicit_grant() {
+        let wildcard = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:*"],"Resource":["arn:aws:s3:::*"]}]}"#,
+        )
+        .expect("wildcard policy parses");
+        let explicit = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:ForceDeleteObject","s3:ForceDeleteBucket","s3:DeleteObject"],"Resource":["arn:aws:s3:::*"]}]}"#,
+        )
+        .expect("explicit policy parses");
+        let denied = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[
+                {"Effect":"Allow","Action":["s3:ForceDeleteObject"],"Resource":["arn:aws:s3:::*"]},
+                {"Effect":"Deny","Action":["s3:ForceDeleteObject"],"Resource":["arn:aws:s3:::*"]}
+            ]}"#,
+        )
+        .expect("deny policy parses");
+
+        let wildcard_deny = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[
+                {"Effect":"Allow","Action":["s3:ForceDeleteObject","s3:DeleteObject"],"Resource":["arn:aws:s3:::*"]},
+                {"Effect":"Deny","Action":["s3:*"],"Resource":["arn:aws:s3:::*"]}
+            ]}"#,
+        )
+        .expect("wildcard deny policy parses");
+
+        assert!(allows(&wildcard, "s3:DeleteObject").await);
+        assert!(!allows(&wildcard, "s3:ForceDeleteObject").await);
+        assert!(!allows(&wildcard, "s3:ForceDeleteBucket").await);
+        assert!(allows(&explicit, "s3:ForceDeleteObject").await);
+        assert!(allows(&explicit, "s3:ForceDeleteBucket").await);
+        assert!(!allows(&denied, "s3:ForceDeleteObject").await);
+        assert!(!allows(&wildcard_deny, "s3:ForceDeleteObject").await);
+        assert!(!allows(&wildcard_deny, "s3:DeleteObject").await);
+    }
+
+    #[tokio::test]
+    async fn not_action_allow_does_not_grant_force_delete() {
+        for not_action in ["s3:*", "s3:GetObject"] {
+            let iam = Policy::parse_config(
+                format!(
+                    r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","NotAction":["{not_action}"],"Resource":["arn:aws:s3:::*"]}}]}}"#
+                )
+                .as_bytes(),
+            )
+            .expect("NotAction policy parses");
+            let bucket: BucketPolicy = serde_json::from_str(&format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":["*"]}},"NotAction":["{not_action}"],"Resource":["arn:aws:s3:::bucket","arn:aws:s3:::bucket/*"]}}]}}"#
+            ))
+            .expect("NotAction bucket policy parses");
+
+            for action in ["s3:ForceDeleteObject", "s3:ForceDeleteBucket"] {
+                assert!(!allows(&iam, action).await, "IAM NotAction {not_action} must not grant {action}");
+                assert!(
+                    !bucket_allows(&bucket, action).await,
+                    "bucket NotAction {not_action} must not grant {action}"
+                );
+            }
+        }
+
+        // NotAction still grants ordinary actions it does not exclude.
+        let iam = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","NotAction":["s3:GetObject"],"Resource":["arn:aws:s3:::*"]}]}"#,
+        )
+        .expect("NotAction policy parses");
+        assert!(allows(&iam, "s3:DeleteObject").await);
+
+        // Deny + NotAction keeps plain wildcard semantics: s3:* excludes
+        // force-delete, a narrower exclusion still denies it.
+        let deny_all_but = |not_action: &str| {
+            Policy::parse_config(
+                format!(
+                    r#"{{"Version":"2012-10-17","Statement":[
+                        {{"Effect":"Allow","Action":["s3:ForceDeleteObject"],"Resource":["arn:aws:s3:::*"]}},
+                        {{"Effect":"Deny","NotAction":["{not_action}"],"Resource":["arn:aws:s3:::*"]}}
+                    ]}}"#
+                )
+                .as_bytes(),
+            )
+            .expect("deny NotAction policy parses")
+        };
+        assert!(allows(&deny_all_but("s3:*"), "s3:ForceDeleteObject").await);
+        assert!(!allows(&deny_all_but("s3:GetObject"), "s3:ForceDeleteObject").await);
+    }
+
+    async fn bucket_allows(policy: &BucketPolicy, action: &str) -> bool {
+        let conditions = HashMap::new();
+        policy
+            .is_allowed(&BucketPolicyArgs {
+                account: "user",
+                groups: &None,
+                action: Action::try_from(action).expect("action parses"),
+                bucket: "bucket",
+                conditions: &conditions,
+                is_owner: false,
+                object: "folder/a",
+            })
+            .await
+    }
+
+    async fn allows(policy: &Policy, action: &str) -> bool {
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let groups = None;
+        policy
+            .is_allowed(&Args {
+                account: "user",
+                groups: &groups,
+                action: Action::try_from(action).expect("action parses"),
+                bucket: "bucket",
+                conditions: &conditions,
+                is_owner: false,
+                object: "folder/a",
+                claims: &claims,
+                deny_only: false,
+            })
+            .await
     }
 }

@@ -12,204 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::Error;
-use crate::global::get_global_bucket_monitor;
-use rustfs_filemeta::{ReplicatedTargetInfo, ReplicationStatusType, ReplicationType};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::Arc;
+use super::replication_error_boundary::Error;
+use super::replication_filemeta_boundary::{ReplicatedTargetInfo, ReplicationStatusType, ReplicationType};
+use super::replication_resync_boundary::ResyncStatusType;
+#[cfg(test)]
+use super::replication_stats_boundary::FailStats;
+use super::replication_stats_boundary::{
+    ActiveWorkerStat, BucketReplicationStat, BucketReplicationStats, BucketStats, InQueueMetric, ProxyMetric, ProxyStatsCache,
+    QueueCache, ReplicationMetricScope, SRMetricsSummary, XferStats,
+};
+use super::runtime_boundary as runtime_sources;
+use std::collections::{HashMap, hash_map::Entry};
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex, Weak};
 use std::time::{Duration, SystemTime};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::interval;
-
-/// Exponential Moving Average with thread-safe interior mutability
-#[derive(Debug)]
-pub struct ExponentialMovingAverage {
-    pub alpha: f64,
-    pub value: AtomicU64, // Store f64 as u64 bits
-    pub last_update: Arc<Mutex<SystemTime>>,
-}
-
-impl ExponentialMovingAverage {
-    pub fn new() -> Self {
-        let now = SystemTime::now();
-        Self {
-            alpha: 0.1, // smoothing factor
-            value: AtomicU64::new(0_f64.to_bits()),
-            last_update: Arc::new(Mutex::new(now)),
-        }
-    }
-
-    pub fn add_value(&self, value: f64, timestamp: SystemTime) {
-        let current_value = f64::from_bits(self.value.load(AtomicOrdering::Relaxed));
-        let new_value = if current_value == 0.0 {
-            value
-        } else {
-            self.alpha * value + (1.0 - self.alpha) * current_value
-        };
-        self.value.store(new_value.to_bits(), AtomicOrdering::Relaxed);
-
-        // Update timestamp (this is async, but we'll use try_lock to avoid blocking)
-        if let Ok(mut last_update) = self.last_update.try_lock() {
-            *last_update = timestamp;
-        }
-    }
-
-    pub fn get_current_average(&self) -> f64 {
-        f64::from_bits(self.value.load(AtomicOrdering::Relaxed))
-    }
-
-    pub fn update_exponential_moving_average(&self, now: SystemTime) {
-        if let Ok(mut last_update_guard) = self.last_update.try_lock() {
-            let last_update = *last_update_guard;
-            if let Ok(duration) = now.duration_since(last_update)
-                && duration.as_secs() > 0
-            {
-                let decay = (-duration.as_secs_f64() / 60.0).exp(); // 1 minute decay
-                let current_value = f64::from_bits(self.value.load(AtomicOrdering::Relaxed));
-                self.value.store((current_value * decay).to_bits(), AtomicOrdering::Relaxed);
-                *last_update_guard = now;
-            }
-        }
-    }
-
-    pub fn merge(&self, other: &ExponentialMovingAverage) -> Self {
-        let now = SystemTime::now();
-        let self_value = f64::from_bits(self.value.load(AtomicOrdering::Relaxed));
-        let other_value = f64::from_bits(other.value.load(AtomicOrdering::Relaxed));
-        let merged_value = (self_value + other_value) / 2.0;
-
-        // Get timestamps (use current time as fallback)
-        let self_time = self.last_update.try_lock().map(|t| *t).unwrap_or(now);
-        let other_time = other.last_update.try_lock().map(|t| *t).unwrap_or(now);
-        let merged_time = self_time.max(other_time);
-
-        Self {
-            alpha: self.alpha,
-            value: AtomicU64::new(merged_value.to_bits()),
-            last_update: Arc::new(Mutex::new(merged_time)),
-        }
-    }
-}
-
-impl Clone for ExponentialMovingAverage {
-    fn clone(&self) -> Self {
-        let now = SystemTime::now();
-        let value = self.value.load(AtomicOrdering::Relaxed);
-        let last_update = self.last_update.try_lock().map(|t| *t).unwrap_or(now);
-
-        Self {
-            alpha: self.alpha,
-            value: AtomicU64::new(value),
-            last_update: Arc::new(Mutex::new(last_update)),
-        }
-    }
-}
-
-impl Default for ExponentialMovingAverage {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Serialize for ExponentialMovingAverage {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("ExponentialMovingAverage", 3)?;
-        state.serialize_field("alpha", &self.alpha)?;
-        state.serialize_field("value", &f64::from_bits(self.value.load(AtomicOrdering::Relaxed)))?;
-        let last_update = self.last_update.try_lock().map(|t| *t).unwrap_or(SystemTime::UNIX_EPOCH);
-        state.serialize_field("last_update", &last_update)?;
-        state.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for ExponentialMovingAverage {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct ExponentialMovingAverageData {
-            alpha: f64,
-            value: f64,
-            last_update: SystemTime,
-        }
-
-        let data = ExponentialMovingAverageData::deserialize(deserializer)?;
-        Ok(Self {
-            alpha: data.alpha,
-            value: AtomicU64::new(data.value.to_bits()),
-            last_update: Arc::new(Mutex::new(data.last_update)),
-        })
-    }
-}
-
-/// Transfer statistics
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct XferStats {
-    pub avg: f64,
-    pub curr: f64,
-    pub peak: f64,
-    pub measure: ExponentialMovingAverage,
-}
-
-impl XferStats {
-    pub fn new() -> Self {
-        Self {
-            avg: 0.0,
-            curr: 0.0,
-            peak: 0.0,
-            measure: ExponentialMovingAverage::new(),
-        }
-    }
-
-    pub fn add_size(&mut self, size: i64, duration: Duration) {
-        if duration.as_nanos() > 0 {
-            let rate = (size as f64) / duration.as_secs_f64();
-            self.curr = rate;
-            if rate > self.peak {
-                self.peak = rate;
-            }
-            self.measure.add_value(rate, SystemTime::now());
-            self.avg = self.measure.get_current_average();
-        }
-    }
-
-    pub fn clone_stats(&self) -> Self {
-        Self {
-            avg: self.avg,
-            curr: self.curr,
-            peak: self.peak,
-            measure: self.measure.clone(),
-        }
-    }
-
-    pub fn merge(&self, other: &XferStats) -> Self {
-        Self {
-            avg: (self.avg + other.avg) / 2.0,
-            curr: self.curr + other.curr,
-            peak: self.peak.max(other.peak),
-            measure: self.measure.merge(&other.measure),
-        }
-    }
-
-    pub fn update_exponential_moving_average(&mut self, now: SystemTime) {
-        self.measure.update_exponential_moving_average(now);
-        self.avg = self.measure.get_current_average();
-    }
-}
-
-impl Default for XferStats {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct ReplStat {
@@ -317,380 +135,6 @@ impl SRStats {
     }
 }
 
-/// Statistics in queue
-#[derive(Debug, Default, Serialize, Deserialize)]
-pub struct InQueueStats {
-    pub bytes: i64,
-    pub count: i64,
-    #[serde(skip)]
-    pub now_bytes: AtomicI64,
-    #[serde(skip)]
-    pub now_count: AtomicI64,
-}
-
-impl Clone for InQueueStats {
-    fn clone(&self) -> Self {
-        Self {
-            bytes: self.bytes,
-            count: self.count,
-            now_bytes: AtomicI64::new(self.now_bytes.load(Ordering::Relaxed)),
-            now_count: AtomicI64::new(self.now_count.load(Ordering::Relaxed)),
-        }
-    }
-}
-
-impl InQueueStats {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn get_current_bytes(&self) -> i64 {
-        self.now_bytes.load(Ordering::Relaxed)
-    }
-
-    pub fn get_current_count(&self) -> i64 {
-        self.now_count.load(Ordering::Relaxed)
-    }
-}
-
-/// Metrics in queue
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct InQueueMetric {
-    pub curr: InQueueStats,
-    pub avg: InQueueStats,
-    pub max: InQueueStats,
-}
-
-impl InQueueMetric {
-    pub fn merge(&self, other: &InQueueMetric) -> Self {
-        Self {
-            curr: InQueueStats {
-                bytes: self.curr.bytes + other.curr.bytes,
-                count: self.curr.count + other.curr.count,
-                now_bytes: AtomicI64::new(
-                    self.curr.now_bytes.load(Ordering::Relaxed) + other.curr.now_bytes.load(Ordering::Relaxed),
-                ),
-                now_count: AtomicI64::new(
-                    self.curr.now_count.load(Ordering::Relaxed) + other.curr.now_count.load(Ordering::Relaxed),
-                ),
-            },
-            avg: InQueueStats {
-                bytes: (self.avg.bytes + other.avg.bytes) / 2,
-                count: (self.avg.count + other.avg.count) / 2,
-                ..Default::default()
-            },
-            max: InQueueStats {
-                bytes: self.max.bytes.max(other.max.bytes),
-                count: self.max.count.max(other.max.count),
-                ..Default::default()
-            },
-        }
-    }
-}
-
-/// Queue cache
-#[derive(Debug, Default)]
-pub struct QueueCache {
-    pub bucket_stats: HashMap<String, InQueueStats>,
-    pub sr_queue_stats: InQueueStats,
-}
-
-impl QueueCache {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn update(&mut self) {
-        // Update queue statistics cache
-        // In actual implementation, this would get latest statistics from queue system
-    }
-
-    pub fn get_bucket_stats(&self, bucket: &str) -> InQueueMetric {
-        if let Some(bucket_stat) = self.bucket_stats.get(bucket) {
-            InQueueMetric {
-                curr: InQueueStats {
-                    bytes: bucket_stat.now_bytes.load(Ordering::Relaxed),
-                    count: bucket_stat.now_count.load(Ordering::Relaxed),
-                    ..Default::default()
-                },
-                avg: InQueueStats::default(), // simplified implementation
-                max: InQueueStats::default(), // simplified implementation
-            }
-        } else {
-            InQueueMetric::default()
-        }
-    }
-
-    pub fn get_site_stats(&self) -> InQueueMetric {
-        InQueueMetric {
-            curr: InQueueStats {
-                bytes: self.sr_queue_stats.now_bytes.load(Ordering::Relaxed),
-                count: self.sr_queue_stats.now_count.load(Ordering::Relaxed),
-                ..Default::default()
-            },
-            avg: InQueueStats::default(), // simplified implementation
-            max: InQueueStats::default(), // simplified implementation
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ProxyMetric {
-    pub get_total: i64,
-    pub get_failed: i64,
-    pub put_total: i64,
-    pub put_failed: i64,
-    pub head_total: i64,
-    pub head_failed: i64,
-}
-
-impl ProxyMetric {
-    pub fn add(&mut self, other: &ProxyMetric) {
-        self.get_total += other.get_total;
-        self.get_failed += other.get_failed;
-        self.put_total += other.put_total;
-        self.put_failed += other.put_failed;
-        self.head_total += other.head_total;
-        self.head_failed += other.head_failed;
-    }
-}
-
-/// Proxy statistics cache
-#[derive(Debug, Clone, Default)]
-pub struct ProxyStatsCache {
-    bucket_stats: HashMap<String, ProxyMetric>,
-}
-
-impl ProxyStatsCache {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn inc(&mut self, bucket: &str, api: &str, is_err: bool) {
-        let metric = self.bucket_stats.entry(bucket.to_string()).or_default();
-
-        match api {
-            "GetObject" => {
-                metric.get_total += 1;
-                if is_err {
-                    metric.get_failed += 1;
-                }
-            }
-            "PutObject" => {
-                metric.put_total += 1;
-                if is_err {
-                    metric.put_failed += 1;
-                }
-            }
-            "HeadObject" => {
-                metric.head_total += 1;
-                if is_err {
-                    metric.head_failed += 1;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    pub fn get_bucket_stats(&self, bucket: &str) -> ProxyMetric {
-        self.bucket_stats.get(bucket).cloned().unwrap_or_default()
-    }
-
-    pub fn get_site_stats(&self) -> ProxyMetric {
-        let mut total = ProxyMetric::default();
-        for metric in self.bucket_stats.values() {
-            total.add(metric);
-        }
-        total
-    }
-}
-
-/// Failure statistics
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct FailStats {
-    pub count: i64,
-    pub size: i64,
-}
-
-impl FailStats {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn add_size(&mut self, size: i64, _err: Option<&Error>) {
-        self.count += 1;
-        self.size += size;
-    }
-
-    pub fn merge(&self, other: &FailStats) -> Self {
-        Self {
-            count: self.count + other.count,
-            size: self.size + other.size,
-        }
-    }
-
-    pub fn to_metric(&self) -> FailedMetric {
-        FailedMetric {
-            count: self.count,
-            size: self.size,
-        }
-    }
-}
-
-/// Failed metric
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct FailedMetric {
-    pub count: i64,
-    pub size: i64,
-}
-
-/// Latency statistics
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct LatencyStats {
-    pub avg: f64,
-    pub curr: f64,
-    pub max: f64,
-}
-
-impl LatencyStats {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn update(&mut self, _size: i64, duration: Duration) {
-        let latency = duration.as_millis() as f64;
-        self.curr = latency;
-        if latency > self.max {
-            self.max = latency;
-        }
-        // Simple moving average (simplified implementation)
-        self.avg = (self.avg + latency) / 2.0;
-    }
-
-    pub fn merge(&self, other: &LatencyStats) -> Self {
-        Self {
-            avg: (self.avg + other.avg) / 2.0,
-            curr: self.curr.max(other.curr),
-            max: self.max.max(other.max),
-        }
-    }
-}
-
-/// Bucket replication statistics for a single target
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct BucketReplicationStat {
-    pub replicated_size: i64,
-    pub replicated_count: i64,
-    pub failed: FailedMetric,
-    pub fail_stats: FailStats,
-    pub latency: LatencyStats,
-    pub xfer_rate_lrg: XferStats,
-    pub xfer_rate_sml: XferStats,
-    pub bandwidth_limit_bytes_per_sec: i64,
-    pub current_bandwidth_bytes_per_sec: f64,
-}
-
-impl BucketReplicationStat {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn update_xfer_rate(&mut self, size: i64, duration: Duration) {
-        // Classify as large or small transfer based on size
-        if size > 1024 * 1024 {
-            // > 1MB
-            self.xfer_rate_lrg.add_size(size, duration);
-        } else {
-            self.xfer_rate_sml.add_size(size, duration);
-        }
-    }
-}
-
-/// Queue statistics for nodes
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct QueueStats {
-    pub nodes: Vec<QueueNode>,
-}
-
-/// Queue node statistics
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct QueueNode {
-    pub q_stats: InQueueMetric,
-}
-
-/// Bucket replication statistics
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct BucketReplicationStats {
-    pub stats: HashMap<String, BucketReplicationStat>,
-    pub replica_size: i64,
-    pub replica_count: i64,
-    pub replicated_size: i64,
-    pub replicated_count: i64,
-    pub q_stat: InQueueMetric,
-}
-
-impl BucketReplicationStats {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.stats.is_empty() && self.replica_size == 0 && self.replicated_size == 0
-    }
-
-    pub fn has_replication_usage(&self) -> bool {
-        self.replica_size > 0 || self.replicated_size > 0 || !self.stats.is_empty()
-    }
-
-    pub fn clone_stats(&self) -> Self {
-        self.clone()
-    }
-}
-
-/// Bucket statistics
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct BucketStats {
-    pub uptime: i64,
-    pub replication_stats: BucketReplicationStats,
-    pub queue_stats: QueueStats,
-    pub proxy_stats: ProxyMetric,
-}
-
-/// Site replication metrics summary
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SRMetricsSummary {
-    pub uptime: i64,
-    pub queued: InQueueMetric,
-    pub active_workers: ActiveWorkerStat,
-    pub metrics: HashMap<String, i64>,
-    pub proxied: ProxyMetric,
-    pub replica_size: i64,
-    pub replica_count: i64,
-}
-
-/// Active worker statistics
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ActiveWorkerStat {
-    pub curr: i32,
-    pub max: i32,
-    pub avg: f64,
-}
-
-impl ActiveWorkerStat {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn get(&self) -> Self {
-        self.clone()
-    }
-
-    pub fn update(&mut self) {
-        // Simulate worker statistics update logic
-        // In actual implementation, this would get current active count from worker pool
-    }
-}
-
 /// Global replication statistics
 #[derive(Debug)]
 pub struct ReplicationStats {
@@ -699,7 +143,7 @@ pub struct ReplicationStats {
     // Active worker statistics
     pub workers: Arc<Mutex<ActiveWorkerStat>>,
     // Queue statistics cache
-    pub q_cache: Arc<Mutex<QueueCache>>,
+    pub q_cache: Arc<StdMutex<QueueCache>>,
     // Proxy statistics cache
     pub p_cache: Arc<Mutex<ProxyStatsCache>>,
     // MRF backlog statistics (simplified)
@@ -709,12 +153,89 @@ pub struct ReplicationStats {
     pub most_recent_stats: Arc<Mutex<HashMap<String, BucketStats>>>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeReplicationTargetBacklog {
+    pub bucket: String,
+    pub target_arn: String,
+    pub count: u64,
+    pub bytes: u64,
+}
+
+type TargetQueueKey = (String, String);
+type TargetQueueCache = HashMap<TargetQueueKey, InQueueMetric>;
+
+struct TargetQueueCacheSlot {
+    owner: Weak<StdMutex<QueueCache>>,
+    metrics: TargetQueueCache,
+}
+
+impl TargetQueueCacheSlot {
+    fn new(owner: &Arc<StdMutex<QueueCache>>) -> Self {
+        Self {
+            owner: Arc::downgrade(owner),
+            metrics: TargetQueueCache::default(),
+        }
+    }
+
+    fn belongs_to(&self, owner: &Arc<StdMutex<QueueCache>>) -> bool {
+        self.owner.upgrade().is_some_and(|current| Arc::ptr_eq(&current, owner))
+    }
+}
+
+// Keep runtime target counters outside ReplicationStats to preserve its public struct shape.
+static TARGET_QUEUE_CACHES: LazyLock<StdMutex<Vec<TargetQueueCacheSlot>>> = LazyLock::new(|| StdMutex::new(Vec::new()));
+
+fn i64_to_u64_floor_zero(value: i64) -> u64 {
+    u64::try_from(value.max(0)).unwrap_or(0)
+}
+
+fn normalized_target_arns(target_arns: &[String]) -> Vec<&str> {
+    let mut target_arns = target_arns
+        .iter()
+        .map(String::as_str)
+        .filter(|target_arn| !target_arn.is_empty())
+        .collect::<Vec<_>>();
+    target_arns.sort_unstable();
+    target_arns.dedup();
+    target_arns
+}
+
+fn target_queue_cache_snapshot(cache: &TargetQueueCache) -> Vec<RuntimeReplicationTargetBacklog> {
+    cache
+        .iter()
+        .filter_map(|((bucket, target_arn), metric)| {
+            let count = i64_to_u64_floor_zero(metric.curr.get_current_count());
+            let bytes = i64_to_u64_floor_zero(metric.curr.get_current_bytes());
+            (count > 0 || bytes > 0).then(|| RuntimeReplicationTargetBacklog {
+                bucket: bucket.clone(),
+                target_arn: target_arn.clone(),
+                count,
+                bytes,
+            })
+        })
+        .collect()
+}
+
+fn prune_stale_target_queue_caches(caches: &mut Vec<TargetQueueCacheSlot>) {
+    caches.retain(|slot| slot.owner.strong_count() > 0);
+}
+
+fn with_target_queue_caches<T>(f: impl FnOnce(&mut Vec<TargetQueueCacheSlot>) -> T) -> T {
+    match TARGET_QUEUE_CACHES.lock() {
+        Ok(mut caches) => f(&mut caches),
+        Err(poisoned) => {
+            let mut caches = poisoned.into_inner();
+            f(&mut caches)
+        }
+    }
+}
+
 impl ReplicationStats {
     pub fn new() -> Self {
         Self {
             sr_stats: Arc::new(SRStats::new()),
             workers: Arc::new(Mutex::new(ActiveWorkerStat::new())),
-            q_cache: Arc::new(Mutex::new(QueueCache::new())),
+            q_cache: Arc::new(StdMutex::new(QueueCache::new())),
             p_cache: Arc::new(Mutex::new(ProxyStatsCache::new())),
             mrf_stats: HashMap::new(),
             cache: Arc::new(RwLock::new(HashMap::new())),
@@ -740,8 +261,11 @@ impl ReplicationStats {
             let mut interval = interval(Duration::from_secs(2));
             loop {
                 interval.tick().await;
+                let current = runtime_sources::replication_pool()
+                    .map(|pool| pool.active_workers() + pool.active_lrg_workers() + pool.active_mrf_workers())
+                    .unwrap_or(0);
                 let mut workers = workers_clone.lock().await;
-                workers.update();
+                workers.update(current);
             }
         });
 
@@ -751,8 +275,9 @@ impl ReplicationStats {
             let mut interval = interval(Duration::from_secs(2));
             loop {
                 interval.tick().await;
-                let mut cache = q_cache_clone.lock().await;
-                cache.update();
+                if let Ok(mut cache) = q_cache_clone.lock() {
+                    cache.update();
+                }
             }
         });
     }
@@ -763,7 +288,7 @@ impl ReplicationStats {
         let now = SystemTime::now();
 
         let cache_read = cache.read().await;
-        for (_bucket, stats) in cache_read.iter() {
+        for stats in cache_read.values() {
             for stat in stats.stats.values() {
                 // Now we can update the moving averages using interior mutability
                 stat.xfer_rate_lrg.measure.update_exponential_moving_average(now);
@@ -808,7 +333,17 @@ impl ReplicationStats {
         self.sr_stats.replica_count.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub async fn record_resync_status(&self, bucket: &str, status: ResyncStatusType, duration: Option<Duration>) {
+        let mut cache = self.cache.write().await;
+        let stats = cache.entry(bucket.to_string()).or_insert_with(BucketReplicationStats::new);
+        stats.record_resync_status(status, duration);
+    }
+
     /// Site replication update replica statistics
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity replication surface with no caller in this port (backlog#1823)"
+    )]
     fn sr_update_replica_stat(&self, size: i64) {
         self.sr_stats.replica_size.fetch_add(size, Ordering::Relaxed);
         self.sr_stats.replica_count.fetch_add(1, Ordering::Relaxed);
@@ -832,61 +367,55 @@ impl ReplicationStats {
         let mut rs = ReplStat::new();
 
         match status {
-            ReplicationStatusType::Pending => {
-                if ri.op_type.is_data_replication() && prev_status != status {
-                    rs.set(
-                        ri.arn.clone(),
-                        ri.size,
-                        Duration::default(),
-                        status,
-                        ri.op_type,
-                        ri.endpoint.clone(),
-                        ri.secure,
-                        ri.error.as_ref().map(|e| crate::error::Error::other(e.clone())),
-                    );
-                }
+            ReplicationStatusType::Pending if ri.op_type.is_data_replication() && prev_status != status => {
+                rs.set(
+                    ri.arn.clone(),
+                    ri.size,
+                    Duration::default(),
+                    status,
+                    ri.op_type,
+                    ri.endpoint.clone(),
+                    ri.secure,
+                    ri.error.as_ref().map(|e| Error::other(e.clone())),
+                );
             }
-            ReplicationStatusType::Completed => {
-                if ri.op_type.is_data_replication() {
-                    rs.set(
-                        ri.arn.clone(),
-                        ri.size,
-                        ri.duration,
-                        status,
-                        ri.op_type,
-                        ri.endpoint.clone(),
-                        ri.secure,
-                        ri.error.as_ref().map(|e| crate::error::Error::other(e.clone())),
-                    );
-                }
+            ReplicationStatusType::Completed if ri.op_type.is_data_replication() => {
+                rs.set(
+                    ri.arn.clone(),
+                    ri.size,
+                    ri.duration,
+                    status,
+                    ri.op_type,
+                    ri.endpoint.clone(),
+                    ri.secure,
+                    ri.error.as_ref().map(|e| Error::other(e.clone())),
+                );
             }
-            ReplicationStatusType::Failed => {
-                if ri.op_type.is_data_replication() && prev_status == ReplicationStatusType::Pending {
-                    rs.set(
-                        ri.arn.clone(),
-                        ri.size,
-                        ri.duration,
-                        status,
-                        ri.op_type,
-                        ri.endpoint.clone(),
-                        ri.secure,
-                        ri.error.as_ref().map(|e| crate::error::Error::other(e.clone())),
-                    );
-                }
+            ReplicationStatusType::Failed
+                if ri.op_type.is_data_replication() && prev_status == ReplicationStatusType::Pending =>
+            {
+                rs.set(
+                    ri.arn.clone(),
+                    ri.size,
+                    ri.duration,
+                    status,
+                    ri.op_type,
+                    ri.endpoint.clone(),
+                    ri.secure,
+                    ri.error.as_ref().map(|e| Error::other(e.clone())),
+                );
             }
-            ReplicationStatusType::Replica => {
-                if ri.op_type == ReplicationType::Object {
-                    rs.set(
-                        ri.arn.clone(),
-                        ri.size,
-                        Duration::default(),
-                        status,
-                        ri.op_type,
-                        String::new(),
-                        false,
-                        ri.error.as_ref().map(|e| crate::error::Error::other(e.clone())),
-                    );
-                }
+            ReplicationStatusType::Replica if ri.op_type == ReplicationType::Object => {
+                rs.set(
+                    ri.arn.clone(),
+                    ri.size,
+                    Duration::default(),
+                    status,
+                    ri.op_type,
+                    String::new(),
+                    false,
+                    ri.error.as_ref().map(|e| Error::other(e.clone())),
+                );
             }
             _ => {}
         }
@@ -916,10 +445,12 @@ impl ReplicationStats {
                 if rs.transfer_duration > Duration::default() {
                     stat.latency.update(rs.transfer_size, rs.transfer_duration);
                     stat.update_xfer_rate(rs.transfer_size, rs.transfer_duration);
+                    stat.latency_scope = ReplicationMetricScope::NodeLocal;
                 }
             }
             (false, true, false) => {
                 stat.fail_stats.add_size(rs.transfer_size, rs.err.as_ref());
+                stat.failed = stat.fail_stats.to_metric();
             }
             (false, false, true) => {
                 // Pending status, no processing for now
@@ -931,14 +462,32 @@ impl ReplicationStats {
     /// Get replication metrics for all buckets
     pub async fn get_all(&self) -> HashMap<String, BucketReplicationStats> {
         let cache = self.cache.read().await;
-        let mut result = HashMap::new();
+        let mut result = HashMap::with_capacity(cache.len());
 
         for (bucket, stats) in cache.iter() {
-            let mut cloned_stats = stats.clone_stats();
-            // Add queue statistics
-            let q_cache = self.q_cache.lock().await;
-            cloned_stats.q_stat = q_cache.get_bucket_stats(bucket);
-            result.insert(bucket.clone(), cloned_stats);
+            let mut snapshot = stats.clone_stats();
+            snapshot.mark_node_local_provider_available();
+            snapshot.queue_scope = ReplicationMetricScope::NodeLocal;
+            result.insert(bucket.clone(), snapshot);
+        }
+        drop(cache);
+
+        {
+            if let Ok(q_cache) = self.q_cache.lock() {
+                for (bucket, queue_stats) in &q_cache.bucket_stats {
+                    let bucket_stats = result.entry(bucket.clone()).or_insert_with(BucketReplicationStats::new);
+                    bucket_stats.q_stat = queue_stats.snapshot();
+                    bucket_stats.mark_node_local_provider_available();
+                    bucket_stats.queue_scope = ReplicationMetricScope::NodeLocal;
+                }
+            }
+        }
+
+        {
+            let p_cache = self.p_cache.lock().await;
+            for bucket in p_cache.bucket_names() {
+                result.entry(bucket.to_string()).or_insert_with(BucketReplicationStats::new);
+            }
         }
 
         result
@@ -948,9 +497,13 @@ impl ReplicationStats {
     pub async fn get(&self, bucket: &str) -> BucketReplicationStats {
         let cache = self.cache.read().await;
         if let Some(stats) = cache.get(bucket) {
-            stats.clone_stats()
+            let mut snapshot = stats.clone_stats();
+            snapshot.mark_node_local_provider_available();
+            snapshot
         } else {
-            BucketReplicationStats::new()
+            let mut snapshot = BucketReplicationStats::new();
+            snapshot.mark_node_local_provider_available();
+            snapshot
         }
     }
 
@@ -959,8 +512,11 @@ impl ReplicationStats {
         let boot_time = SystemTime::UNIX_EPOCH; // simplified implementation
         let uptime = SystemTime::now().duration_since(boot_time).unwrap_or_default().as_secs() as i64;
 
-        let q_cache = self.q_cache.lock().await;
-        let queued = q_cache.get_site_stats();
+        let queued = self
+            .q_cache
+            .lock()
+            .map(|q_cache| q_cache.get_site_stats())
+            .unwrap_or_default();
 
         let p_cache = self.p_cache.lock().await;
         let proxied = p_cache.get_site_stats();
@@ -996,11 +552,15 @@ impl ReplicationStats {
         let mut tq = InQueueMetric::default();
 
         for bucket_stat in &bucket_stats {
-            tot_replica_size += bucket_stat.replication_stats.replica_size;
-            tot_replica_count += bucket_stat.replication_stats.replica_count;
+            tot_replica_size = tot_replica_size.saturating_add(bucket_stat.replication_stats.replica_size);
+            tot_replica_count = tot_replica_count.saturating_add(bucket_stat.replication_stats.replica_count);
 
-            for q in &bucket_stat.queue_stats.nodes {
-                tq = tq.merge(&q.q_stats);
+            if bucket_stat.replication_stats.queue_scope != ReplicationMetricScope::Unavailable {
+                tq = tq.merge(&bucket_stat.replication_stats.q_stat);
+            } else {
+                for q in &bucket_stat.queue_stats.nodes {
+                    tq = tq.merge(&q.q_stats);
+                }
             }
 
             for (arn, stat) in &bucket_stat.replication_stats.stats {
@@ -1013,22 +573,38 @@ impl ReplicationStats {
                 let f_stats = stat.fail_stats.merge(&old_stat.fail_stats);
                 let lrg = old_stat.xfer_rate_lrg.merge(&stat.xfer_rate_lrg);
                 let sml = old_stat.xfer_rate_sml.merge(&stat.xfer_rate_sml);
+                let latency_available = stat.latency_scope != ReplicationMetricScope::Unavailable
+                    || old_stat.latency_scope != ReplicationMetricScope::Unavailable;
+                let bandwidth_available = stat.bandwidth_scope != ReplicationMetricScope::Unavailable
+                    || old_stat.bandwidth_scope != ReplicationMetricScope::Unavailable;
 
                 *old_stat = BucketReplicationStat {
                     failed: f_stats.to_metric(),
                     fail_stats: f_stats,
-                    replicated_size: stat.replicated_size + old_stat.replicated_size,
-                    replicated_count: stat.replicated_count + old_stat.replicated_count,
+                    replicated_size: stat.replicated_size.saturating_add(old_stat.replicated_size),
+                    replicated_count: stat.replicated_count.saturating_add(old_stat.replicated_count),
                     latency: stat.latency.merge(&old_stat.latency),
                     xfer_rate_lrg: lrg,
                     xfer_rate_sml: sml,
-                    bandwidth_limit_bytes_per_sec: stat.bandwidth_limit_bytes_per_sec,
+                    bandwidth_limit_bytes_per_sec: stat
+                        .bandwidth_limit_bytes_per_sec
+                        .saturating_add(old_stat.bandwidth_limit_bytes_per_sec),
                     current_bandwidth_bytes_per_sec: stat.current_bandwidth_bytes_per_sec
                         + old_stat.current_bandwidth_bytes_per_sec,
+                    latency_scope: if latency_available {
+                        ReplicationMetricScope::ClusterAggregated
+                    } else {
+                        ReplicationMetricScope::Unavailable
+                    },
+                    bandwidth_scope: if bandwidth_available {
+                        ReplicationMetricScope::ClusterAggregated
+                    } else {
+                        ReplicationMetricScope::Unavailable
+                    },
                 };
 
-                tot_replicated_size += stat.replicated_size;
-                tot_replicated_count += stat.replicated_count;
+                tot_replicated_size = tot_replicated_size.saturating_add(stat.replicated_size);
+                tot_replicated_count = tot_replicated_count.saturating_add(stat.replicated_count);
             }
         }
 
@@ -1039,6 +615,31 @@ impl ReplicationStats {
             replica_count: tot_replica_count,
             replicated_size: tot_replicated_size,
             replicated_count: tot_replicated_count,
+            resync_started_count: bucket_stats
+                .iter()
+                .map(|stats| stats.replication_stats.resync_started_count)
+                .fold(0i64, i64::saturating_add),
+            resync_completed_count: bucket_stats
+                .iter()
+                .map(|stats| stats.replication_stats.resync_completed_count)
+                .fold(0i64, i64::saturating_add),
+            resync_failed_count: bucket_stats
+                .iter()
+                .map(|stats| stats.replication_stats.resync_failed_count)
+                .fold(0i64, i64::saturating_add),
+            resync_canceled_count: bucket_stats
+                .iter()
+                .map(|stats| stats.replication_stats.resync_canceled_count)
+                .fold(0i64, i64::saturating_add),
+            resync_duration_ms: bucket_stats
+                .iter()
+                .map(|stats| stats.replication_stats.resync_duration_ms)
+                .fold(0i64, i64::saturating_add),
+            provider_available: true,
+            cluster_complete: true,
+            observed_node_count: u32::try_from(bucket_stats.len()).unwrap_or(u32::MAX),
+            expected_node_count: u32::try_from(bucket_stats.len()).unwrap_or(u32::MAX),
+            queue_scope: ReplicationMetricScope::ClusterAggregated,
         };
 
         let qs = Default::default();
@@ -1070,6 +671,33 @@ impl ReplicationStats {
         bs
     }
 
+    pub async fn aggregate_bucket_replication_stats(
+        &self,
+        bucket: &str,
+        bucket_stats: Vec<BucketStats>,
+        expected_node_count: u32,
+    ) -> BucketStats {
+        let mut aggregated = self.calculate_bucket_replication_stats(bucket, bucket_stats).await;
+        let observed_node_count = aggregated.replication_stats.observed_node_count;
+        let complete = observed_node_count == expected_node_count;
+        aggregated.replication_stats.expected_node_count = expected_node_count;
+        aggregated.replication_stats.cluster_complete = complete;
+        aggregated.replication_stats.queue_scope = if complete {
+            ReplicationMetricScope::ClusterAggregated
+        } else {
+            ReplicationMetricScope::PartialCluster
+        };
+        for stat in aggregated.replication_stats.stats.values_mut() {
+            if stat.latency_scope != ReplicationMetricScope::Unavailable {
+                stat.latency_scope = aggregated.replication_stats.queue_scope;
+            }
+            if stat.bandwidth_scope != ReplicationMetricScope::Unavailable {
+                stat.bandwidth_scope = aggregated.replication_stats.queue_scope;
+            }
+        }
+        aggregated
+    }
+
     /// Get latest replication statistics
     pub async fn get_latest_replication_stats(&self, bucket: &str) -> BucketStats {
         // In actual implementation, statistics would be obtained from cluster
@@ -1080,6 +708,12 @@ impl ReplicationStats {
         } else {
             BucketReplicationStats::new()
         };
+        // Stamp the serializable failure windows from the live samples: the
+        // samples themselves do not cross the peer-RPC wire, so this snapshot
+        // is what cluster aggregation and the metrics endpoints see.
+        for stat in replication_stats.stats.values_mut() {
+            stat.fail_stats.refresh_windows();
+        }
         let uptime = if cache.contains_key(bucket) {
             SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -1090,7 +724,17 @@ impl ReplicationStats {
         };
         drop(cache);
 
-        if let Some(monitor) = get_global_bucket_monitor() {
+        {
+            if let Ok(q_cache) = self.q_cache.lock()
+                && let Some(queue_stats) = q_cache.bucket_stats.get(bucket)
+            {
+                replication_stats.q_stat = queue_stats.snapshot();
+            }
+        }
+        replication_stats.mark_node_local_provider_available();
+        replication_stats.queue_scope = ReplicationMetricScope::NodeLocal;
+
+        if let Some(monitor) = runtime_sources::bucket_monitor() {
             let bw_report = monitor.get_report(|name| name == bucket);
             for (opts, bw) in bw_report.bucket_stats {
                 let stat = replication_stats
@@ -1101,8 +745,7 @@ impl ReplicationStats {
                         xfer_rate_sml: XferStats::new(),
                         ..Default::default()
                     });
-                stat.bandwidth_limit_bytes_per_sec = bw.limit_bytes_per_sec;
-                stat.current_bandwidth_bytes_per_sec = bw.current_bandwidth_bytes_per_sec;
+                stat.set_node_local_bandwidth(bw.limit_bytes_per_sec, bw.current_bandwidth_bytes_per_sec);
             }
         }
 
@@ -1115,31 +758,79 @@ impl ReplicationStats {
     }
 
     /// Increase queue statistics
-    pub async fn inc_q(&self, bucket: &str, size: i64, _is_delete_repl: bool, _op_type: ReplicationType) {
-        let mut q_cache = self.q_cache.lock().await;
-        let stats = q_cache
-            .bucket_stats
-            .entry(bucket.to_string())
-            .or_insert_with(InQueueStats::default);
-        stats.now_bytes.fetch_add(size, Ordering::Relaxed);
-        stats.now_count.fetch_add(1, Ordering::Relaxed);
-
-        q_cache.sr_queue_stats.now_bytes.fetch_add(size, Ordering::Relaxed);
-        q_cache.sr_queue_stats.now_count.fetch_add(1, Ordering::Relaxed);
+    pub fn inc_q(&self, bucket: &str, size: i64, _is_delete_repl: bool, _op_type: ReplicationType) {
+        if let Ok(mut q_cache) = self.q_cache.lock() {
+            q_cache.inc(bucket, size);
+        }
     }
 
     /// Decrease queue statistics
-    pub async fn dec_q(&self, bucket: &str, size: i64, _is_del_marker: bool, _op_type: ReplicationType) {
-        let mut q_cache = self.q_cache.lock().await;
-        let stats = q_cache
-            .bucket_stats
-            .entry(bucket.to_string())
-            .or_insert_with(InQueueStats::default);
-        stats.now_bytes.fetch_sub(size, Ordering::Relaxed);
-        stats.now_count.fetch_sub(1, Ordering::Relaxed);
+    pub fn dec_q(&self, bucket: &str, size: i64, _is_del_marker: bool, _op_type: ReplicationType) {
+        if let Ok(mut q_cache) = self.q_cache.lock() {
+            q_cache.dec(bucket, size);
+        }
+    }
 
-        q_cache.sr_queue_stats.now_bytes.fetch_sub(size, Ordering::Relaxed);
-        q_cache.sr_queue_stats.now_count.fetch_sub(1, Ordering::Relaxed);
+    pub(crate) fn inc_target_q(&self, bucket: &str, target_arns: &[String], size: i64) {
+        let target_arns = normalized_target_arns(target_arns);
+        if target_arns.is_empty() {
+            return;
+        }
+        with_target_queue_caches(|caches| {
+            prune_stale_target_queue_caches(caches);
+            let slot_index = match caches.iter().position(|slot| slot.belongs_to(&self.q_cache)) {
+                Some(index) => index,
+                None => {
+                    caches.push(TargetQueueCacheSlot::new(&self.q_cache));
+                    caches.len() - 1
+                }
+            };
+            let slot = &mut caches[slot_index];
+            let bucket = bucket.to_string();
+            for target_arn in target_arns {
+                let metric = match slot.metrics.entry((bucket.clone(), target_arn.to_string())) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(entry) => entry.insert(InQueueMetric::default()),
+                };
+                metric.curr.add_current(size, 1);
+            }
+        });
+    }
+
+    pub(crate) fn dec_target_q(&self, bucket: &str, target_arns: &[String], size: i64) {
+        let target_arns = normalized_target_arns(target_arns);
+        if target_arns.is_empty() {
+            return;
+        }
+        with_target_queue_caches(|caches| {
+            prune_stale_target_queue_caches(caches);
+            if let Some(slot) = caches.iter_mut().find(|slot| slot.belongs_to(&self.q_cache)) {
+                let bucket = bucket.to_string();
+                for target_arn in target_arns {
+                    if let Some(metric) = slot.metrics.get_mut(&(bucket.clone(), target_arn.to_string())) {
+                        metric.curr.subtract_current(size, 1);
+                    }
+                }
+                slot.metrics
+                    .retain(|_, metric| metric.curr.get_current_count() > 0 || metric.curr.get_current_bytes() > 0);
+            }
+        });
+    }
+
+    pub fn runtime_target_backlog_snapshot(&self) -> Vec<RuntimeReplicationTargetBacklog> {
+        let mut snapshot = with_target_queue_caches(|caches| {
+            caches
+                .iter()
+                .find(|slot| slot.belongs_to(&self.q_cache))
+                .map(|slot| target_queue_cache_snapshot(&slot.metrics))
+                .unwrap_or_default()
+        });
+        snapshot.sort_by(|left, right| {
+            left.bucket
+                .cmp(&right.bucket)
+                .then_with(|| left.target_arn.cmp(&right.target_arn))
+        });
+        snapshot
     }
 
     /// Increase proxy metrics
@@ -1165,6 +856,94 @@ impl Default for ReplicationStats {
 mod tests {
     use super::*;
 
+    #[test]
+    fn runtime_target_backlog_snapshot_tracks_targets() {
+        let stats = ReplicationStats::new();
+        stats.inc_target_q(
+            "photos",
+            &[
+                "arn:rustfs:replication:target-b".to_string(),
+                "arn:rustfs:replication:target-a".to_string(),
+                "arn:rustfs:replication:target-a".to_string(),
+            ],
+            1024,
+        );
+
+        let snapshot = stats.runtime_target_backlog_snapshot();
+
+        assert_eq!(
+            snapshot,
+            vec![
+                RuntimeReplicationTargetBacklog {
+                    bucket: "photos".to_string(),
+                    target_arn: "arn:rustfs:replication:target-a".to_string(),
+                    count: 1,
+                    bytes: 1024,
+                },
+                RuntimeReplicationTargetBacklog {
+                    bucket: "photos".to_string(),
+                    target_arn: "arn:rustfs:replication:target-b".to_string(),
+                    count: 1,
+                    bytes: 1024,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_target_backlog_ignores_empty_targets() {
+        let stats = ReplicationStats::new();
+        stats.inc_target_q("photos", &["".to_string()], 1024);
+
+        assert!(stats.runtime_target_backlog_snapshot().is_empty());
+    }
+
+    #[test]
+    fn runtime_target_backlog_is_scoped_to_stats_instance() {
+        let first = ReplicationStats::new();
+        let second = ReplicationStats::new();
+        first.inc_target_q("photos", &["arn:rustfs:replication:target-a".to_string()], 1024);
+
+        assert!(second.runtime_target_backlog_snapshot().is_empty());
+        assert_eq!(first.runtime_target_backlog_snapshot()[0].count, 1);
+    }
+
+    #[test]
+    fn runtime_target_backlog_decrements_with_saturation() {
+        let stats = ReplicationStats::new();
+        let target_arns = ["arn:rustfs:replication:target-a".to_string()];
+        stats.inc_target_q("photos", &target_arns, 1024);
+        stats.dec_target_q("photos", &target_arns, 2048);
+
+        assert!(stats.runtime_target_backlog_snapshot().is_empty());
+    }
+
+    #[test]
+    fn runtime_target_backlog_prunes_stale_sidecar_on_next_access() {
+        {
+            let stats = ReplicationStats::new();
+            stats.inc_target_q("photos", &["arn:rustfs:replication:target-a".to_string()], 1024);
+            assert!(
+                TARGET_QUEUE_CACHES
+                    .lock()
+                    .expect("target queue cache mutex")
+                    .iter()
+                    .any(|slot| slot.owner.strong_count() > 0)
+            );
+        }
+
+        let stats = ReplicationStats::new();
+        stats.inc_target_q("photos", &["arn:rustfs:replication:target-b".to_string()], 1024);
+
+        assert!(
+            TARGET_QUEUE_CACHES
+                .lock()
+                .expect("target queue cache mutex")
+                .iter()
+                .all(|slot| slot.owner.strong_count() > 0)
+        );
+    }
+
     #[tokio::test]
     async fn test_replication_stats_new() {
         let stats = ReplicationStats::new();
@@ -1189,6 +968,29 @@ mod tests {
         let bucket_stats = stats.get("test-bucket").await;
         assert_eq!(bucket_stats.replica_size, 1024);
         assert_eq!(bucket_stats.replica_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_record_resync_status_updates_bucket_stats() {
+        let stats = ReplicationStats::new();
+
+        stats
+            .record_resync_status("test-bucket", ResyncStatusType::ResyncStarted, None)
+            .await;
+        stats
+            .record_resync_status("test-bucket", ResyncStatusType::ResyncCompleted, Some(Duration::from_millis(1500)))
+            .await;
+        stats
+            .record_resync_status("test-bucket", ResyncStatusType::ResyncPending, Some(Duration::from_millis(500)))
+            .await;
+
+        let bucket_stats = stats.get("test-bucket").await;
+        assert_eq!(bucket_stats.resync_started_count, 1);
+        assert_eq!(bucket_stats.resync_completed_count, 1);
+        assert_eq!(bucket_stats.resync_failed_count, 0);
+        assert_eq!(bucket_stats.resync_canceled_count, 0);
+        assert_eq!(bucket_stats.resync_duration_ms, 1500);
+        assert!(bucket_stats.has_replication_usage());
     }
 
     #[tokio::test]
@@ -1222,6 +1024,203 @@ mod tests {
         let stat = &bucket_stats.stats["test-arn"];
         assert_eq!(stat.replicated_size, 1024);
         assert_eq!(stat.replicated_count, 1);
+    }
+
+    #[tokio::test]
+    async fn latest_stats_include_queue_until_drained() {
+        let stats = ReplicationStats::new();
+
+        stats.inc_q("queued-bucket", 4096, false, ReplicationType::Object);
+        let queued = stats.get_latest_replication_stats("queued-bucket").await;
+        assert!(queued.replication_stats.provider_available);
+        assert_eq!(queued.replication_stats.q_stat.curr.count, 1);
+        assert_eq!(queued.replication_stats.q_stat.curr.bytes, 4096);
+        assert_eq!(queued.replication_stats.queue_scope, ReplicationMetricScope::NodeLocal);
+
+        stats.dec_q("queued-bucket", 4096, false, ReplicationType::Object);
+        let drained = stats.get_latest_replication_stats("queued-bucket").await;
+        assert_eq!(drained.replication_stats.q_stat.curr.count, 0);
+        assert_eq!(drained.replication_stats.q_stat.curr.bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn failed_metric_matches_authoritative_fail_stats() {
+        let stats = ReplicationStats::new();
+        let target_info = ReplicatedTargetInfo {
+            arn: "failed-arn".to_string(),
+            size: 2048,
+            duration: Duration::from_millis(25),
+            op_type: ReplicationType::Object,
+            error: Some("target unavailable".to_string()),
+            ..Default::default()
+        };
+
+        stats
+            .update(
+                "failed-bucket",
+                &target_info,
+                ReplicationStatusType::Failed,
+                ReplicationStatusType::Pending,
+            )
+            .await;
+
+        let snapshot = stats.get_latest_replication_stats("failed-bucket").await;
+        let target = &snapshot.replication_stats.stats["failed-arn"];
+        assert_eq!(target.failed.count, target.fail_stats.count);
+        assert_eq!(target.failed.size, target.fail_stats.size);
+        assert_eq!(target.failed.count, 1);
+        assert_eq!(target.failed.size, 2048);
+    }
+
+    #[tokio::test]
+    async fn valid_empty_provider_is_not_reported_as_unavailable() {
+        let stats = ReplicationStats::new();
+
+        let snapshot = stats.get_latest_replication_stats("empty-bucket").await;
+
+        assert!(snapshot.replication_stats.provider_available);
+        assert!(snapshot.replication_stats.cluster_complete);
+        assert_eq!(snapshot.replication_stats.observed_node_count, 1);
+        assert_eq!(snapshot.replication_stats.expected_node_count, 1);
+        assert!(snapshot.replication_stats.stats.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cluster_aggregation_counts_each_node_once_and_marks_partial() {
+        let stats = ReplicationStats::new();
+        let node = |failed_count, failed_size, queued_count, queued_size| {
+            let mut fail_stats = FailStats::new();
+            fail_stats.count = failed_count;
+            fail_stats.size = failed_size;
+            let mut targets = HashMap::new();
+            targets.insert(
+                "arn".to_string(),
+                BucketReplicationStat {
+                    fail_stats,
+                    latency_scope: ReplicationMetricScope::NodeLocal,
+                    ..Default::default()
+                },
+            );
+            let q_stat = InQueueMetric::default();
+            q_stat.curr.now_count.store(queued_count, Ordering::Relaxed);
+            q_stat.curr.now_bytes.store(queued_size, Ordering::Relaxed);
+            let q_stat = q_stat.snapshot();
+            BucketStats {
+                replication_stats: BucketReplicationStats {
+                    stats: targets,
+                    q_stat,
+                    provider_available: true,
+                    queue_scope: ReplicationMetricScope::NodeLocal,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        };
+
+        let aggregated = stats
+            .aggregate_bucket_replication_stats("bucket", vec![node(1, 10, 2, 20), node(3, 30, 4, 40)], 3)
+            .await;
+
+        let target = &aggregated.replication_stats.stats["arn"];
+        assert_eq!(target.failed.count, 4);
+        assert_eq!(target.failed.size, 40);
+        assert_eq!(aggregated.replication_stats.q_stat.curr.count, 6);
+        assert_eq!(aggregated.replication_stats.q_stat.curr.bytes, 60);
+        assert_eq!(aggregated.replication_stats.observed_node_count, 2);
+        assert_eq!(aggregated.replication_stats.expected_node_count, 3);
+        assert!(!aggregated.replication_stats.cluster_complete);
+        assert_eq!(aggregated.replication_stats.queue_scope, ReplicationMetricScope::PartialCluster);
+        assert_eq!(target.latency_scope, ReplicationMetricScope::PartialCluster);
+    }
+
+    #[tokio::test]
+    async fn concurrent_queue_updates_are_visible_without_lost_counts() {
+        let stats = Arc::new(ReplicationStats::new());
+        let mut tasks = Vec::with_capacity(32);
+        for _ in 0..32 {
+            let stats = Arc::clone(&stats);
+            tasks.push(tokio::spawn(async move {
+                stats.inc_q("concurrent-bucket", 7, false, ReplicationType::Object);
+            }));
+        }
+        for task in tasks {
+            task.await.expect("queue update task should complete");
+        }
+
+        let snapshot = stats.get_latest_replication_stats("concurrent-bucket").await;
+        assert_eq!(snapshot.replication_stats.q_stat.curr.count, 32);
+        assert_eq!(snapshot.replication_stats.q_stat.curr.bytes, 224);
+    }
+
+    #[tokio::test]
+    async fn test_get_all_includes_proxy_only_bucket() {
+        let stats = ReplicationStats::new();
+        stats.inc_proxy("proxy-only-bucket", "HeadObject", false).await;
+
+        let all = stats.get_all().await;
+        assert!(all.contains_key("proxy-only-bucket"));
+    }
+
+    /// Pins the read-proxy metric contract (backlog#1675 P1-5): the API
+    /// strings the GET/HEAD/Tagging proxy paths record map onto the
+    /// get/head/tagging totals, and only unexpected failures raise the
+    /// failed counters.
+    #[tokio::test]
+    async fn test_proxy_stats_map_read_proxy_apis_to_totals() {
+        let stats = ReplicationStats::new();
+        stats.inc_proxy("proxy-bucket", "GetObject", false).await;
+        stats.inc_proxy("proxy-bucket", "GetObject", true).await;
+        stats.inc_proxy("proxy-bucket", "HeadObject", false).await;
+        stats.inc_proxy("proxy-bucket", "GetObjectTagging", false).await;
+        stats.inc_proxy("proxy-bucket", "PutObjectTagging", false).await;
+        stats.inc_proxy("proxy-bucket", "DeleteObjectTagging", true).await;
+
+        let metric = stats.get_proxy_stats("proxy-bucket").await;
+        assert_eq!(metric.get_total, 2);
+        assert_eq!(metric.get_failed, 1);
+        assert_eq!(metric.head_total, 1);
+        assert_eq!(metric.head_failed, 0);
+        assert_eq!(metric.get_tag_total, 1);
+        assert_eq!(metric.put_tag_total, 1);
+        assert_eq!(metric.delete_tag_total, 1);
+        assert_eq!(metric.delete_tag_failed, 1);
+    }
+
+    #[tokio::test]
+    async fn test_calculate_bucket_replication_stats_merges_resync_metrics() {
+        let stats = ReplicationStats::new();
+        let got = stats
+            .calculate_bucket_replication_stats(
+                "test-bucket",
+                vec![
+                    BucketStats {
+                        replication_stats: BucketReplicationStats {
+                            resync_started_count: 1,
+                            resync_completed_count: 1,
+                            resync_duration_ms: 1000,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    BucketStats {
+                        replication_stats: BucketReplicationStats {
+                            resync_started_count: 2,
+                            resync_failed_count: 1,
+                            resync_canceled_count: 1,
+                            resync_duration_ms: 2500,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                ],
+            )
+            .await;
+
+        assert_eq!(got.replication_stats.resync_started_count, 3);
+        assert_eq!(got.replication_stats.resync_completed_count, 1);
+        assert_eq!(got.replication_stats.resync_failed_count, 1);
+        assert_eq!(got.replication_stats.resync_canceled_count, 1);
+        assert_eq!(got.replication_stats.resync_duration_ms, 3500);
     }
 
     #[test]

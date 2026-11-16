@@ -17,16 +17,21 @@
 pub const ENV_CORS_ALLOWED_ORIGINS: &str = "RUSTFS_CORS_ALLOWED_ORIGINS";
 
 /// Default CORS allowed origins for the endpoint service
-/// Comes from the console service default
-/// See DEFAULT_CONSOLE_CORS_ALLOWED_ORIGINS
-pub const DEFAULT_CORS_ALLOWED_ORIGINS: &str = DEFAULT_CONSOLE_CORS_ALLOWED_ORIGINS;
+/// Empty means the S3 endpoint emits no generic CORS headers unless configured.
+pub const DEFAULT_CORS_ALLOWED_ORIGINS: &str = "";
 
 /// CORS allowed origins for the console service
 /// Comma-separated list of origins or "*" for all origins
 pub const ENV_CONSOLE_CORS_ALLOWED_ORIGINS: &str = "RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS";
 
-/// Default CORS allowed origins for the console service
-pub const DEFAULT_CONSOLE_CORS_ALLOWED_ORIGINS: &str = "*";
+/// Default CORS allowed origins for the console service.
+///
+/// Empty string means same-origin only — no `Access-Control-Allow-Origin`
+/// header is emitted, so browsers will not allow cross-origin reads of
+/// console responses by default. Operators that need cross-origin access set
+/// `RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS` to a comma-separated allow-list, or
+/// to `*` to keep the previous permissive behavior.
+pub const DEFAULT_CONSOLE_CORS_ALLOWED_ORIGINS: &str = "";
 
 /// Enable or disable the console service
 pub const ENV_CONSOLE_ENABLE: &str = "RUSTFS_CONSOLE_ENABLE";
@@ -64,21 +69,43 @@ pub const ENV_CONSOLE_RATE_LIMIT_RPM: &str = "RUSTFS_CONSOLE_RATE_LIMIT_RPM";
 pub const DEFAULT_CONSOLE_RATE_LIMIT_RPM: u32 = 100;
 
 /// Set the console authentication timeout in seconds
-/// Specifies how long a console authentication session remains valid
+/// Bounds how long the console waits for a single authenticated HTTP request before it is
+/// considered timed out. This is a request timeout, not the session lifetime: the Console
+/// credential lifetime issued by the OIDC callback is `RUSTFS_CONSOLE_OIDC_SESSION_DURATION`.
 /// Default: 3600 seconds (1 hour)
 /// Minimum: 300 seconds (5 minutes)
 /// Maximum: 86400 seconds (24 hours)
 pub const ENV_CONSOLE_AUTH_TIMEOUT: &str = "RUSTFS_CONSOLE_AUTH_TIMEOUT";
 
 /// Default console authentication timeout in seconds
-/// This is the default timeout for console authentication sessions.
-/// After this timeout, users need to re-authenticate to access the console.
+/// This is the default timeout for console authentication requests.
+/// After this timeout, a pending console request is abandoned.
 /// Default value: 3600 seconds (1 hour)
 /// Environment variable: RUSTFS_CONSOLE_AUTH_TIMEOUT
 /// Command line argument: --console-auth-timeout
 /// Example: RUSTFS_CONSOLE_AUTH_TIMEOUT=3600
 /// Example: --console-auth-timeout 3600
 pub const DEFAULT_CONSOLE_AUTH_TIMEOUT: u64 = 3600;
+
+/// Console credential lifetime, in seconds, for Console credentials issued by the OIDC callback.
+///
+/// Process-level, Console-scoped setting: it applies to every OIDC provider and deliberately
+/// lives outside the per-provider `RUSTFS_IDENTITY_OPENID_*` namespace, so it is never
+/// suffix-scanned into a provider id and has no `identity_openid` KVS equivalent. The same value
+/// also sets how long the Console logout token stays valid.
+pub const ENV_CONSOLE_OIDC_SESSION_DURATION: &str = "RUSTFS_CONSOLE_OIDC_SESSION_DURATION";
+
+/// Default Console credential lifetime in seconds, used when the environment variable is unset,
+/// not a positive integer, or zero. Matches the value this path hard-coded before it was
+/// parameterised.
+pub const DEFAULT_CONSOLE_OIDC_SESSION_DURATION_SECS: usize = 3600;
+
+/// Upper bound on the Console credential lifetime in seconds (7 days).
+///
+/// Values above this are clamped with a warning. The bound keeps the moka logout cache's
+/// `time_to_live` well under its 1000-year assertion, and stops an operator from minting an
+/// effectively permanent Console STS credential on every node.
+pub const CONSOLE_OIDC_SESSION_DURATION_MAX_SECS: usize = 604_800;
 
 /// Toggle update check
 /// It controls whether to check for newer versions of rustfs
@@ -89,3 +116,20 @@ pub const ENV_UPDATE_CHECK: &str = "RUSTFS_CHECK_UPDATE";
 
 /// Default value for update toggle
 pub const DEFAULT_UPDATE_CHECK: bool = true;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_cors_default_is_restrictive() {
+        assert_eq!(ENV_CORS_ALLOWED_ORIGINS, "RUSTFS_CORS_ALLOWED_ORIGINS");
+        assert_eq!(DEFAULT_CORS_ALLOWED_ORIGINS, "");
+    }
+
+    #[test]
+    fn console_cors_default_is_same_origin_only() {
+        assert_eq!(ENV_CONSOLE_CORS_ALLOWED_ORIGINS, "RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS");
+        assert_eq!(DEFAULT_CONSOLE_CORS_ALLOWED_ORIGINS, "");
+    }
+}

@@ -13,23 +13,154 @@
 // limitations under the License.
 
 //! Core FTPS tests
+//!
+//! # Security regression coverage
+//!
+//! GHSA-3p3x-734c-h5vx (constant-time secret comparison on the WebDAV/FTPS
+//! password login path, fixed in rustfs/rustfs#4403) is anchored end-to-end
+//! by [`assert_ftps_ghsa_3p3x_wrong_credentials_rejected`], invoked from
+//! [`test_ftps_core_operations`]. It exercises the `ct_eq` rejection branch in
+//! `FtpsAuthenticator::authenticate` (`crates/protocols/src/ftps/server.rs`),
+//! proving that a wrong password and an unknown user are both rejected and are
+//! indistinguishable at the protocol layer (both return FTP `530 Not logged
+//! in`). The sibling WebDAV assertion lives in `webdav_core.rs`; the internode
+//! RPC fail-closed advisory (GHSA-r5qv-rc46-hv8q, rustfs/rustfs#4402) is
+//! anchored by the `ghsa_r5qv_*` unit tests in
+//! `crates/ecstore/src/cluster/rpc/http_auth.rs`. See
+//! `docs/testing/security-regressions.md` for the full advisory -> test map.
+//!
+//! Advisory: <https://github.com/rustfs/rustfs/security/advisories/GHSA-3p3x-734c-h5vx>
 
-use crate::common::rustfs_binary_path;
+use crate::common::rustfs_binary_path_with_features;
 use crate::protocols::test_env::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, ProtocolTestEnvironment};
 use anyhow::Result;
 use rcgen::generate_simple_self_signed;
-use rustls::{ClientConfig, RootCertStore, pki_types::CertificateDer, pki_types::pem::PemObject};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::Arc;
-use suppaftp::RustlsConnector;
-use suppaftp::RustlsFtpStream;
+use suppaftp::types::Response;
+use suppaftp::{FtpError, RustlsConnector, RustlsFtpStream, Status};
 use tokio::process::Command;
 use tracing::info;
 
 // Fixed FTPS port for testing
 const FTPS_PORT: u16 = 9021;
 const FTPS_ADDRESS: &str = "127.0.0.1:9021";
+
+#[derive(Debug)]
+struct AcceptAnyServerCertVerifier;
+
+impl ServerCertVerifier for AcceptAnyServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, RustlsError> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Open a fresh, unauthenticated FTPS control connection to the test server
+/// and upgrade it to TLS. The caller is responsible for logging in.
+///
+/// Assumes the process-wide rustls crypto provider has already been installed
+/// (done once at the top of [`test_ftps_core_operations`]).
+fn ftps_connect_secure() -> Result<RustlsFtpStream> {
+    let config = ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCertVerifier))
+        .with_no_client_auth();
+
+    let tls_connector = RustlsConnector::from(Arc::new(config));
+
+    let ftp_stream = RustlsFtpStream::connect(FTPS_ADDRESS).map_err(|e| anyhow::anyhow!("Failed to connect: {}", e))?;
+
+    ftp_stream
+        .into_secure(tls_connector, "127.0.0.1")
+        .map_err(|e| anyhow::anyhow!("Failed to upgrade to TLS: {}", e))
+}
+
+/// Extract the FTP reply status from a failed login, asserting the failure is a
+/// protocol-level rejection (`FtpError::UnexpectedResponse`) rather than a
+/// transport error.
+fn login_rejection_status(user: &str, password: &str) -> Result<Status> {
+    let mut ftp_stream = ftps_connect_secure()?;
+    match ftp_stream.login(user, password) {
+        Ok(()) => anyhow::bail!("login unexpectedly succeeded for user '{user}'"),
+        Err(FtpError::UnexpectedResponse(Response { status, .. })) => Ok(status),
+        Err(other) => anyhow::bail!("expected a protocol rejection, got transport error: {other}"),
+    }
+}
+
+/// Security regression for GHSA-3p3x-734c-h5vx.
+///
+/// FTPS password verification must reject invalid credentials via the
+/// constant-time `ct_eq` branch in `FtpsAuthenticator::authenticate`
+/// (`crates/protocols/src/ftps/server.rs`, fixed in rustfs/rustfs#4403). This
+/// asserts, purely on behavior (no timing assertions):
+///
+/// 1. A valid user with a wrong password is rejected (`530`), exercising the
+///    secret-mismatch branch that the advisory hardened.
+/// 2. An unknown user is rejected (`530`).
+/// 3. The two failures are indistinguishable at the protocol layer — both
+///    return the same FTP status, so an attacker cannot use the reply code to
+///    tell "user exists, wrong password" from "no such user".
+async fn assert_ftps_ghsa_3p3x_wrong_credentials_rejected() -> Result<()> {
+    info!("Testing FTPS (GHSA-3p3x): wrong password is rejected");
+    let wrong_password_status = login_rejection_status(DEFAULT_ACCESS_KEY, "definitely-not-the-secret")?;
+    assert_eq!(
+        wrong_password_status,
+        Status::NotLoggedIn,
+        "valid user + wrong password must be rejected with 530, got {wrong_password_status:?}"
+    );
+    info!("PASS: FTPS wrong password rejected with 530");
+
+    info!("Testing FTPS (GHSA-3p3x): unknown user is rejected");
+    let unknown_user_status = login_rejection_status("no-such-access-key", DEFAULT_SECRET_KEY)?;
+    assert_eq!(
+        unknown_user_status,
+        Status::NotLoggedIn,
+        "unknown user must be rejected with 530, got {unknown_user_status:?}"
+    );
+    info!("PASS: FTPS unknown user rejected with 530");
+
+    assert_eq!(
+        wrong_password_status, unknown_user_status,
+        "invalid-user and invalid-password failures must be indistinguishable at the protocol layer"
+    );
+    info!("PASS: FTPS invalid-user and invalid-password failures are indistinguishable");
+    Ok(())
+}
 
 /// Test FTPS: put, ls, mkdir, rmdir, delete operations
 pub async fn test_ftps_core_operations() -> Result<()> {
@@ -58,8 +189,9 @@ pub async fn test_ftps_core_operations() -> Result<()> {
 
     // Start server manually
     info!("Starting FTPS server on {}", FTPS_ADDRESS);
-    let binary_path = rustfs_binary_path();
+    let binary_path = rustfs_binary_path_with_features(Some("ftps,webdav"));
     let mut server_process = Command::new(&binary_path)
+        .env("RUSTFS_CONSOLE_ENABLE", "false")
         .env("RUSTFS_FTPS_ENABLE", "true")
         .env("RUSTFS_FTPS_ADDRESS", FTPS_ADDRESS)
         .env("RUSTFS_FTPS_CERTS_DIR", cert_dir.to_str().unwrap())
@@ -73,36 +205,18 @@ pub async fn test_ftps_core_operations() -> Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-        // Build ServerConfig with SNI support
+        // Install the default crypto provider once for this process before any
+        // TLS handshake. Subsequent connections reuse it via `ftps_connect_secure`.
         rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
             .map_err(|e| anyhow::anyhow!("Failed to install crypto provider: {:?}", e))?;
 
-        // Create a simple rustls config that accepts any certificate for testing
-        let mut root_store = RootCertStore::empty();
-        // Add the self-signed certificate to the trust store for e2e
-        // Note: In a real environment, you'd use proper root certificates
-        let cert_pem = default_cert.cert.pem();
-        let cert_der = CertificateDer::pem_reader_iter(&mut Cursor::new(cert_pem))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| anyhow::anyhow!("Failed to parse cert: {}", e))?;
+        // Security regression (GHSA-3p3x-734c-h5vx): wrong credentials must be
+        // rejected before any successful login is attempted below.
+        assert_ftps_ghsa_3p3x_wrong_credentials_rejected().await?;
 
-        root_store.add_parsable_certificates(cert_der);
-
-        let config = ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-
-        // Wrap in suppaftp's RustlsConnector
-        let tls_connector = RustlsConnector::from(Arc::new(config));
-
-        // Connect to FTPS server
-        let ftp_stream = RustlsFtpStream::connect(FTPS_ADDRESS).map_err(|e| anyhow::anyhow!("Failed to connect: {}", e))?;
-
-        // Upgrade to secure connection
-        let mut ftp_stream = ftp_stream
-            .into_secure(tls_connector, "127.0.0.1")
-            .map_err(|e| anyhow::anyhow!("Failed to upgrade to TLS: {}", e))?;
+        // Connect and log in with valid credentials for the functional flow.
+        let mut ftp_stream = ftps_connect_secure()?;
         ftp_stream.login(DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY)?;
 
         info!("Testing FTPS: mkdir bucket");

@@ -114,7 +114,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let mut tags = HashMap::new();
                     tags.insert("environment".to_string(), "demo".to_string());
                     tags.insert("purpose".to_string(), "testing".to_string());
-                    tags.insert("backend".to_string(), "vault".to_string());
+                    tags.insert("backend".to_string(), "vault-kv2".to_string());
                     tags
                 },
                 origin: Some("demo2.rs".to_string()),
@@ -263,10 +263,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Step 12: Check cache statistics
     println!("12. Checking cache statistics...");
-    if let Some((hits, misses)) = encryption_service.cache_stats().await {
+    if let Some(stats) = encryption_service.cache_stats().await {
         println!("   ✓ Cache statistics:");
-        println!("     - Cache hits: {}", hits);
-        println!("     - Cache misses: {}\n", misses);
+        println!("     - Cached entries: {}", stats.entries);
+        println!("     - Cache hits: {}", stats.hits);
+        println!("     - Cache misses: {}", stats.misses);
+        println!("     - Entries evicted: {}\n", stats.evictions);
     } else {
         println!("   - Cache is disabled\n");
     }

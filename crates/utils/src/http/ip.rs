@@ -20,18 +20,20 @@ use std::str::FromStr;
 use std::sync::LazyLock;
 
 /// De-facto standard header keys.
-const X_FORWARDED_FOR: &str = "x-forwarded-for";
-const X_FORWARDED_PROTO: &str = "x-forwarded-proto";
-const X_FORWARDED_SCHEME: &str = "x-forwarded-scheme";
-const X_REAL_IP: &str = "x-real-ip";
+pub const X_FORWARDED_FOR: &str = "x-forwarded-for";
+pub const X_FORWARDED_PROTO: &str = "x-forwarded-proto";
+pub const X_FORWARDED_SCHEME: &str = "x-forwarded-scheme";
+pub const X_REAL_IP: &str = "x-real-ip";
 
 /// RFC7239 defines a new "Forwarded: " header designed to replace the
 /// existing use of X-Forwarded-* headers.
 /// e.g. Forwarded: for=192.0.2.60;proto=https;by=203.0.113.43
 const FORWARDED: &str = "forwarded";
 
-static FOR_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)(?:for=)([^(;|,| )]+)(.*)").unwrap());
-static PROTO_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^(;|,| )+(?:proto=)(https|http)").unwrap());
+static FOR_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)(?:for=)([^(;|,| )]+)(.*)").expect("operation should succeed"));
+static PROTO_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^(;|,| )+(?:proto=)(https|http)").expect("operation should succeed"));
 
 /// Used to disable all processing of the X-Forwarded-For header in source IP discovery.
 ///

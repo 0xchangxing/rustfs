@@ -8,11 +8,7 @@
 # - Intentionally unsupported by product decision (for example ACL authorization)
 
 # Vendor-specific / non-portable tests
-test_100_continue_error_retry
 test_account_usage
-test_atomic_conditional_write_1mb
-test_atomic_dual_conditional_write_1mb
-test_atomic_write_bucket_gone
 test_bucket_get_location
 test_bucket_head_extended
 test_bucket_header_acl_grants
@@ -122,19 +118,12 @@ test_bucket_policy_get_obj_existing_tag
 test_bucket_policy_get_obj_tagging_existing_tag
 test_bucket_policy_put_obj_copy_source
 test_bucket_policy_put_obj_copy_source_meta
-test_bucket_policy_put_obj_kms_noenc
 test_bucket_policy_put_obj_request_obj_tag
-test_bucket_policy_put_obj_s3_incorrect_algo_sse_s3
-test_bucket_policy_put_obj_s3_noenc
 test_bucket_policy_put_obj_tagging_existing_tag
 test_bucket_policy_set_condition_operator_end_with_IfExists
 test_bucket_policy_upload_part_copy
 test_bucket_recreate_new_acl
 test_bucket_recreate_overwrite_acl
-test_copy_object_ifmatch_failed
-test_copy_object_ifmatch_good
-test_copy_object_ifnonematch_failed
-test_copy_object_ifnonematch_good
 test_cors_presigned_get_object_tenant_v2
 test_cors_presigned_get_object_v2
 test_cors_presigned_put_object_tenant_v2
@@ -164,38 +153,26 @@ test_delete_objects_if_match_size
 test_delete_objects_version_if_match
 test_delete_objects_version_if_match_last_modified_time
 test_delete_objects_version_if_match_size
-test_delete_tags_obj_public
-test_encrypted_transfer_13b
-test_encrypted_transfer_1MB
-test_encrypted_transfer_1b
-test_encrypted_transfer_1kb
-test_encryption_sse_c_deny_algo_with_bucket_policy
-test_encryption_sse_c_enforced_with_bucket_policy
-test_encryption_sse_c_multipart_invalid_chunks_1
-test_encryption_sse_c_multipart_invalid_chunks_2
-test_encryption_sse_c_multipart_upload
-test_encryption_sse_c_post_object_authenticated_request
-test_encryption_sse_c_unaligned_multipart_upload
-test_expected_bucket_owner
 test_get_multipart_checksum_object_attributes
-test_get_multipart_object_attributes
-test_get_obj_tagging
-test_get_object_attributes
-test_get_paginated_multipart_object_attributes
-test_get_single_multipart_object_attributes
-test_get_sse_c_encrypted_object_attributes
-test_get_tags_acl_public
 test_head_bucket_usage
-test_lifecycle_cloud_multiple_transition
-test_lifecycle_cloud_transition
-test_lifecycle_cloud_transition_large_obj
-test_lifecycle_deletemarker_expiration
+# -----------------------------------------------------------------------------
+# Lifecycle behavior (backlog#1148 ilm-10, master plan #1155)
+#
+# The upstream "Vendor-specific" label on these was inaccurate: the real blocker
+# was the absence of a Ceph `lc_debug_interval` equivalent, so Days>=1 expiration
+# behavior could not be exercised in seconds. RUSTFS_ILM_DEBUG_DAY_SECS (ilm-5)
+# now provides that. The first batch of expiration tests has been moved into the
+# dedicated behavior lane: scripts/s3-tests/lifecycle_behavior_tests.txt
+# (run by the ci.yml job `s3-lifecycle-behavior-tests`). The entries below are
+# NOT vendor-specific — they stay excluded from the DEFAULT single-server gate
+# for the specific reasons noted, and are queued for later batches.
+#
+# --- Batch 2 candidates: expiration with tag / size filters + noncurrent counts.
+#     These need the same debug/scanner lane as batch 1 plus tag/size-filter and
+#     NewerNoncurrentVersions coverage (see ilm-9). Queued for ilm-10 batch 2.
+#     tags1 sends Prefix and Tag as sibling Filter predicates instead of And;
+#     AWS also rejects that malformed request, so it is not a compatibility gate.
 test_lifecycle_deletemarker_expiration_with_days_tag
-test_lifecycle_expiration
-test_lifecycle_expiration_date
-test_lifecycle_expiration_header_and_tags_head
-test_lifecycle_expiration_header_head
-test_lifecycle_expiration_header_tags_head
 test_lifecycle_expiration_newer_noncurrent
 test_lifecycle_expiration_noncur_tags1
 test_lifecycle_expiration_size_gt
@@ -203,74 +180,39 @@ test_lifecycle_expiration_size_lt
 test_lifecycle_expiration_tags1
 test_lifecycle_expiration_tags2
 test_lifecycle_expiration_versioned_tags2
-test_lifecycle_expiration_versioning_enabled
-test_lifecycle_multipart_expiration
-test_lifecycle_noncur_cloud_transition
-test_lifecycle_noncur_expiration
+#
+# --- Storage-class transition to a remote/warm tier. Needs a real tier backend
+#     (the hermetic second-RustFS cold layer from ilm-7) which is not wired into
+#     the s3-tests topology. Queued behind ilm-7.
 test_lifecycle_noncur_transition
 test_lifecycle_transition
+#
+# --- Single-rule multi-level Transition (hot->warm->cold). RustFS only honors
+#     transitions.first() (core.rs:676); multi-level semantics are undecided and
+#     tracked as a product item (ex-ilm-20). Do not enable until that lands.
 test_lifecycle_transition_single_rule_multi_trans
-test_lifecyclev2_expiration
+#
+# --- Cloud (S3/remote) transition + restore. Requires the [s3 cloud] endpoint
+#     the RustFS SNSD harness does not provision; depends on ilm-7 tier carrier.
+test_lifecycle_cloud_multiple_transition
+test_lifecycle_cloud_transition
+test_lifecycle_cloud_transition_large_obj
+test_lifecycle_noncur_cloud_transition
+# -----------------------------------------------------------------------------
 test_list_buckets_anonymous
 test_list_buckets_paginated
-test_list_multipart_upload
 test_list_multipart_upload_owner
-test_multipart_checksum_sha256
-test_multipart_copy_multiple_sizes
-test_multipart_copy_versioned
 test_multipart_get_part
-test_multipart_put_current_object_if_match
-test_multipart_put_current_object_if_none_match
-test_multipart_put_object_if_match
 test_multipart_single_get_part
 test_multipart_sse_c_get_part
 test_multipart_upload
-test_multipart_upload_contents
-test_multipart_upload_resend_part
 test_multipart_upload_small
 test_multipart_use_cksum_helper_crc32
 test_multipart_use_cksum_helper_crc32c
 test_multipart_use_cksum_helper_crc64nvme
 test_multipart_use_cksum_helper_sha1
 test_multipart_use_cksum_helper_sha256
-test_non_multipart_get_part
-test_non_multipart_sse_c_get_part
-test_object_copy_canned_acl
 test_object_header_acl_grants
-test_object_lock_changing_mode_from_compliance
-test_object_lock_changing_mode_from_governance_with_bypass
-test_object_lock_changing_mode_from_governance_without_bypass
-test_object_lock_delete_multipart_object_with_legal_hold_on
-test_object_lock_delete_multipart_object_with_retention
-test_object_lock_delete_object_with_legal_hold_off
-test_object_lock_delete_object_with_legal_hold_on
-test_object_lock_delete_object_with_retention
-test_object_lock_delete_object_with_retention_and_marker
-test_object_lock_get_legal_hold
-test_object_lock_get_obj_lock
-test_object_lock_get_obj_metadata
-test_object_lock_get_obj_retention
-test_object_lock_get_obj_retention_iso8601
-test_object_lock_multi_delete_object_with_retention
-test_object_lock_put_legal_hold
-test_object_lock_put_legal_hold_invalid_status
-test_object_lock_put_obj_lock
-test_object_lock_put_obj_lock_invalid_days
-test_object_lock_put_obj_lock_invalid_mode
-test_object_lock_put_obj_lock_invalid_status
-test_object_lock_put_obj_lock_invalid_years
-test_object_lock_put_obj_lock_with_days_and_years
-test_object_lock_put_obj_retention
-test_object_lock_put_obj_retention_increase_period
-test_object_lock_put_obj_retention_invalid_mode
-test_object_lock_put_obj_retention_override_default_retention
-test_object_lock_put_obj_retention_shorten_period
-test_object_lock_put_obj_retention_shorten_period_bypass
-test_object_lock_put_obj_retention_versionid
-test_object_lock_suspend_versioning
-test_object_lock_uploading_obj
-test_object_raw_get_x_amz_expires_not_expired
-test_object_raw_get_x_amz_expires_not_expired_tenant
 test_object_raw_get_x_amz_expires_out_max_range
 test_object_raw_get_x_amz_expires_out_positive_range
 test_object_raw_put_authenticated_expired
@@ -282,7 +224,6 @@ test_post_object_invalid_date_format
 test_post_object_invalid_request_field_value
 test_post_object_missing_policy_condition
 test_post_object_request_missing_policy_specified_field
-test_post_object_set_key_from_filename
 test_post_object_success_redirect_action
 test_post_object_tags_anonymous_request
 test_post_object_wrong_bucket
@@ -295,54 +236,13 @@ test_put_bucket_logging_tenant_s
 test_put_bucket_ownership_bucket_owner_enforced
 test_put_bucket_ownership_bucket_owner_preferred
 test_put_bucket_ownership_object_writer
-test_put_current_object_if_match
-test_put_current_object_if_none_match
-test_put_delete_tags
-test_put_max_tags
-test_put_modify_tags
-test_put_obj_with_tags
 test_put_object_current_if_match
-test_put_object_if_match
-test_put_tags_acl_public
-test_ranged_big_request_response_code
-test_ranged_request_response_code
-test_ranged_request_return_trailing_bytes_response_code
-test_ranged_request_skip_leading_bytes_response_code
 test_read_through
 test_restore_noncur_obj
 test_restore_object_permanent
 test_restore_object_temporary
-test_sse_kms_default_post_object_authenticated_request
-test_sse_kms_default_upload_1b
-test_sse_kms_default_upload_1kb
-test_sse_kms_default_upload_1mb
-test_sse_kms_default_upload_8mb
-test_sse_kms_method_head
-test_sse_kms_multipart_invalid_chunks_1
-test_sse_kms_multipart_invalid_chunks_2
-test_sse_kms_multipart_upload
 test_sse_kms_post_object_authenticated_request
-test_sse_kms_present
-test_sse_kms_transfer_13b
-test_sse_kms_transfer_1MB
-test_sse_kms_transfer_1b
-test_sse_kms_transfer_1kb
-test_sse_s3_default_method_head
-test_sse_s3_default_multipart_upload
-test_sse_s3_default_post_object_authenticated_request
-test_sse_s3_default_upload_1b
-test_sse_s3_default_upload_1kb
-test_sse_s3_default_upload_1mb
-test_sse_s3_default_upload_8mb
-test_sse_s3_encrypted_upload_1b
-test_sse_s3_encrypted_upload_1kb
-test_sse_s3_encrypted_upload_1mb
-test_sse_s3_encrypted_upload_8mb
 test_versioned_object_acl_no_version_specified
-test_versioning_copy_obj_version
-test_versioning_multi_object_delete_with_marker_create
-test_versioning_obj_create_overwrite_multipart
-test_versioning_obj_suspended_copy
 test_versioning_stack_delete_merkers
 
 # Intentionally unsupported by design: ACL-related tests
@@ -374,22 +274,13 @@ test_access_bucket_publicreadwrite_object_publicreadwrite
 test_object_anon_put_write_access
 test_get_public_acl_bucket_policy_status
 test_get_authpublic_acl_bucket_policy_status
-test_get_publicpolicy_acl_bucket_policy_status
-test_get_nonpublicpolicy_acl_bucket_policy_status
 test_block_public_put_bucket_acls
 test_block_public_object_canned_acls
 test_ignore_public_acls
-test_bucket_policy_acl
-test_bucketv2_policy_acl
-test_bucket_policy_put_obj_acl
-test_object_presigned_put_object_with_acl
-test_object_put_acl_mtime
 test_versioned_object_acl
-test_object_presigned_put_object_with_acl_tenant
 test_bucket_acl_canned
 test_bucket_acl_canned_authenticatedread
 test_bucket_acl_canned_during_create
-test_bucket_acl_canned_private_to_private
 test_bucket_acl_canned_publicreadwrite
 test_bucket_acl_default
 test_bucket_acl_grant_email
@@ -401,7 +292,6 @@ test_bucket_acl_grant_userid_readacp
 test_bucket_acl_grant_userid_write
 test_bucket_acl_grant_userid_writeacp
 test_bucket_acl_revoke_all
-test_bucket_concurrent_set_canned_acl
 test_object_acl
 test_object_acl_canned
 test_object_acl_canned_authenticatedread
@@ -417,9 +307,19 @@ test_object_acl_readacp
 test_object_acl_write
 test_object_acl_writeacp
 test_put_bucket_acl_grant_group_read
-test_object_raw_authenticated_bucket_acl
-test_object_raw_authenticated_object_acl
 test_object_raw_get_bucket_acl
-test_object_raw_get_object_acl
-test_cors_presigned_put_object_with_acl
-test_cors_presigned_put_object_tenant_with_acl
+
+# Require upstream cloud-storage or IAM account services
+test_bucket_logging_requester_assumed_role
+test_lifecycle_cloud_transition_target_by_bucket
+test_lifecycle_cloud_transition_target_by_bucket_multiple_buckets
+test_list_object_versions_restore_status
+test_list_objects_restore_status
+
+# Require per-account bucket ownership across distinct S3 accounts
+# A RustFS deployment owns one bucket namespace and records no bucket owner, so every
+# authorized requester is the bucket's owner: a duplicate CreateBucket returns the
+# legacy 200 in the default region and BucketAlreadyOwnedByYou elsewhere, never
+# BucketAlreadyExists for a second account. The deployment-level behavior is covered by
+# crates/e2e_test/src/create_bucket_region_test.rs.
+test_bucket_create_exists_nonowner

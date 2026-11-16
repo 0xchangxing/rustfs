@@ -18,6 +18,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 
 const S2_INDEX_HEADER: &[u8] = b"s2idx\x00";
 const S2_INDEX_TRAILER: &[u8] = b"\x00xdi2s";
+const LEGACY_INDEX_HEADER_PADDING: &[u8] = &[0, 0, 0];
 const MAX_INDEX_ENTRIES: usize = 1 << 16;
 const MIN_INDEX_DIST: i64 = 1 << 20;
 // const MIN_INDEX_DIST: i64 = 0;
@@ -48,7 +49,6 @@ pub struct IndexInfo {
     pub uncompressed_offset: i64,
 }
 
-#[allow(dead_code)]
 impl Index {
     pub fn new() -> Self {
         Self {
@@ -59,23 +59,23 @@ impl Index {
         }
     }
 
-    #[allow(dead_code)]
-    fn reset(&mut self, max_block: usize) {
-        self.est_block_uncomp = max_block as i64;
-        self.total_compressed = -1;
-        self.total_uncompressed = -1;
-        self.info.clear();
-    }
-
     pub fn len(&self) -> usize {
         self.info.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.info.is_empty()
+    }
+
     fn alloc_infos(&mut self, n: usize) {
-        if n > MAX_INDEX_ENTRIES {
-            panic!("n > MAX_INDEX_ENTRIES");
-        }
-        self.info = Vec::with_capacity(n);
+        debug_assert!(n <= MAX_INDEX_ENTRIES, "n > MAX_INDEX_ENTRIES");
+        self.info = vec![
+            IndexInfo {
+                compressed_offset: 0,
+                uncompressed_offset: 0,
+            };
+            n
+        ];
     }
 
     pub fn add(&mut self, compressed_offset: i64, uncompressed_offset: i64) -> io::Result<()> {
@@ -213,15 +213,14 @@ impl Index {
         self.reduce();
         let init_size = b.len();
 
-        // Add skippable header
-        b.extend_from_slice(&[0x50, 0x2A, 0x4D, 0x18]); // ChunkTypeIndex
-        b.extend_from_slice(&[0, 0, 0]); // Placeholder for chunk length
+        // Add skippable header (1-byte marker + 24-bit length placeholder)
+        b.extend_from_slice(&[0x50, 0x2A, 0x4D, 0x18]); // length is written back into bytes 1..=3
 
         // Add header
         b.extend_from_slice(S2_INDEX_HEADER);
 
         // Add total sizes
-        let mut tmp = [0u8; 8];
+        let mut tmp = [0u8; 10];
         let n = write_varint(&mut tmp, uncomp_total);
         b.extend_from_slice(&tmp[..n]);
         let n = write_varint(&mut tmp, comp_total);
@@ -291,7 +290,7 @@ impl Index {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "buffer too small"));
         }
 
-        if b[0] != 0x50 || b[1] != 0x2A || b[2] != 0x4D || b[3] != 0x18 {
+        if b[0] != 0x50 {
             return Err(io::Error::other("invalid chunk type"));
         }
 
@@ -300,6 +299,10 @@ impl Index {
 
         if b.len() < chunk_len {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "buffer too small"));
+        }
+
+        if b.starts_with(LEGACY_INDEX_HEADER_PADDING) {
+            b = &b[LEGACY_INDEX_HEADER_PADDING.len()..];
         }
 
         if !b.starts_with(S2_INDEX_HEADER) {
@@ -382,12 +385,13 @@ impl Index {
             b = &b[n..];
 
             if idx > 0 {
-                c_predict += c_off / 2;
+                let next_c_predict = c_predict + c_off / 2;
                 let prev = self.info[idx - 1].compressed_offset;
                 c_off += prev + c_predict;
                 if c_off <= prev {
                     return Err(io::Error::other("invalid offset"));
                 }
+                c_predict = next_c_predict;
             }
             if c_off < 0 {
                 return Err(io::Error::other("negative offset"));
@@ -468,75 +472,43 @@ impl Index {
     }
 }
 
-// Helper functions for varint encoding/decoding
-fn write_varint(buf: &mut [u8], mut v: i64) -> usize {
+// Helper functions for signed varint encoding/decoding (ZigZag + LEB128,
+// matching Go binary.PutVarint / binary.Varint used by the S2 index format).
+fn write_varint(buf: &mut [u8], v: i64) -> usize {
+    let mut uv = ((v as u64) << 1) ^ ((v >> 63) as u64);
     let mut n = 0;
-    while v >= 0x80 {
-        buf[n] = (v as u8) | 0x80;
-        v >>= 7;
+    while uv >= 0x80 {
+        buf[n] = (uv as u8) | 0x80;
+        uv >>= 7;
         n += 1;
     }
-    buf[n] = v as u8;
+    buf[n] = uv as u8;
     n + 1
 }
 
 fn read_varint(buf: &[u8]) -> io::Result<(i64, usize)> {
-    let mut result = 0i64;
-    let mut shift = 0;
+    let mut uv = 0u64;
+    let mut shift = 0u32;
     let mut n = 0;
 
     while n < buf.len() {
         let byte = buf[n];
         n += 1;
-        result |= ((byte & 0x7F) as i64) << shift;
+        if n == 10 && byte > 1 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "varint overflow"));
+        }
+        uv |= ((byte & 0x7F) as u64) << shift;
         if byte < 0x80 {
+            let result = ((uv >> 1) as i64) ^ (-((uv & 1) as i64));
             return Ok((result, n));
         }
         shift += 7;
+        if shift >= 64 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "varint overflow"));
+        }
     }
 
     Err(io::Error::new(io::ErrorKind::UnexpectedEof, "unexpected EOF"))
-}
-
-// Helper functions for index header manipulation
-#[allow(dead_code)]
-pub fn remove_index_headers(b: &[u8]) -> Option<&[u8]> {
-    if b.len() < 4 + S2_INDEX_TRAILER.len() {
-        return None;
-    }
-
-    // Skip size
-    let b = &b[4..];
-
-    // Check trailer
-    if !b.starts_with(S2_INDEX_TRAILER) {
-        return None;
-    }
-
-    Some(&b[S2_INDEX_TRAILER.len()..])
-}
-
-#[allow(dead_code)]
-pub fn restore_index_headers(in_data: &[u8]) -> Vec<u8> {
-    if in_data.is_empty() {
-        return Vec::new();
-    }
-
-    let mut b = Vec::with_capacity(4 + S2_INDEX_HEADER.len() + in_data.len() + S2_INDEX_TRAILER.len() + 4);
-    b.extend_from_slice(&[0x50, 0x2A, 0x4D, 0x18]);
-    b.extend_from_slice(S2_INDEX_HEADER);
-    b.extend_from_slice(in_data);
-
-    let total_size = (b.len() + 4 + S2_INDEX_TRAILER.len()) as u32;
-    b.extend_from_slice(&total_size.to_le_bytes());
-    b.extend_from_slice(S2_INDEX_TRAILER);
-
-    let chunk_len = b.len() - 4;
-    b[1] = chunk_len as u8;
-    b[2] = (chunk_len >> 8) as u8;
-    b[3] = (chunk_len >> 16) as u8;
-
-    b
 }
 
 #[cfg(test)]
@@ -680,6 +652,106 @@ mod tests {
         assert!(json_str.contains("\"compressed\": 100"));
         assert!(json_str.contains("\"uncompressed\": 1000"));
         assert!(json_str.contains("\"est_block_uncompressed\": 0"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_index_into_vec_round_trip_via_load() -> io::Result<()> {
+        let mut source = Index::new();
+        source.add(100, 1_000)?;
+        source.add(300, 1_000 + MIN_INDEX_DIST)?;
+        source.add(650, 1_000 + MIN_INDEX_DIST * 2)?;
+
+        let encoded = source.clone().into_vec();
+
+        let mut decoded = Index::new();
+        let rest = decoded.load(encoded.as_ref())?;
+
+        assert!(rest.is_empty());
+        assert_eq!(decoded.total_uncompressed, source.total_uncompressed);
+        assert_eq!(decoded.total_compressed, source.total_compressed);
+        assert_eq!(decoded.info.len(), source.info.len());
+        assert_eq!(decoded.info[0].compressed_offset, source.info[0].compressed_offset);
+        assert_eq!(decoded.info[0].uncompressed_offset, source.info[0].uncompressed_offset);
+        assert_eq!(decoded.info[1].compressed_offset, source.info[1].compressed_offset);
+        assert_eq!(decoded.info[1].uncompressed_offset, source.info[1].uncompressed_offset);
+        assert_eq!(decoded.info[2].compressed_offset, source.info[2].compressed_offset);
+        assert_eq!(decoded.info[2].uncompressed_offset, source.info[2].uncompressed_offset);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_index_load_rejects_invalid_chunk_type_marker() -> io::Result<()> {
+        let mut source = Index::new();
+        source.add(100, 1_000)?;
+        source.add(300, 1_000 + MIN_INDEX_DIST)?;
+        let mut encoded = source.into_vec().to_vec();
+
+        encoded[0] = 0x51;
+
+        let mut decoded = Index::new();
+        let err = decoded
+            .load(encoded.as_slice())
+            .expect_err("invalid marker should be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(err.to_string(), "invalid chunk type");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_index_load_accepts_legacy_zero_padded_header() -> io::Result<()> {
+        let mut source = Index::new();
+        source.add(100, 1_000)?;
+        source.add(300, 1_000 + MIN_INDEX_DIST)?;
+
+        let mut encoded = source.clone().into_vec().to_vec();
+        let chunk_len = (encoded[1] as usize) | ((encoded[2] as usize) << 8) | ((encoded[3] as usize) << 16);
+        let legacy_chunk_len = chunk_len + LEGACY_INDEX_HEADER_PADDING.len();
+
+        encoded[1] = legacy_chunk_len as u8;
+        encoded[2] = (legacy_chunk_len >> 8) as u8;
+        encoded[3] = (legacy_chunk_len >> 16) as u8;
+        encoded.splice(4..4, LEGACY_INDEX_HEADER_PADDING.iter().copied());
+
+        let mut decoded = Index::new();
+        let rest = decoded.load(encoded.as_slice())?;
+
+        assert!(rest.is_empty());
+        assert_eq!(decoded.total_uncompressed, source.total_uncompressed);
+        assert_eq!(decoded.total_compressed, source.total_compressed);
+        assert_eq!(decoded.info.len(), source.info.len());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_index_round_trip_with_negative_compressed_deltas_and_maximum_totals() -> io::Result<()> {
+        let mut source = Index::new();
+        source.est_block_uncomp = 1 << 20;
+        // Compressed blocks much smaller than est_block_uncomp / 2 (512 KiB)
+        // produce negative c_off residuals (-524,088 and -262,144).
+        source.add(0, 0)?;
+        source.add(200, 1 << 20)?;
+        source.add(300, 2 << 20)?;
+        source.add(450, (3 << 20) + 12345)?;
+        // ZigZag + LEB128 needs all 10 bytes for the largest valid signed value.
+        source.total_uncompressed = i64::MAX;
+        source.total_compressed = i64::MAX;
+
+        let encoded = source.clone().into_vec();
+        let mut decoded = Index::new();
+        let rest = decoded.load(encoded.as_ref())?;
+        assert!(rest.is_empty());
+        assert_eq!(decoded.total_uncompressed, source.total_uncompressed);
+        assert_eq!(decoded.total_compressed, source.total_compressed);
+        assert_eq!(decoded.info.len(), source.info.len());
+        for (actual, expected) in decoded.info.iter().zip(source.info.iter()) {
+            assert_eq!(actual.compressed_offset, expected.compressed_offset);
+            assert_eq!(actual.uncompressed_offset, expected.uncompressed_offset);
+        }
 
         Ok(())
     }

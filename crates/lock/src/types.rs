@@ -79,6 +79,23 @@ pub struct LockInfo {
     pub wait_start_time: Option<SystemTime>,
 }
 
+/// Point-in-time lease information exposed by lock clients for diagnostics.
+#[derive(Debug, Clone)]
+pub struct LockLeaseInfo {
+    /// Resource protected by the lock.
+    pub resource: ObjectKey,
+    /// Shared or exclusive lock mode.
+    pub lock_type: LockType,
+    /// Lock owner recorded by the local lock backend.
+    pub owner: String,
+    /// Original acquisition time. Refreshes do not change this value.
+    pub acquired_at: SystemTime,
+    /// Opaque guard identity used to reject stale diagnostic snapshots.
+    pub guard_id: Option<u64>,
+    /// Remaining lease duration derived from the monotonic lease deadline.
+    pub remaining_ttl: Duration,
+}
+
 impl LockInfo {
     /// Check if the lock has expired
     pub fn has_expired(&self) -> bool {
@@ -225,6 +242,15 @@ pub struct LockRequest {
     pub priority: LockPriority,
     /// Deadlock detection
     pub deadlock_detection: bool,
+    /// Suppress warning logs for expected contention failures
+    pub suppress_contention_logs: bool,
+    /// Optional override for the guard heartbeat/refresh interval.
+    ///
+    /// `None` means the holding guard derives an interval from `ttl` (ttl/3). Mainly injected
+    /// by tests to drive very small intervals; `#[serde(default)]` keeps older RPC payloads
+    /// (which never encoded this field) deserializable.
+    #[serde(default)]
+    pub refresh_interval: Option<Duration>,
 }
 
 impl LockRequest {
@@ -240,6 +266,8 @@ impl LockRequest {
             metadata: LockMetadata::default(),
             priority: LockPriority::default(),
             deadlock_detection: false,
+            suppress_contention_logs: false,
+            refresh_interval: None,
         }
     }
 
@@ -270,6 +298,18 @@ impl LockRequest {
     /// Set deadlock detection
     pub fn with_deadlock_detection(mut self, enabled: bool) -> Self {
         self.deadlock_detection = enabled;
+        self
+    }
+
+    /// Suppress warning logs for expected contention failures
+    pub fn with_suppress_contention_logs(mut self, enabled: bool) -> Self {
+        self.suppress_contention_logs = enabled;
+        self
+    }
+
+    /// Override the guard heartbeat/refresh interval (otherwise derived from `ttl`).
+    pub fn with_refresh_interval(mut self, interval: Duration) -> Self {
+        self.refresh_interval = Some(interval);
         self
     }
 }

@@ -12,22 +12,118 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::heal::{ErasureSetHealer, progress::HealProgress, storage::HealStorageAPI};
+use crate::error::{HealErrorClass, classify_heal_error};
+use crate::heal::{
+    DiskError, ErasureSetHealer, HealDiskExt as _,
+    erasure_healer::target_outcomes_complete,
+    outcome::{
+        HealAbortReason, HealDeferredReason, HealExecutionOutcome, HealFailureClass, HealObjectDisposition, HealObjectIdentity,
+        HealObjectKind, HealObjectOutcome, HealObjectReceipt, HealObjectReceiptExt, HealTaskOutcome,
+    },
+    progress::HealProgress,
+    resume::{
+        CheckpointManager, ReplacementPhase, ReplacementTargetIdentity, ResumeManager, replacement_target_identities_match,
+    },
+    storage::{HealBucketUsageBaseline, HealStorageAPI, next_heal_listing_token},
+};
 use crate::{Error, Result};
-use rustfs_common::heal_channel::{HealOpts, HealScanMode};
+use metrics::{counter, histogram};
+use rustfs_common::trace_bus::{TraceEvent, TraceFunc, TraceKind, trace_emit};
+use rustfs_heal_contracts::heal_channel::{DriveState, HealOpts, HealRequestSource, HealScanMode};
+use rustfs_madmin::heal_commands::HealResultItem;
+use rustfs_utils::path::SLASH_SEPARATOR;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::VecDeque,
     future::Future,
-    sync::Arc,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime},
 };
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use super::{BUCKET_META_PREFIX, DATA_USAGE_CACHE_NAME, POOL_META_NAME, RUSTFS_META_BUCKET};
+
+#[cfg(test)]
+pub(crate) struct OutcomeFinishTestHook {
+    pub(crate) task_id: String,
+    pub(crate) reached: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+pub(crate) static OUTCOME_FINISH_TEST_HOOK: std::sync::LazyLock<tokio::sync::Mutex<Option<Arc<OutcomeFinishTestHook>>>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(None));
+
+#[cfg(test)]
+static STORAGE_RECEIPT_TEST_HOOK: std::sync::LazyLock<tokio::sync::Mutex<Option<Arc<OutcomeFinishTestHook>>>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(None));
+
+#[cfg(test)]
+async fn pause_storage_receipt(task_id: &str) {
+    let hook = STORAGE_RECEIPT_TEST_HOOK.lock().await.clone();
+    if let Some(hook) = hook.filter(|hook| hook.task_id == task_id) {
+        hook.reached.notify_one();
+        hook.release.notified().await;
+    }
+}
+
+#[cfg(test)]
+async fn pause_outcome_finish(task_id: &str) {
+    let hook = OUTCOME_FINISH_TEST_HOOK.lock().await.clone();
+    if let Some(hook) = hook.filter(|hook| hook.task_id == task_id) {
+        hook.reached.notify_one();
+        hook.release.notified().await;
+    }
+}
+
+const LOG_COMPONENT_HEAL: &str = "heal";
+const LOG_SUBSYSTEM_TASK: &str = "task";
+const LOG_SUBSYSTEM_OBJECT: &str = "object";
+const EVENT_HEAL_TASK_STATE: &str = "heal_task_state";
+const EVENT_HEAL_OBJECT_STAGE: &str = "heal_object_stage";
+const EVENT_HEAL_OBJECT_MISSING: &str = "heal_object_missing";
+const MAX_RETAINED_HEAL_RESULT_ITEMS: usize = 1024;
+const EVENT_HEAL_OBJECT_RESULT: &str = "heal_object_result";
+pub(super) const MAX_BUCKET_OBJECT_HEAL_RETRIES: u32 = 3;
+const MAX_BUCKET_FAILURE_LOG_SAMPLES: u64 = 5;
+
+/// Emits at `$level`, demoted to `debug!` when `$demote` is true. Keeps
+/// per-object heal work — Object/Metadata/ECDecode tasks queued per
+/// object by MRF/autoheal/scanner loops, and per-object sweep failures past
+/// a sample cap — from amplifying into one info!/warn!/error! line per
+/// object during mass recovery (rustfs/rustfs#5716). Aggregate task kinds
+/// and foreground (admin/internal) requests keep operator-visible levels;
+/// metrics and end-of-sweep summaries carry the aggregate signal for the
+/// demoted paths.
+macro_rules! demote_to_debug_when {
+    ($demote:expr, $level:ident, target: $target:expr, { $($fields:tt)* }) => {
+        if $demote {
+            tracing::debug!(target: $target, $($fields)*);
+        } else {
+            tracing::$level!(target: $target, $($fields)*);
+        }
+    };
+}
+pub(crate) use demote_to_debug_when;
+const EVENT_HEAL_BUCKET_STAGE: &str = "heal_bucket_stage";
+const EVENT_HEAL_BUCKET_RESULT: &str = "heal_bucket_result";
+const EVENT_HEAL_METADATA_STAGE: &str = "heal_metadata_stage";
+const EVENT_HEAL_METADATA_RESULT: &str = "heal_metadata_result";
+const EVENT_HEAL_EC_DECODE_STAGE: &str = "heal_ec_decode_stage";
+const EVENT_HEAL_EC_DECODE_RESULT: &str = "heal_ec_decode_result";
+const EVENT_HEAL_ERASURE_SET_STAGE: &str = "heal_erasure_set_stage";
+const EVENT_HEAL_ERASURE_SET_RESULT: &str = "heal_erasure_set_result";
+
 /// Heal type
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HealType {
+    /// Cluster heal
+    Cluster,
     /// Object heal
     Object {
         bucket: String,
@@ -36,18 +132,73 @@ pub enum HealType {
     },
     /// Bucket heal
     Bucket { bucket: String },
+    /// Prefix heal
+    Prefix { bucket: String, prefix: String },
     /// Erasure Set heal (includes disk format repair)
     ErasureSet { buckets: Vec<String>, set_disk_id: String },
     /// Metadata heal
     Metadata { bucket: String, object: String },
-    /// MRF heal
-    MRF { meta_path: String },
     /// EC decode heal
     ECDecode {
         bucket: String,
         object: String,
         version_id: Option<String>,
     },
+    /// Complete an explicit delete-marker purge on its original erasure set.
+    DeleteMarkerPurge {
+        bucket: String,
+        object: String,
+        version_id: String,
+        purge: rustfs_common::mrf_channel::MrfDeleteMarkerPurge,
+    },
+}
+
+impl HealType {
+    pub(crate) fn kind_label(&self) -> &'static str {
+        match self {
+            Self::Cluster => "cluster",
+            Self::Object { .. } => "object",
+            Self::Bucket { .. } => "bucket",
+            Self::Prefix { .. } => "prefix",
+            Self::ErasureSet { .. } => "erasure_set",
+            Self::Metadata { .. } => "metadata",
+            Self::ECDecode { .. } => "ec_decode",
+            Self::DeleteMarkerPurge { .. } => "delete_marker_purge",
+        }
+    }
+
+    /// Task kinds enqueued at per-object granularity (MRF, autoheal, scanner,
+    /// read-repair loops; the MRF loop queues Object/ECDecode/Metadata
+    /// tasks). Their lifecycle and admission logs stay at `debug!`
+    /// so a recovery loop queuing hundreds of thousands of object heal tasks
+    /// cannot amplify into per-object `info!`/`warn!` lines; aggregate kinds
+    /// (cluster/bucket/prefix/erasure-set) keep operator-visible levels.
+    pub(crate) fn is_per_object(&self) -> bool {
+        matches!(
+            self,
+            Self::Object { .. } | Self::Metadata { .. } | Self::ECDecode { .. } | Self::DeleteMarkerPurge { .. }
+        )
+    }
+}
+
+/// A trailing-slash object-dir candidate whose locked storage read found no
+/// object is a listing artifact, not a missing object.
+pub(crate) fn is_missing_object_dir_heal_result(object: &str, err: &Error) -> bool {
+    object.ends_with(SLASH_SEPARATOR) && err.is_object_absent()
+}
+
+/// Sample cap for per-object failure logs during a sweep: returns true (and
+/// consumes a sample slot) for the first [`MAX_BUCKET_FAILURE_LOG_SAMPLES`]
+/// calls, false afterwards so callers demote the remaining occurrences to
+/// `debug!`. Aggregate failed/skipped counts still surface in end-of-sweep
+/// summaries.
+pub(crate) fn take_failure_log_sample(samples_logged: &mut u64) -> bool {
+    if *samples_logged < MAX_BUCKET_FAILURE_LOG_SAMPLES {
+        *samples_logged = samples_logged.saturating_add(1);
+        true
+    } else {
+        false
+    }
 }
 
 /// Heal priority
@@ -64,8 +215,19 @@ pub enum HealPriority {
     Urgent = 3,
 }
 
+impl HealPriority {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Normal => "normal",
+            Self::High => "high",
+            Self::Urgent => "urgent",
+        }
+    }
+}
+
 /// Heal options
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealOptions {
     /// Scan mode
     pub scan_mode: HealScanMode,
@@ -79,7 +241,10 @@ pub struct HealOptions {
     pub recursive: bool,
     /// Whether to dry run
     pub dry_run: bool,
-    /// Timeout
+    /// Whether to skip namespace locking
+    #[serde(default)]
+    pub no_lock: bool,
+    /// Aggregate execution timeout across recoverable manager retries
     pub timeout: Option<Duration>,
     /// pool index
     pub pool_index: Option<usize>,
@@ -96,10 +261,24 @@ impl Default for HealOptions {
             update_parity: true,
             recursive: false,
             dry_run: false,
-            timeout: Some(Duration::from_secs(300)), // 5 minutes default timeout
+            no_lock: false,
+            timeout: None,
             pool_index: None,
             set_index: None,
         }
+    }
+}
+
+impl HealOptions {
+    pub(crate) fn set_key(&self) -> Option<String> {
+        match (self.pool_index, self.set_index) {
+            (Some(pool), Some(set)) => Some(format!("pool_{pool}_set_{set}")),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn set_metric_label(&self) -> String {
+        self.set_key().unwrap_or_else(|| "global".to_string())
     }
 }
 
@@ -110,7 +289,9 @@ pub enum HealTaskStatus {
     Pending,
     /// Running
     Running,
-    /// Completed
+    /// Retrying after a recoverable failure
+    Retrying { error: String, retry_attempt: u32 },
+    /// Execution completed; the outcome and durable MRF ledger retain any unverified responsibility.
     Completed,
     /// Failed
     Failed { error: String },
@@ -120,6 +301,26 @@ pub enum HealTaskStatus {
     Timeout,
 }
 
+#[derive(Debug)]
+pub(crate) struct BatchHealFailure {
+    pub(crate) scope: String,
+    pub(crate) failed: u64,
+    pub(crate) retryable: u64,
+    pub(crate) permanent: u64,
+    pub(crate) first_object: String,
+    pub(crate) first_error: String,
+}
+
+impl std::fmt::Display for BatchHealFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Heal batch failed for {}: {} failed ({} retryable, {} permanent); first failure at {}: {}",
+            self.scope, self.failed, self.retryable, self.permanent, self.first_object, self.first_error
+        )
+    }
+}
+
 /// Heal request
 #[derive(Debug, Clone)]
 pub struct HealRequest {
@@ -127,22 +328,49 @@ pub struct HealRequest {
     pub id: String,
     /// Heal type
     pub heal_type: HealType,
+    /// Admission identity for an explicit administrator bucket heal. Never rebound on replay.
+    pub bucket_incarnation_id: Option<Uuid>,
+    /// Source bucket generation captured for a durable MRF object repair.
+    /// Unlike the admin admission fence above, this must survive queueing and
+    /// retries so execution cannot target a later bucket incarnation.
+    pub expected_mrf_bucket_incarnation_id: Option<Uuid>,
     /// Heal options
     pub options: HealOptions,
     /// Priority
     pub priority: HealPriority,
+    /// Origin of the request for operational status.
+    pub source: HealRequestSource,
+    /// Whether this request should bypass queue admission dedup/full policies.
+    pub force_start: bool,
+    /// Number of recoverable retry attempts already scheduled for this request.
+    pub retry_attempts: u32,
+    /// Endpoints of the disks being rebuilt by an erasure-set heal. Used to
+    /// write per-disk healing markers so `DiskInfo.healing` reflects reality;
+    /// empty when the trigger doesn't know the specific disks (admin API,
+    /// unclean-shutdown verification).
+    pub heal_endpoints: Vec<String>,
     /// Created time
     pub created_at: SystemTime,
+    /// Queue admission time used for scheduler delay metrics
+    pub enqueued_at: SystemTime,
 }
 
 impl HealRequest {
     pub fn new(heal_type: HealType, options: HealOptions, priority: HealPriority) -> Self {
+        let now = SystemTime::now();
         Self {
             id: Uuid::new_v4().to_string(),
             heal_type,
+            bucket_incarnation_id: None,
+            expected_mrf_bucket_incarnation_id: None,
             options,
             priority,
-            created_at: SystemTime::now(),
+            source: HealRequestSource::Internal,
+            force_start: false,
+            retry_attempts: 0,
+            heal_endpoints: Vec::new(),
+            created_at: now,
+            enqueued_at: now,
         }
     }
 
@@ -180,19 +408,73 @@ impl HealRequest {
 }
 
 /// Heal task
+/// Incremental view over a task's retained result items (HS-06).
+///
+/// `next_seq` is the cursor a client should pass on its next poll; `min_seq`
+/// is the oldest sequence still retained; `lagged` means the client's cursor
+/// fell behind `min_seq` and items were skipped — the client should restart
+/// from `min_seq`.
+#[derive(Debug, Clone)]
+pub struct HealResultWindow {
+    pub items: Vec<HealResultItem>,
+    pub next_seq: u64,
+    pub min_seq: u64,
+    pub lagged: bool,
+}
+
+#[derive(Clone)]
 pub struct HealTask {
     /// Task ID
     pub id: String,
     /// Heal type
     pub heal_type: HealType,
+    pub bucket_incarnation_id: Option<Uuid>,
+    pub expected_mrf_bucket_incarnation_id: Option<Uuid>,
     /// Heal options
     pub options: HealOptions,
+    /// Priority inherited from the request
+    pub priority: HealPriority,
+    /// Origin inherited from the request
+    pub source: HealRequestSource,
+    /// Number of recoverable retry attempts already scheduled for this task.
+    pub retry_attempts: u32,
+    /// Endpoints of the disks being rebuilt (see `HealRequest::heal_endpoints`).
+    pub heal_endpoints: Vec<String>,
+    /// Durable resume anchor injected by the manager for an existing automatic
+    /// replacement generation.
+    replacement_resume_endpoint: Option<String>,
+    replacement_resume_disk: Arc<RwLock<Option<crate::heal::DiskStore>>>,
+    replacement_execution: Arc<RwLock<Option<Arc<super::storage::ReplacementExecution>>>>,
+    replacement_running: Arc<AtomicBool>,
+    replacement_start_retry_count: Arc<AtomicU32>,
+    /// Set when the locked storage read classified the single target as absent.
+    object_absent: Arc<AtomicBool>,
+    /// The first resolved incarnation belongs to this task even if storage
+    /// fails or the bucket is recreated before its terminal outcome is recorded.
+    single_object_incarnation: Arc<OnceLock<Option<Uuid>>>,
     /// Task status
     pub status: Arc<RwLock<HealTaskStatus>>,
     /// Progress tracking
     pub progress: Arc<RwLock<HealProgress>>,
+    outcome: Arc<RwLock<HealTaskOutcome>>,
+    admin_recovery: Option<Arc<super::manager::root_recovery::RootHealRecovery>>,
+    /// Result items collected from storage heal calls, each stamped with a
+    /// monotonically increasing sequence number for incremental consumption
+    /// (the client passes the last seen seq back and receives only newer
+    /// items; see `get_result_items_since`).
+    pub result_items: Arc<RwLock<VecDeque<(u64, HealResultItem)>>>,
+    /// Next sequence number to assign; starts at 1.
+    next_item_seq: Arc<AtomicU64>,
+    /// Sequence number of the oldest item still inside the retention window;
+    /// equals `next_item_seq` while the window is empty.
+    min_available_seq: Arc<AtomicU64>,
+    result_items_truncated: Arc<AtomicBool>,
+    batch_failure: Arc<RwLock<Option<BatchHealFailure>>>,
+    batch_failure_recorded: Arc<AtomicBool>,
     /// Created time
     pub created_at: SystemTime,
+    /// Queue admission time
+    pub enqueued_at: SystemTime,
     /// Started time
     pub started_at: Arc<RwLock<Option<SystemTime>>>,
     /// Completed time
@@ -203,23 +485,352 @@ pub struct HealTask {
     pub cancel_token: tokio_util::sync::CancellationToken,
     /// Storage layer interface
     pub storage: Arc<dyn HealStorageAPI>,
+    mainline_pacer: Option<super::pacing::ForegroundPacing>,
 }
 
 impl HealTask {
+    async fn verify_replacement_identity_fence(
+        &self,
+        expected_identities: &[ReplacementTargetIdentity],
+        set_disk_id: &str,
+        stage: &str,
+    ) -> Result<()> {
+        let actual_identities = self
+            .await_with_control(self.storage.replacement_target_identities(&self.heal_endpoints))
+            .await?;
+        if replacement_target_identities_match(expected_identities, &actual_identities) {
+            return Ok(());
+        }
+
+        Err(Error::TaskExecutionFailed {
+            message: format!("Replacement target changed during {stage} for automatic heal {set_disk_id}"),
+        })
+    }
+
     pub fn from_request(request: HealRequest, storage: Arc<dyn HealStorageAPI>) -> Self {
         Self {
             id: request.id,
             heal_type: request.heal_type,
+            bucket_incarnation_id: request.bucket_incarnation_id,
+            expected_mrf_bucket_incarnation_id: request.expected_mrf_bucket_incarnation_id,
             options: request.options,
+            priority: request.priority,
+            source: request.source,
+            retry_attempts: request.retry_attempts,
+            heal_endpoints: request.heal_endpoints,
+            replacement_resume_endpoint: None,
+            replacement_resume_disk: Arc::new(RwLock::new(None)),
+            replacement_execution: Arc::new(RwLock::new(None)),
+            replacement_running: Arc::new(AtomicBool::new(false)),
+            replacement_start_retry_count: Arc::new(AtomicU32::new(0)),
+            object_absent: Arc::new(AtomicBool::new(false)),
+            single_object_incarnation: Arc::new(OnceLock::new()),
             status: Arc::new(RwLock::new(HealTaskStatus::Pending)),
             progress: Arc::new(RwLock::new(HealProgress::new())),
+            result_items: Arc::new(RwLock::new(VecDeque::with_capacity(MAX_RETAINED_HEAL_RESULT_ITEMS))),
+            next_item_seq: Arc::new(AtomicU64::new(1)),
+            min_available_seq: Arc::new(AtomicU64::new(1)),
+            result_items_truncated: Arc::new(AtomicBool::new(false)),
+            batch_failure: Arc::new(RwLock::new(None)),
+            batch_failure_recorded: Arc::new(AtomicBool::new(false)),
+            outcome: Arc::new(RwLock::new(HealTaskOutcome::default())),
+            admin_recovery: None,
             created_at: request.created_at,
+            enqueued_at: request.enqueued_at,
             started_at: Arc::new(RwLock::new(None)),
             completed_at: Arc::new(RwLock::new(None)),
             task_start_instant: Arc::new(RwLock::new(None)),
             cancel_token: tokio_util::sync::CancellationToken::new(),
             storage,
+            mainline_pacer: None,
         }
+    }
+
+    pub fn retry_request(&self) -> HealRequest {
+        HealRequest {
+            id: self.id.clone(),
+            heal_type: self.heal_type.clone(),
+            bucket_incarnation_id: self.bucket_incarnation_id,
+            expected_mrf_bucket_incarnation_id: self.expected_mrf_bucket_incarnation_id,
+            options: self.options.clone(),
+            priority: self.priority,
+            source: self.source,
+            force_start: false,
+            retry_attempts: self.retry_attempts.saturating_add(1),
+            heal_endpoints: self.heal_endpoints.clone(),
+            created_at: self.created_at,
+            enqueued_at: SystemTime::now(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn set_execution_elapsed_for_test(&self, elapsed: Duration) {
+        *self.task_start_instant.write().await = Some(Instant::now() - elapsed);
+    }
+
+    pub(crate) async fn retry_request_with_remaining_timeout(&self) -> Result<HealRequest> {
+        let mut request = self.retry_request();
+        if self.options.timeout.is_some() {
+            request.options.timeout = self.remaining_timeout().await?;
+        }
+        Ok(request)
+    }
+
+    pub(crate) fn from_replacement_recovery_request(
+        request: HealRequest,
+        storage: Arc<dyn HealStorageAPI>,
+        replacement_resume_endpoint: Option<String>,
+    ) -> Self {
+        let mut task = Self::from_request(request, storage);
+        task.replacement_resume_endpoint = replacement_resume_endpoint;
+        task
+    }
+
+    pub(crate) fn with_mainline_pacer(mut self, pacer: Option<super::pacing::ForegroundPacing>) -> Self {
+        self.mainline_pacer = pacer;
+        self
+    }
+
+    pub(crate) fn with_admin_recovery(mut self, recovery: Arc<super::manager::root_recovery::RootHealRecovery>) -> Self {
+        self.admin_recovery = Some(recovery);
+        self
+    }
+
+    async fn pace_mainline(&self) -> Result<()> {
+        if let Some(pacer) = &self.mainline_pacer {
+            self.await_with_control(pacer.wait(&self.cancel_token)).await?;
+        }
+        Ok(())
+    }
+
+    pub fn metric_type_label(&self) -> &'static str {
+        self.heal_type.kind_label()
+    }
+
+    pub(super) async fn restore_outcome(&self, mut outcome: HealTaskOutcome) {
+        let mut current = self.outcome.write().await;
+        if self.cancel_token.is_cancelled() || current.execution == HealExecutionOutcome::Aborted(HealAbortReason::Cancelled) {
+            outcome.finish(Some(HealAbortReason::Cancelled));
+        }
+        *current = outcome;
+    }
+
+    pub async fn get_outcome(&self) -> HealTaskOutcome {
+        self.outcome.read().await.clone()
+    }
+
+    /// Record that the locked storage read found the single target absent.
+    pub(crate) fn mark_object_absent(&self) {
+        self.object_absent.store(true, Ordering::Release);
+    }
+
+    /// Whether this task's single target was classified absent.
+    pub(crate) fn object_absent(&self) -> bool {
+        self.object_absent.load(Ordering::Acquire)
+    }
+
+    fn outcome_identity(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        pool_index: Option<usize>,
+        set_index: Option<usize>,
+    ) -> HealObjectIdentity {
+        HealObjectIdentity {
+            kind: match self.heal_type {
+                HealType::Metadata { .. } => HealObjectKind::Metadata,
+                HealType::ECDecode { .. } => HealObjectKind::Decode,
+                HealType::DeleteMarkerPurge { .. } => HealObjectKind::DeleteMarkerPurge,
+                _ => HealObjectKind::Object,
+            },
+            bucket: bucket.to_owned(),
+            object: object.to_owned(),
+            version_id: version_id.map(ToOwned::to_owned),
+            bucket_incarnation_id: None,
+            pool_index,
+            set_index,
+        }
+    }
+
+    pub(super) async fn outcome_bucket_incarnation_id(&self, bucket: &str, dry_run: bool) -> Result<Option<Uuid>> {
+        if dry_run {
+            return Ok(None);
+        }
+        match self.await_with_control(self.storage.bucket_incarnation_id(bucket)).await {
+            Ok(incarnation_id) => Ok(incarnation_id),
+            Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
+            Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
+            Err(_) => Ok(None),
+        }
+    }
+
+    fn single_object_identity(&self) -> Option<HealObjectIdentity> {
+        let (bucket, object, version) = match &self.heal_type {
+            HealType::Object {
+                bucket,
+                object,
+                version_id,
+            }
+            | HealType::ECDecode {
+                bucket,
+                object,
+                version_id,
+            } => (bucket, object, version_id.as_deref()),
+            HealType::Metadata { bucket, object } => (bucket, object, None),
+            HealType::DeleteMarkerPurge {
+                bucket,
+                object,
+                version_id,
+                ..
+            } => (bucket, object, Some(version_id.as_str())),
+            _ => return None,
+        };
+        let mut identity = self.outcome_identity(bucket, object, version, self.options.pool_index, self.options.set_index);
+        identity.bucket_incarnation_id = self.single_object_incarnation.get().copied().flatten();
+        Some(identity)
+    }
+
+    pub(super) async fn record_verified_storage_receipt(
+        &self,
+        expected: &HealObjectIdentity,
+        receipt: Option<HealObjectReceipt>,
+    ) -> bool {
+        if self.options.dry_run || self.cancel_token.is_cancelled() {
+            return false;
+        }
+        let Some(receipt) = receipt else {
+            return false;
+        };
+        if !receipt.verified_for(expected) {
+            return false;
+        }
+        let quorum_selected_data_dir = receipt.quorum_selected_data_dir.filter(|generation| !generation.is_nil());
+        let deep_check_observed = receipt.deep_check_observed
+            && quorum_selected_data_dir.is_some()
+            && matches!(
+                receipt.disposition,
+                HealObjectDisposition::Repaired | HealObjectDisposition::VerifiedHealthy
+            );
+        let mut outcome = self.outcome.write().await;
+        outcome.record(HealObjectOutcome {
+            identity: receipt.identity,
+            disposition: receipt.disposition,
+            detail: None,
+            quorum_selected_data_dir,
+            deep_check_observed,
+        });
+        true
+    }
+
+    async fn record_deferred_object(&self, reason: HealDeferredReason, retry_not_before: Option<SystemTime>) {
+        if let Some(identity) = self.single_object_identity() {
+            let mut outcome = self.outcome.write().await;
+            outcome.attempt_failed();
+            outcome.record(HealObjectOutcome {
+                deep_check_observed: false,
+                quorum_selected_data_dir: None,
+                identity,
+                disposition: HealObjectDisposition::Deferred {
+                    reason,
+                    retry_not_before,
+                },
+                detail: None,
+            });
+        }
+    }
+
+    pub(crate) fn has_batch_failure(&self) -> bool {
+        self.batch_failure_recorded.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn batch_failure_is_retryable(&self) -> bool {
+        self.batch_failure
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|failure| failure.failed > 0 && failure.failed == failure.retryable && failure.permanent == 0)
+    }
+
+    pub(crate) async fn record_batch_failure(&self, failure: BatchHealFailure) -> Error {
+        self.batch_failure_recorded.store(true, Ordering::Release);
+        let message = failure.to_string();
+        *self.batch_failure.write().await = Some(failure);
+        Error::TaskExecutionFailed { message }
+    }
+
+    async fn take_batch_failure(&self) -> Option<BatchHealFailure> {
+        self.batch_failure.write().await.take()
+    }
+
+    pub fn metric_set_label(&self) -> String {
+        match &self.heal_type {
+            HealType::ErasureSet { set_disk_id, .. } => set_disk_id.clone(),
+            _ => self.options.set_metric_label(),
+        }
+    }
+
+    fn emit_trace_task_state(&self, state: &'static str, duration: Duration, error: Option<&Error>) {
+        trace_emit(|| {
+            let mut event = TraceEvent::new(TraceKind::Heal, TraceFunc::HealTask)
+                .with_duration(duration)
+                .with_attr("task_id", self.id.as_str())
+                .with_attr("heal_type", self.heal_type.kind_label())
+                .with_attr("state", state)
+                .with_attr("source", self.source.as_str())
+                .with_attr("priority", self.priority.as_str())
+                .with_attr("retry_attempts", u64::from(self.retry_attempts))
+                .with_attr("dry_run", self.options.dry_run);
+
+            event = match &self.heal_type {
+                HealType::Cluster => event,
+                HealType::Object {
+                    bucket,
+                    object,
+                    version_id,
+                } => {
+                    let event = event.with_bucket(bucket.as_str()).with_object(object.as_str());
+                    match version_id {
+                        Some(version_id) => event.with_attr("version_id", version_id.as_str()),
+                        None => event,
+                    }
+                }
+                HealType::Bucket { bucket } => event.with_bucket(bucket.as_str()),
+                HealType::Prefix { bucket, prefix } => event.with_bucket(bucket.as_str()).with_object(prefix.as_str()),
+                HealType::ErasureSet { buckets, set_disk_id } => {
+                    let bucket_count = u64::try_from(buckets.len()).unwrap_or(u64::MAX);
+                    event
+                        .with_attr("set_disk_id", set_disk_id.as_str())
+                        .with_attr("bucket_count", bucket_count)
+                }
+                HealType::Metadata { bucket, object } => event.with_bucket(bucket.as_str()).with_object(object.as_str()),
+                HealType::ECDecode {
+                    bucket,
+                    object,
+                    version_id,
+                } => {
+                    let event = event.with_bucket(bucket.as_str()).with_object(object.as_str());
+                    match version_id {
+                        Some(version_id) => event.with_attr("version_id", version_id.as_str()),
+                        None => event,
+                    }
+                }
+                HealType::DeleteMarkerPurge {
+                    bucket,
+                    object,
+                    version_id,
+                    ..
+                } => event
+                    .with_bucket(bucket.as_str())
+                    .with_object(object.as_str())
+                    .with_attr("version_id", version_id.as_str()),
+            };
+
+            match error {
+                Some(error) => event.with_attr("error", error.to_string()),
+                None => event,
+            }
+        });
     }
 
     async fn remaining_timeout(&self) -> Result<Option<Duration>> {
@@ -253,6 +864,14 @@ impl HealTask {
         F: Future<Output = Result<T>> + Send,
         T: Send,
     {
+        let execution = self.replacement_execution.read().await.clone();
+        if let Some(_execution) = execution {
+            // Replacement mutations finish at their storage boundary before
+            // cancellation is observed. Dropping them can leave detached I/O
+            // writing after the execution lease has been released.
+            self.check_control_flags().await?;
+            return fut.await;
+        }
         let cancel_token = self.cancel_token.clone();
         if let Some(remaining) = self.remaining_timeout().await? {
             if remaining.is_zero() {
@@ -272,11 +891,210 @@ impl HealTask {
         }
     }
 
+    async fn skip_due_to_transient_object_exists(&self, bucket: &str, object: &str, err: &Error) -> Result<()> {
+        self.record_deferred_object(HealDeferredReason::TransientExistenceCheck, None)
+            .await;
+        warn!(
+            target: "rustfs::heal::task",
+            event = EVENT_HEAL_OBJECT_RESULT,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_OBJECT,
+            task_id = %self.id,
+            bucket,
+            object,
+            result = "transient_skip",
+            error = %err,
+            "Heal object skipped due to transient existence check error"
+        );
+
+        let mut progress = self.progress.write().await;
+        progress.set_current_object(Some(format!("skipped: {bucket}/{object}")));
+        progress.update_stage(1, 1);
+        Ok(())
+    }
+
+    fn is_data_usage_cache_object(bucket: &str, object: &str) -> bool {
+        bucket == RUSTFS_META_BUCKET
+            && object
+                .strip_prefix(BUCKET_META_PREFIX)
+                .and_then(|suffix| suffix.strip_prefix('/'))
+                .is_some_and(|name| name.contains(DATA_USAGE_CACHE_NAME))
+    }
+
+    fn is_transient_lock_or_timeout_error(err: &Error) -> bool {
+        matches!(classify_heal_error(err), HealErrorClass::LockContention)
+    }
+
+    fn should_skip_data_usage_cache_heal_error(bucket: &str, object: &str, err: &Error) -> bool {
+        Self::is_data_usage_cache_object(bucket, object) && Self::is_transient_lock_or_timeout_error(err)
+    }
+
+    fn is_dangling_delete_grace_error(err: &Error) -> bool {
+        err.is_dangling_delete_grace()
+    }
+
+    fn is_no_heal_required_error(err: &Error) -> bool {
+        matches!(classify_heal_error(err), HealErrorClass::NoHealRequired)
+    }
+
+    pub(super) fn bucket_object_retry_delay(task_id: &str, retry_attempt: u32) -> Duration {
+        let base = Duration::from_secs(2_u64.saturating_pow(retry_attempt.clamp(1, MAX_BUCKET_OBJECT_HEAL_RETRIES)));
+        let jitter_seed = task_id
+            .bytes()
+            .fold(0_u64, |acc, byte| acc.wrapping_mul(31).wrapping_add(u64::from(byte)));
+        Duration::from_millis(jitter_seed % 500).saturating_add(base)
+    }
+
+    pub(crate) fn should_log_failure(&self, error: &Error) -> bool {
+        if !matches!(error, Error::Storage(crate::heal::StorageError::DeleteRecoveryLegacyAmbiguous)) {
+            return true;
+        }
+        let (bucket, object, version_id) = match &self.heal_type {
+            HealType::Object {
+                bucket,
+                object,
+                version_id,
+            }
+            | HealType::ECDecode {
+                bucket,
+                object,
+                version_id,
+            } => (bucket.as_str(), object.as_str(), version_id.as_deref()),
+            HealType::Metadata { bucket, object } => (bucket.as_str(), object.as_str(), None),
+            HealType::DeleteMarkerPurge {
+                bucket,
+                object,
+                version_id,
+                ..
+            } => (bucket.as_str(), object.as_str(), Some(version_id.as_str())),
+            _ => return true,
+        };
+        crate::heal::failure_logging::log_legacy_ambiguity(
+            bucket,
+            object,
+            version_id,
+            self.options.pool_index,
+            self.options.set_index,
+        )
+    }
+
+    fn should_return_typed_heal_error(err: &Error) -> bool {
+        matches!(err, Error::Storage(_) | Error::Disk(_) | Error::TransientSkip { .. })
+    }
+
+    async fn skip_data_usage_cache_heal_error(&self, bucket: &str, object: &str, err: &Error) -> bool {
+        if !Self::should_skip_data_usage_cache_heal_error(bucket, object, err) {
+            return false;
+        }
+
+        self.record_deferred_object(HealDeferredReason::TransientUsageCache, None)
+            .await;
+
+        warn!(
+            target: "rustfs::heal::task",
+            event = EVENT_HEAL_OBJECT_RESULT,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_OBJECT,
+            task_id = %self.id,
+            bucket,
+            object,
+            result = "data_usage_cache_transient_skip",
+            error = %err,
+            "Heal object skipped for data usage cache after transient error"
+        );
+        let mut progress = self.progress.write().await;
+        progress.update_stage(3, 3);
+        true
+    }
+
+    async fn skip_retired_marker_error(&self, err: &Error) -> bool {
+        if !matches!(err, Error::Storage(source) if source.is_retired_marker_deferred()) {
+            return false;
+        }
+        if let Some(identity) = self.single_object_identity() {
+            let mut outcome = self.outcome.write().await;
+            outcome.attempt_failed();
+            outcome.record(HealObjectOutcome {
+                deep_check_observed: false,
+                quorum_selected_data_dir: None,
+                identity,
+                disposition: HealObjectDisposition::Deferred {
+                    reason: HealDeferredReason::RetiredMarkerProof,
+                    retry_not_before: None,
+                },
+                detail: Some(err.to_string()),
+            });
+        }
+        self.progress.write().await.update_stage(3, 3);
+        true
+    }
+
+    async fn skip_dangling_delete_grace_error(&self, bucket: &str, object: &str, err: &Error) -> bool {
+        if !Self::is_dangling_delete_grace_error(err) {
+            return false;
+        }
+
+        self.record_deferred_object(HealDeferredReason::DanglingDeleteGrace, err.dangling_delete_retry_not_before())
+            .await;
+
+        warn!(
+            target: "rustfs::heal::task",
+            event = EVENT_HEAL_OBJECT_RESULT,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_OBJECT,
+            task_id = %self.id,
+            bucket,
+            object,
+            result = "dangling_delete_grace_skip",
+            error = %err,
+            "Heal object dangling cleanup deferred by grace window"
+        );
+        let mut progress = self.progress.write().await;
+        progress.set_current_object(Some(format!("skipped: {bucket}/{object}")));
+        progress.update_object_progress(1, 0, 0, 1, 0);
+        progress.update_stage(3, 3);
+        true
+    }
+
     #[tracing::instrument(skip(self), fields(task_id = %self.id, heal_type = ?self.heal_type))]
+    #[hotpath::measure]
     pub async fn execute(&self) -> Result<()> {
+        self.execute_with_owner(None).await
+    }
+
+    #[tracing::instrument(name = "execute", skip(self, parent), fields(task_id = %self.id, heal_type = ?self.heal_type))]
+    #[hotpath::measure]
+    pub(super) async fn execute_owned(&self, parent: Option<super::manager::HealWork>) -> Result<()> {
+        self.execute_with_owner(parent).await
+    }
+
+    async fn execute_with_owner(&self, parent: Option<super::manager::HealWork>) -> Result<()> {
+        if self.source == HealRequestSource::AutoHeal
+            && !self.heal_endpoints.is_empty()
+            && matches!(self.heal_type, HealType::ErasureSet { .. })
+        {
+            // The waiter may be cancelled or dropped while storage owns a
+            // blocking write. Keep the entire executor, including its leases,
+            // alive until that write and failure persistence have finished.
+            let task = self.clone();
+            return super::manager::spawn_heal_work(
+                parent.as_ref(),
+                move |parent| async move { task.execute_inner(parent).await },
+            )
+            .await
+            .map_err(|error| Error::other(format!("replacement executor failed: {error}")))?;
+        }
+        self.execute_inner(parent).await
+    }
+
+    async fn execute_inner(&self, parent: Option<super::manager::HealWork>) -> Result<()> {
+        self.outcome.write().await.start();
         // update status and timestamps atomically to avoid race conditions
         let now = SystemTime::now();
         let start_instant = Instant::now();
+        let queue_delay = now.duration_since(self.enqueued_at).unwrap_or_default();
+        let type_label = self.metric_type_label().to_string();
+        let set_label = self.metric_set_label();
         {
             let mut status = self.status.write().await;
             let mut started_at = self.started_at.write().await;
@@ -286,25 +1104,109 @@ impl HealTask {
             *task_start_instant = Some(start_instant);
         }
 
-        info!("Task started");
+        histogram!(
+            "rustfs_heal_queue_delay_seconds",
+            "type" => type_label.clone(),
+            "set" => set_label.clone()
+        )
+        .record(queue_delay.as_secs_f64());
+        counter!(
+            "rustfs_heal_task_start_total",
+            "type" => type_label,
+            "set" => set_label
+        )
+        .increment(1);
 
-        let result = match &self.heal_type {
-            HealType::Object {
-                bucket,
-                object,
-                version_id,
-            } => self.heal_object(bucket, object, version_id.as_deref()).await,
-            HealType::Bucket { bucket } => self.heal_bucket(bucket).await,
+        demote_to_debug_when!(self.heal_type.is_per_object(), info, target: "rustfs::heal::task", {
+            event = EVENT_HEAL_TASK_STATE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_TASK,
+            task_id = %self.id,
+            heal_type = self.heal_type.kind_label(),
+            state = "started",
+            queue_delay = ?queue_delay,
+            "Heal task started"
+        });
+        self.emit_trace_task_state("started", Duration::ZERO, None);
 
-            HealType::Metadata { bucket, object } => self.heal_metadata(bucket, object).await,
-            HealType::MRF { meta_path } => self.heal_mrf(meta_path).await,
-            HealType::ECDecode {
-                bucket,
-                object,
-                version_id,
-            } => self.heal_ec_decode(bucket, object, version_id.as_deref()).await,
-            HealType::ErasureSet { buckets, set_disk_id } => self.heal_erasure_set(buckets.clone(), set_disk_id.clone()).await,
-        };
+        let result = async {
+            if self.heal_type.is_per_object() {
+                self.pace_mainline().await?;
+            }
+            match &self.heal_type {
+                HealType::Cluster => self.heal_cluster().await,
+                HealType::Object {
+                    bucket,
+                    object,
+                    version_id,
+                } => self.heal_object(bucket, object, version_id.as_deref()).await,
+                HealType::Bucket { bucket } => self.heal_bucket(bucket).await,
+                HealType::Prefix { bucket, prefix } => self.heal_prefix(bucket, prefix).await,
+
+                HealType::Metadata { bucket, object } => self.heal_metadata(bucket, object).await,
+                HealType::ECDecode {
+                    bucket,
+                    object,
+                    version_id,
+                } => self.heal_ec_decode(bucket, object, version_id.as_deref()).await,
+                HealType::DeleteMarkerPurge {
+                    bucket,
+                    object,
+                    version_id,
+                    purge,
+                } => self.heal_delete_marker_purge(bucket, object, version_id, purge).await,
+                HealType::ErasureSet { buckets, set_disk_id } => {
+                    self.heal_erasure_set_owned(buckets.clone(), set_disk_id.clone(), parent.as_ref())
+                        .await
+                }
+            }
+        }
+        .await;
+
+        self.replacement_running.store(false, Ordering::Release);
+        let result = self.persist_replacement_result(result).await;
+        self.replacement_execution.write().await.take();
+
+        #[cfg(test)]
+        pause_outcome_finish(&self.id).await;
+        {
+            let mut outcome = self.outcome.write().await;
+            if outcome.counters.processed == 0
+                && let Some(identity) = self.single_object_identity()
+            {
+                let disposition = match &result {
+                    Ok(()) if self.options.dry_run => HealObjectDisposition::DryRunObserved,
+                    Ok(()) => HealObjectDisposition::Unknown,
+                    Err(Error::TaskCancelled) => HealObjectDisposition::Cancelled,
+                    Err(Error::TaskTimeout) => HealObjectDisposition::Deferred {
+                        reason: HealDeferredReason::Deadline,
+                        retry_not_before: None,
+                    },
+                    Err(error) => {
+                        outcome.attempt_failed();
+                        HealObjectDisposition::Failed(if error.is_recoverable_heal() {
+                            HealFailureClass::Recoverable
+                        } else {
+                            HealFailureClass::Permanent
+                        })
+                    }
+                };
+                outcome.record(HealObjectOutcome {
+                    deep_check_observed: false,
+                    quorum_selected_data_dir: None,
+                    identity,
+                    disposition,
+                    detail: result.as_ref().err().map(ToString::to_string),
+                });
+            }
+            let abort = match &result {
+                Err(Error::TaskCancelled) => Some(HealAbortReason::Cancelled),
+                Err(Error::TaskTimeout) => Some(HealAbortReason::Deadline),
+                Err(_) if !self.has_batch_failure() && !self.heal_type.is_per_object() => Some(HealAbortReason::Untraversable),
+                _ => None,
+            };
+            outcome.finish(abort);
+        }
 
         // update completed time and status
         {
@@ -314,35 +1216,164 @@ impl HealTask {
 
         match &result {
             Ok(_) => {
+                // A stage can reach its final step before the durable resume
+                // ledger and cleanup fences commit. Publish terminal 100 only
+                // after the enclosing operation has returned success.
+                self.progress.write().await.mark_completed();
                 let mut status = self.status.write().await;
                 *status = HealTaskStatus::Completed;
-                info!("Task completed successfully");
+                demote_to_debug_when!(self.heal_type.is_per_object(), info, target: "rustfs::heal::task", {
+                    event = EVENT_HEAL_TASK_STATE,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_TASK,
+                    task_id = %self.id,
+                    heal_type = self.heal_type.kind_label(),
+                    state = "completed",
+                    "Heal task completed"
+                });
+            }
+            Err(Error::LegacyMrfUnverified { .. }) => {
+                // The qualified Deep attempt finished, but its Unknown outcome
+                // cannot discharge the separately owned durable responsibility.
+                self.progress.write().await.mark_completed();
+                *self.status.write().await = HealTaskStatus::Completed;
+                debug!(
+                    target: "rustfs::heal::task",
+                    event = EVENT_HEAL_TASK_STATE,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_TASK,
+                    state = "verification_unavailable",
+                    task_id = %self.id,
+                    heal_type = self.heal_type.kind_label(),
+                    "Heal attempt completed without independent verification"
+                );
             }
             Err(Error::TaskCancelled) => {
                 let mut status = self.status.write().await;
                 *status = HealTaskStatus::Cancelled;
-                info!("Heal task was cancelled: {}", self.id);
+                info!(
+                    target: "rustfs::heal::task",
+                    event = EVENT_HEAL_TASK_STATE,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_TASK,
+                    task_id = %self.id,
+                    heal_type = self.heal_type.kind_label(),
+                    state = "cancelled",
+                    "Heal task cancelled"
+                );
             }
             Err(Error::TaskTimeout) => {
                 let mut status = self.status.write().await;
                 *status = HealTaskStatus::Timeout;
-                warn!("Heal task timed out: {}", self.id);
+                demote_to_debug_when!(self.heal_type.is_per_object(), warn, target: "rustfs::heal::task", {
+                    event = EVENT_HEAL_TASK_STATE,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_TASK,
+                    task_id = %self.id,
+                    heal_type = self.heal_type.kind_label(),
+                    state = "timed_out",
+                    "Heal task timed out"
+                });
             }
             Err(e) => {
                 let mut status = self.status.write().await;
                 *status = HealTaskStatus::Failed { error: e.to_string() };
-                error!("Heal task failed: {} with error: {}", self.id, e);
+                // Per-object failures are already logged with full object
+                // context by the heal_* implementations and terminally by the
+                // scheduler's task_failed error!; this generic duplicate would
+                // multiply every failed object by the retry count.
+                demote_to_debug_when!(self.heal_type.is_per_object(), error, target: "rustfs::heal::task", {
+                    event = EVENT_HEAL_TASK_STATE,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_TASK,
+                    task_id = %self.id,
+                    heal_type = self.heal_type.kind_label(),
+                    state = "failed",
+                    error = %e,
+                    "Heal task failed"
+                });
             }
         }
+
+        let terminal_state = match &result {
+            Ok(_) => "completed",
+            Err(Error::LegacyMrfUnverified { .. }) => "verification_unavailable",
+            Err(Error::TaskCancelled) => "cancelled",
+            Err(Error::TaskTimeout) => "timed_out",
+            Err(_) => "failed",
+        };
+        let terminal_error = result
+            .as_ref()
+            .err()
+            .filter(|error| !matches!(error, Error::LegacyMrfUnverified { .. }));
+        self.emit_trace_task_state(terminal_state, start_instant.elapsed(), terminal_error);
 
         result
     }
 
+    pub(crate) fn replacement_is_running(&self) -> bool {
+        self.replacement_running.load(Ordering::Acquire)
+    }
+
+    async fn persist_replacement_result(&self, result: Result<()>) -> Result<()> {
+        let Err(failure) = result else {
+            return result;
+        };
+        let Some(disk) = self.replacement_resume_disk.read().await.clone() else {
+            return Err(failure);
+        };
+        // The erasure healer has its own manager. Reload its latest durable
+        // progress instead of overwriting it with the pre-format snapshot.
+        let persisted = async {
+            let manager = ResumeManager::load_replacement_intent(disk, &self.id).await?;
+            let attempt = self
+                .replacement_start_retry_count
+                .load(Ordering::Acquire)
+                .max(self.retry_attempts)
+                .saturating_add(1);
+            // A deletion can race any stage, including hidden-transaction recovery.
+            // Only a successful complete inventory may reclassify that failure;
+            // lookup/quorum failures remain the original storage failure.
+            if manager.get_state().await.replacement_bucket_incarnations.is_some()
+                && !matches!(failure, Error::TaskCancelled | Error::TaskTimeout)
+                && matches!(
+                    manager.verify_replacement_bucket_pass(self.storage.as_ref()).await,
+                    Err(Error::ReplacementNamespaceChanged)
+                )
+            {
+                manager
+                    .record_replacement_failure(&Error::ReplacementNamespaceChanged, attempt)
+                    .await
+            } else {
+                manager.record_replacement_failure(&failure, attempt).await
+            }
+        }
+        .await;
+        match persisted {
+            Ok(()) => Err(failure),
+            Err(persistence) => Err(Error::ReplacementFailurePersistence {
+                failure: Box::new(failure),
+                persistence: Box::new(persistence),
+            }),
+        }
+    }
+
     pub async fn cancel(&self) -> Result<()> {
         self.cancel_token.cancel();
+        self.outcome.write().await.finish(Some(HealAbortReason::Cancelled));
         let mut status = self.status.write().await;
         *status = HealTaskStatus::Cancelled;
-        info!("Heal task cancelled: {}", self.id);
+        debug!(
+            target: "rustfs::heal::task",
+            event = EVENT_HEAL_TASK_STATE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_TASK,
+            task_id = %self.id,
+            heal_type = self.heal_type.kind_label(),
+            state = "cancelled",
+            source = "manual",
+            "Heal task cancellation requested"
+        );
         Ok(())
     }
 
@@ -354,635 +1385,72 @@ impl HealTask {
         self.progress.read().await.clone()
     }
 
-    // specific heal implementation method
-    #[tracing::instrument(skip(self), fields(bucket = %bucket, object = %object, version_id = ?version_id))]
-    async fn heal_object(&self, bucket: &str, object: &str, version_id: Option<&str>) -> Result<()> {
-        info!("Starting object heal workflow");
+    pub async fn get_result_items(&self) -> Vec<HealResultItem> {
+        self.result_items.read().await.iter().map(|(_, item)| item.clone()).collect()
+    }
 
-        // update progress
-        {
-            let mut progress = self.progress.write().await;
-            progress.set_current_object(Some(format!("{bucket}/{object}")));
-            progress.update_progress(0, 4, 0, 0);
-        }
+    /// Sequence-stamped retained window, used when archiving a completed
+    /// task so incremental cursors survive the transition (HS-06).
+    pub async fn get_seqed_result_items(&self) -> Vec<(u64, HealResultItem)> {
+        self.result_items.read().await.iter().cloned().collect::<Vec<_>>()
+    }
 
-        // Step 1: Check if object exists and get metadata
-        warn!("Step 1: Checking object existence and metadata");
-        self.check_control_flags().await?;
-        let object_exists = self.await_with_control(self.storage.object_exists(bucket, object)).await?;
-        if !object_exists {
-            warn!("Object does not exist: {}/{}", bucket, object);
-            if self.options.recreate_missing {
-                info!("Attempting to recreate missing object: {}/{}", bucket, object);
-                return self.recreate_missing_object(bucket, object, version_id).await;
-            } else {
-                return Err(Error::TaskExecutionFailed {
-                    message: format!("Object not found: {bucket}/{object}"),
-                });
+    /// Sequence cursors of the retained window (next to assign, oldest
+    /// retained) — the same pair `get_result_items_since` reports, without
+    /// copying the items. Used when archiving a finished task.
+    pub fn result_seq_cursors(&self) -> (u64, u64) {
+        (self.next_item_seq.load(Ordering::Relaxed), self.min_available_seq.load(Ordering::Relaxed))
+    }
+
+    /// Incremental result window (HS-06): `since = None` returns the full
+    /// retained window (legacy snapshot semantics); `since = Some(seq)`
+    /// returns only items stamped with a sequence greater than `seq`.
+    /// `lagged` warns that the caller's cursor fell behind the window start
+    /// and items were skipped (the response carries `min_seq` as the catch-up
+    /// cursor).
+    pub async fn get_result_items_since(&self, since: Option<u64>) -> HealResultWindow {
+        let result_items = self.result_items.read().await;
+        let next_seq = self.next_item_seq.load(Ordering::Relaxed);
+        let min_seq = self.min_available_seq.load(Ordering::Relaxed);
+        let mut lagged = false;
+        let items = match since {
+            None => result_items.iter().map(|(_, item)| item.clone()).collect::<Vec<_>>(),
+            Some(cursor) => {
+                if cursor.saturating_add(1) < min_seq {
+                    lagged = true;
+                }
+                result_items
+                    .iter()
+                    .filter(|(seq, _)| *seq > cursor)
+                    .map(|(_, item)| item.clone())
+                    .collect::<Vec<_>>()
             }
-        }
-
-        {
-            let mut progress = self.progress.write().await;
-            progress.update_progress(1, 3, 0, 0);
-        }
-
-        // Step 2: directly call ecstore to perform heal
-        info!("Step 2: Performing heal using ecstore");
-        let heal_opts = HealOpts {
-            recursive: self.options.recursive,
-            dry_run: self.options.dry_run,
-            remove: self.options.remove_corrupted,
-            recreate: self.options.recreate_missing,
-            scan_mode: self.options.scan_mode,
-            update_parity: self.options.update_parity,
-            no_lock: false,
-            pool: self.options.pool_index,
-            set: self.options.set_index,
         };
-
-        let heal_result = self
-            .await_with_control(self.storage.heal_object(bucket, object, version_id, &heal_opts))
-            .await;
-
-        match heal_result {
-            Ok((result, error)) => {
-                if let Some(e) = error {
-                    // Check if this is a "File not found" error during delete operations
-                    let error_msg = format!("{e}");
-                    if error_msg.contains("File not found") || error_msg.contains("not found") {
-                        info!(
-                            "Object {}/{} not found during heal - likely deleted intentionally, treating as successful",
-                            bucket, object
-                        );
-                        {
-                            let mut progress = self.progress.write().await;
-                            progress.update_progress(3, 3, 0, 0);
-                        }
-                        return Ok(());
-                    }
-
-                    error!("Heal operation failed: {}/{} - {}", bucket, object, e);
-
-                    // If heal failed and remove_corrupted is enabled, delete the corrupted object
-                    if self.options.remove_corrupted {
-                        info!("Removing corrupted object: {}/{}", bucket, object);
-                        if !self.options.dry_run {
-                            self.await_with_control(self.storage.delete_object(bucket, object)).await?;
-                            info!("Successfully deleted corrupted object: {}/{}", bucket, object);
-                        } else {
-                            info!("Dry run mode - would delete corrupted object: {}/{}", bucket, object);
-                        }
-                    }
-
-                    {
-                        let mut progress = self.progress.write().await;
-                        progress.update_progress(3, 3, 0, 0);
-                    }
-
-                    return Err(Error::TaskExecutionFailed {
-                        message: format!("Failed to heal object {bucket}/{object}: {e}"),
-                    });
-                }
-
-                // Step 3: Verify heal result
-                info!("Step 3: Verifying heal result");
-                let object_size = result.object_size as u64;
-                info!(
-                    object_size = object_size,
-                    drives_healed = result.after.drives.len(),
-                    "Heal completed successfully"
-                );
-
-                {
-                    let mut progress = self.progress.write().await;
-                    progress.update_progress(3, 3, object_size, object_size);
-                }
-                Ok(())
-            }
-            Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
-            Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
-            Err(e) => {
-                // Check if this is a "File not found" error during delete operations
-                let error_msg = format!("{e}");
-                if error_msg.contains("File not found") || error_msg.contains("not found") {
-                    info!(
-                        "Object {}/{} not found during heal - likely deleted intentionally, treating as successful",
-                        bucket, object
-                    );
-                    {
-                        let mut progress = self.progress.write().await;
-                        progress.update_progress(3, 3, 0, 0);
-                    }
-                    return Ok(());
-                }
-
-                error!("Heal operation failed: {}/{} - {}", bucket, object, e);
-
-                // If heal failed and remove_corrupted is enabled, delete the corrupted object
-                if self.options.remove_corrupted {
-                    info!("Removing corrupted object: {}/{}", bucket, object);
-                    if !self.options.dry_run {
-                        self.await_with_control(self.storage.delete_object(bucket, object)).await?;
-                        info!("Successfully deleted corrupted object: {}/{}", bucket, object);
-                    } else {
-                        info!("Dry run mode - would delete corrupted object: {}/{}", bucket, object);
-                    }
-                }
-
-                {
-                    let mut progress = self.progress.write().await;
-                    progress.update_progress(3, 3, 0, 0);
-                }
-
-                Err(Error::TaskExecutionFailed {
-                    message: format!("Failed to heal object {bucket}/{object}: {e}"),
-                })
-            }
+        HealResultWindow {
+            items,
+            next_seq,
+            min_seq,
+            lagged,
         }
     }
 
-    /// Recreate missing object (for EC decode scenarios)
-    async fn recreate_missing_object(&self, bucket: &str, object: &str, version_id: Option<&str>) -> Result<()> {
-        info!("Attempting to recreate missing object: {}/{}", bucket, object);
-
-        // Use ecstore's heal_object with recreate option
-        let heal_opts = HealOpts {
-            recursive: false,
-            dry_run: self.options.dry_run,
-            remove: false,
-            recreate: true,
-            scan_mode: HealScanMode::Deep,
-            update_parity: true,
-            no_lock: false,
-            pool: None,
-            set: None,
-        };
-
-        match self
-            .await_with_control(self.storage.heal_object(bucket, object, version_id, &heal_opts))
-            .await
-        {
-            Ok((result, error)) => {
-                if let Some(e) = error {
-                    error!("Failed to recreate missing object: {}/{} - {}", bucket, object, e);
-                    return Err(Error::TaskExecutionFailed {
-                        message: format!("Failed to recreate missing object {bucket}/{object}: {e}"),
-                    });
-                }
-
-                let object_size = result.object_size as u64;
-                info!("Successfully recreated missing object: {}/{} ({} bytes)", bucket, object, object_size);
-
-                {
-                    let mut progress = self.progress.write().await;
-                    progress.update_progress(4, 4, object_size, object_size);
-                }
-                Ok(())
-            }
-            Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
-            Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
-            Err(e) => {
-                error!("Failed to recreate missing object: {}/{} - {}", bucket, object, e);
-                Err(Error::TaskExecutionFailed {
-                    message: format!("Failed to recreate missing object {bucket}/{object}: {e}"),
-                })
-            }
-        }
+    pub fn result_items_truncated(&self) -> bool {
+        self.result_items_truncated.load(Ordering::Relaxed)
     }
 
-    async fn heal_bucket(&self, bucket: &str) -> Result<()> {
-        info!("Healing bucket: {}", bucket);
-
-        // update progress
-        {
-            let mut progress = self.progress.write().await;
-            progress.set_current_object(Some(format!("bucket: {bucket}")));
-            progress.update_progress(0, 3, 0, 0);
-        }
-
-        // Step 1: Check if bucket exists
-        info!("Step 1: Checking bucket existence");
-        self.check_control_flags().await?;
-        let bucket_exists = self.await_with_control(self.storage.get_bucket_info(bucket)).await?.is_some();
-        if !bucket_exists {
-            warn!("Bucket does not exist: {}", bucket);
-            return Err(Error::TaskExecutionFailed {
-                message: format!("Bucket not found: {bucket}"),
-            });
-        }
-
-        {
-            let mut progress = self.progress.write().await;
-            progress.update_progress(1, 3, 0, 0);
-        }
-
-        // Step 2: Perform bucket heal using ecstore
-        info!("Step 2: Performing bucket heal using ecstore");
-        let heal_opts = HealOpts {
-            recursive: self.options.recursive,
-            dry_run: self.options.dry_run,
-            remove: self.options.remove_corrupted,
-            recreate: self.options.recreate_missing,
-            scan_mode: self.options.scan_mode,
-            update_parity: self.options.update_parity,
-            no_lock: false,
-            pool: self.options.pool_index,
-            set: self.options.set_index,
-        };
-
-        let heal_result = self.await_with_control(self.storage.heal_bucket(bucket, &heal_opts)).await;
-
-        match heal_result {
-            Ok(result) => {
-                info!("Bucket heal completed successfully: {} ({} drives)", bucket, result.after.drives.len());
-
-                {
-                    let mut progress = self.progress.write().await;
-                    progress.update_progress(3, 3, 0, 0);
-                }
-                Ok(())
-            }
-            Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
-            Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
-            Err(e) => {
-                error!("Bucket heal failed: {} - {}", bucket, e);
-                {
-                    let mut progress = self.progress.write().await;
-                    progress.update_progress(3, 3, 0, 0);
-                }
-                Err(Error::TaskExecutionFailed {
-                    message: format!("Failed to heal bucket {bucket}: {e}"),
-                })
-            }
-        }
-    }
-
-    async fn heal_metadata(&self, bucket: &str, object: &str) -> Result<()> {
-        info!("Healing metadata: {}/{}", bucket, object);
-
-        // update progress
-        {
-            let mut progress = self.progress.write().await;
-            progress.set_current_object(Some(format!("metadata: {bucket}/{object}")));
-            progress.update_progress(0, 3, 0, 0);
-        }
-
-        // Step 1: Check if object exists
-        info!("Step 1: Checking object existence");
-        self.check_control_flags().await?;
-        let object_exists = self.await_with_control(self.storage.object_exists(bucket, object)).await?;
-        if !object_exists {
-            warn!("Object does not exist: {}/{}", bucket, object);
-            return Err(Error::TaskExecutionFailed {
-                message: format!("Object not found: {bucket}/{object}"),
-            });
-        }
-
-        {
-            let mut progress = self.progress.write().await;
-            progress.update_progress(1, 3, 0, 0);
-        }
-
-        // Step 2: Perform metadata heal using ecstore
-        info!("Step 2: Performing metadata heal using ecstore");
-        let heal_opts = HealOpts {
-            recursive: false,
-            dry_run: self.options.dry_run,
-            remove: false,
-            recreate: false,
-            scan_mode: HealScanMode::Deep,
-            update_parity: false,
-            no_lock: false,
-            pool: self.options.pool_index,
-            set: self.options.set_index,
-        };
-
-        let heal_result = self
-            .await_with_control(self.storage.heal_object(bucket, object, None, &heal_opts))
-            .await;
-
-        match heal_result {
-            Ok((result, error)) => {
-                if let Some(e) = error {
-                    error!("Metadata heal failed: {}/{} - {}", bucket, object, e);
-                    {
-                        let mut progress = self.progress.write().await;
-                        progress.update_progress(3, 3, 0, 0);
-                    }
-                    return Err(Error::TaskExecutionFailed {
-                        message: format!("Failed to heal metadata {bucket}/{object}: {e}"),
-                    });
-                }
-
-                info!(
-                    "Metadata heal completed successfully: {}/{} ({} drives)",
-                    bucket,
-                    object,
-                    result.after.drives.len()
-                );
-
-                {
-                    let mut progress = self.progress.write().await;
-                    progress.update_progress(3, 3, 0, 0);
-                }
-                Ok(())
-            }
-            Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
-            Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
-            Err(e) => {
-                error!("Metadata heal failed: {}/{} - {}", bucket, object, e);
-                {
-                    let mut progress = self.progress.write().await;
-                    progress.update_progress(3, 3, 0, 0);
-                }
-                Err(Error::TaskExecutionFailed {
-                    message: format!("Failed to heal metadata {bucket}/{object}: {e}"),
-                })
-            }
-        }
-    }
-
-    async fn heal_mrf(&self, meta_path: &str) -> Result<()> {
-        info!("Healing MRF: {}", meta_path);
-
-        // update progress
-        {
-            let mut progress = self.progress.write().await;
-            progress.set_current_object(Some(format!("mrf: {meta_path}")));
-            progress.update_progress(0, 2, 0, 0);
-        }
-
-        // Parse meta_path to extract bucket and object
-        let parts: Vec<&str> = meta_path.split('/').collect();
-        if parts.len() < 2 {
-            return Err(Error::TaskExecutionFailed {
-                message: format!("Invalid meta path format: {meta_path}"),
-            });
-        }
-
-        let bucket = parts[0];
-        let object = parts[1..].join("/");
-
-        // Step 1: Perform MRF heal using ecstore
-        info!("Step 1: Performing MRF heal using ecstore");
-        let heal_opts = HealOpts {
-            recursive: true,
-            dry_run: self.options.dry_run,
-            remove: self.options.remove_corrupted,
-            recreate: self.options.recreate_missing,
-            scan_mode: HealScanMode::Deep,
-            update_parity: true,
-            no_lock: false,
-            pool: None,
-            set: None,
-        };
-
-        let heal_result = self
-            .await_with_control(self.storage.heal_object(bucket, &object, None, &heal_opts))
-            .await;
-
-        match heal_result {
-            Ok((result, error)) => {
-                if let Some(e) = error {
-                    error!("MRF heal failed: {} - {}", meta_path, e);
-                    {
-                        let mut progress = self.progress.write().await;
-                        progress.update_progress(2, 2, 0, 0);
-                    }
-                    return Err(Error::TaskExecutionFailed {
-                        message: format!("Failed to heal MRF {meta_path}: {e}"),
-                    });
-                }
-
-                info!("MRF heal completed successfully: {} ({} drives)", meta_path, result.after.drives.len());
-
-                {
-                    let mut progress = self.progress.write().await;
-                    progress.update_progress(2, 2, 0, 0);
-                }
-                Ok(())
-            }
-            Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
-            Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
-            Err(e) => {
-                error!("MRF heal failed: {} - {}", meta_path, e);
-                {
-                    let mut progress = self.progress.write().await;
-                    progress.update_progress(2, 2, 0, 0);
-                }
-                Err(Error::TaskExecutionFailed {
-                    message: format!("Failed to heal MRF {meta_path}: {e}"),
-                })
-            }
-        }
-    }
-
-    async fn heal_ec_decode(&self, bucket: &str, object: &str, version_id: Option<&str>) -> Result<()> {
-        info!("Healing EC decode: {}/{}", bucket, object);
-
-        // update progress
-        {
-            let mut progress = self.progress.write().await;
-            progress.set_current_object(Some(format!("ec_decode: {bucket}/{object}")));
-            progress.update_progress(0, 3, 0, 0);
-        }
-
-        // Step 1: Check if object exists
-        info!("Step 1: Checking object existence");
-        self.check_control_flags().await?;
-        let object_exists = self.await_with_control(self.storage.object_exists(bucket, object)).await?;
-        if !object_exists {
-            warn!("Object does not exist: {}/{}", bucket, object);
-            return Err(Error::TaskExecutionFailed {
-                message: format!("Object not found: {bucket}/{object}"),
-            });
-        }
-
-        {
-            let mut progress = self.progress.write().await;
-            progress.update_progress(1, 3, 0, 0);
-        }
-
-        // Step 2: Perform EC decode heal using ecstore
-        info!("Step 2: Performing EC decode heal using ecstore");
-        let heal_opts = HealOpts {
-            recursive: false,
-            dry_run: self.options.dry_run,
-            remove: false,
-            recreate: true,
-            scan_mode: HealScanMode::Deep,
-            update_parity: true,
-            no_lock: false,
-            pool: None,
-            set: None,
-        };
-
-        let heal_result = self
-            .await_with_control(self.storage.heal_object(bucket, object, version_id, &heal_opts))
-            .await;
-
-        match heal_result {
-            Ok((result, error)) => {
-                if let Some(e) = error {
-                    error!("EC decode heal failed: {}/{} - {}", bucket, object, e);
-                    {
-                        let mut progress = self.progress.write().await;
-                        progress.update_progress(3, 3, 0, 0);
-                    }
-                    return Err(Error::TaskExecutionFailed {
-                        message: format!("Failed to heal EC decode {bucket}/{object}: {e}"),
-                    });
-                }
-
-                let object_size = result.object_size as u64;
-                info!(
-                    "EC decode heal completed successfully: {}/{} ({} bytes, {} drives)",
-                    bucket,
-                    object,
-                    object_size,
-                    result.after.drives.len()
-                );
-
-                {
-                    let mut progress = self.progress.write().await;
-                    progress.update_progress(3, 3, object_size, object_size);
-                }
-                Ok(())
-            }
-            Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
-            Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
-            Err(e) => {
-                error!("EC decode heal failed: {}/{} - {}", bucket, object, e);
-                {
-                    let mut progress = self.progress.write().await;
-                    progress.update_progress(3, 3, 0, 0);
-                }
-                Err(Error::TaskExecutionFailed {
-                    message: format!("Failed to heal EC decode {bucket}/{object}: {e}"),
-                })
-            }
-        }
-    }
-
-    async fn heal_erasure_set(&self, buckets: Vec<String>, set_disk_id: String) -> Result<()> {
-        info!("Healing Erasure Set: {} ({} buckets)", set_disk_id, buckets.len());
-
-        // update progress
-        {
-            let mut progress = self.progress.write().await;
-            progress.set_current_object(Some(format!("erasure_set: {} ({} buckets)", set_disk_id, buckets.len())));
-            progress.update_progress(0, 4, 0, 0);
-        }
-
-        let buckets = if buckets.is_empty() {
-            info!("No buckets specified, listing all buckets");
-            let bucket_infos = self.await_with_control(self.storage.list_buckets()).await?;
-            bucket_infos.into_iter().map(|info| info.name).collect()
+    pub(super) async fn record_result_item(&self, result: HealResultItem) {
+        let seq = self.next_item_seq.fetch_add(1, Ordering::Relaxed);
+        let mut result_items = self.result_items.write().await;
+        if result_items.len() < MAX_RETAINED_HEAL_RESULT_ITEMS {
+            result_items.push_back((seq, result));
         } else {
-            buckets
-        };
-
-        // Step 1: Perform disk format heal using ecstore
-        info!("Step 1: Performing disk format heal using ecstore");
-        let format_result = self.await_with_control(self.storage.heal_format(self.options.dry_run)).await;
-
-        match format_result {
-            Ok((result, error)) => {
-                if let Some(e) = error {
-                    error!("Disk format heal failed: {} - {}", set_disk_id, e);
-                    {
-                        let mut progress = self.progress.write().await;
-                        progress.update_progress(4, 4, 0, 0);
-                    }
-                    return Err(Error::TaskExecutionFailed {
-                        message: format!("Failed to heal disk format for {set_disk_id}: {e}"),
-                    });
-                }
-
-                info!(
-                    "Disk format heal completed successfully: {} ({} drives)",
-                    set_disk_id,
-                    result.after.drives.len()
-                );
-            }
-            Err(Error::TaskCancelled) => return Err(Error::TaskCancelled),
-            Err(Error::TaskTimeout) => return Err(Error::TaskTimeout),
-            Err(e) => {
-                error!("Disk format heal failed: {} - {}", set_disk_id, e);
-                {
-                    let mut progress = self.progress.write().await;
-                    progress.update_progress(4, 4, 0, 0);
-                }
-                return Err(Error::TaskExecutionFailed {
-                    message: format!("Failed to heal disk format for {set_disk_id}: {e}"),
-                });
-            }
-        }
-
-        {
-            let mut progress = self.progress.write().await;
-            progress.update_progress(1, 4, 0, 0);
-        }
-
-        // Step 2: Get disk for resume functionality
-        info!("Step 2: Getting disk for resume functionality");
-        let disk = self
-            .await_with_control(self.storage.get_disk_for_resume(&set_disk_id))
-            .await?;
-
-        {
-            let mut progress = self.progress.write().await;
-            progress.update_progress(2, 4, 0, 0);
-        }
-
-        // Step 3: Heal bucket structure
-        // Check control flags before each iteration to ensure timely cancellation.
-        // Each heal_bucket call may handle timeout/cancellation internally, see its implementation for details.
-        for bucket in buckets.iter() {
-            // Check control flags before starting each bucket heal
-            self.check_control_flags().await?;
-            // heal_bucket internally uses await_with_control for timeout/cancellation handling
-            if let Err(err) = self.heal_bucket(bucket).await {
-                // Check if error is due to cancellation or timeout
-                if matches!(err, Error::TaskCancelled | Error::TaskTimeout) {
-                    return Err(err);
-                }
-                info!("Bucket heal failed: {}", err.to_string());
-            }
-        }
-
-        // Step 3: Create erasure set healer with resume support
-        info!("Step 3: Creating erasure set healer with resume support");
-        let erasure_healer = ErasureSetHealer::new(self.storage.clone(), self.progress.clone(), self.cancel_token.clone(), disk);
-
-        {
-            let mut progress = self.progress.write().await;
-            progress.update_progress(3, 4, 0, 0);
-        }
-
-        // Step 4: Execute erasure set heal with resume
-        info!("Step 4: Executing erasure set heal with resume");
-        let result = erasure_healer.heal_erasure_set(&buckets, &set_disk_id).await;
-
-        {
-            let mut progress = self.progress.write().await;
-            progress.update_progress(4, 4, 0, 0);
-        }
-
-        match result {
-            Ok(_) => {
-                info!("Erasure set heal completed successfully: {} ({} buckets)", set_disk_id, buckets.len());
-                Ok(())
-            }
-            Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
-            Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
-            Err(e) => {
-                error!("Erasure set heal failed: {} - {}", set_disk_id, e);
-                Err(Error::TaskExecutionFailed {
-                    message: format!("Failed to heal erasure set {set_disk_id}: {e}"),
-                })
-            }
+            // Slide the window: the oldest item leaves and the cursor for the
+            // oldest still-available item moves forward with it.
+            result_items.pop_front();
+            self.min_available_seq
+                .store(result_items.front().map_or(seq, |(oldest, _)| *oldest), Ordering::Relaxed);
+            result_items.push_back((seq, result));
+            self.result_items_truncated.store(true, Ordering::Relaxed);
         }
     }
 }
@@ -997,3 +1465,11 @@ impl std::fmt::Debug for HealTask {
             .finish()
     }
 }
+
+mod heal_bucket;
+mod heal_erasure_set;
+mod heal_metadata;
+mod heal_object;
+
+#[cfg(test)]
+mod tests;

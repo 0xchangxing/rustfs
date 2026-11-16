@@ -15,9 +15,11 @@
 #[cfg(test)]
 #[allow(unsafe_op_in_unsafe_fn)]
 mod tests {
-    use crate::config::Opt;
-    use clap::Parser;
-    use rustfs_ecstore::disks_layout::DisksLayout;
+    use crate::config::cli::{InspectCommands, default_server_opts};
+    use crate::config::{CommandResult, Config, Opt, S3Stack, TlsCommands};
+    use crate::storage_api::config_test::DisksLayout;
+    use rustfs_config::{DEFAULT_CONSOLE_ADDRESS, DEFAULT_CONSOLE_ENABLE, DEFAULT_OBS_ENDPOINT, RUSTFS_REGION};
+    use rustfs_credentials::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY};
     use serial_test::serial;
     use std::env;
 
@@ -27,6 +29,8 @@ mod tests {
     /// # Safety
     /// This function uses unsafe env::set_var and env::remove_var.
     /// Tests using this helper must be marked with #[serial] to avoid race conditions.
+    // SAFETY: This helper mutates process environment only inside serial tests
+    // and restores the variable before returning or resuming a panic.
     #[allow(unsafe_code)]
     fn with_env_var<F>(key: &str, value: &str, test_fn: F)
     where
@@ -58,6 +62,207 @@ mod tests {
 
     #[test]
     #[serial]
+    fn test_server_subcommand_and_legacy_equivalence() {
+        // rustfs server <volume> and rustfs <volume> (legacy) must produce identical results
+        let legacy_args = vec!["rustfs", "/data/vol1"];
+        let server_args = vec!["rustfs", "server", "/data/vol1"];
+        let opt_legacy = Opt::parse_from(legacy_args);
+        let opt_server = Opt::parse_from(server_args);
+        assert_eq!(opt_legacy.volumes, opt_server.volumes);
+        assert_eq!(opt_legacy.address, opt_server.address);
+        assert_eq!(opt_legacy.console_address, opt_server.console_address);
+    }
+
+    #[test]
+    #[serial]
+    fn test_tls_inspect_subcommand_parses() {
+        let result =
+            Opt::parse_command(["rustfs", "tls", "inspect", "--path", "/tmp/certs"]).expect("tls inspect command should parse");
+
+        match result {
+            CommandResult::Tls(opts) => match opts.command {
+                TlsCommands::Inspect(inspect) => assert_eq!(inspect.path, "/tmp/certs"),
+            },
+            _ => panic!("expected TLS command result"),
+        }
+    }
+
+    #[test]
+    fn connect_network_cli_requires_l1_consent_and_has_no_peer_override() {
+        let base = [
+            "rustfs",
+            "connect",
+            "performance",
+            "network",
+            "--state-dir",
+            "/state",
+            "--offline-key-id",
+            "key",
+            "--output",
+            "/output.zip",
+            "--organization",
+            "org",
+            "--cluster",
+            "cluster",
+            "--device",
+            "device",
+            "--run-uid",
+            "run",
+            "--artifact-uid",
+            "artifact",
+            "--consent-uid",
+            "consent",
+            "--policy-revision",
+            "1",
+            "--consent-expires-at",
+            "10",
+            "--expires-at",
+            "10",
+        ];
+        assert!(Opt::parse_command(base).is_err());
+        let approved = base.into_iter().chain(["--acknowledge-l1"]).collect::<Vec<_>>();
+        assert!(matches!(
+            Opt::parse_command(approved.clone()),
+            Ok(CommandResult::ConnectNetworkPerformance(_))
+        ));
+        assert!(Opt::parse_command(approved.into_iter().chain(["--peer-address", "example.com"])).is_err());
+    }
+
+    #[test]
+    fn connect_client_cli_selects_offline_key_only_when_requested() {
+        let base = [
+            "rustfs",
+            "connect",
+            "performance",
+            "client",
+            "--state-dir",
+            "/state",
+            "--endpoint",
+            "https://storage.example",
+            "--access-key-file",
+            "/access",
+            "--secret-key-file",
+            "/secret",
+            "--output",
+            "/output.zip",
+            "--organization",
+            "org",
+            "--cluster",
+            "cluster",
+            "--device",
+            "device",
+            "--run-uid",
+            "run",
+            "--artifact-uid",
+            "artifact",
+            "--consent-uid",
+            "consent",
+            "--policy-revision",
+            "1",
+            "--consent-expires-at",
+            "10",
+            "--expires-at",
+            "10",
+            "--operation",
+            "get",
+            "--acknowledge-l1",
+        ];
+        assert!(matches!(
+            Opt::parse_command(base),
+            Ok(CommandResult::ConnectClientPerformance(options)) if options.offline_key_id.is_none()
+        ));
+        assert!(matches!(
+            Opt::parse_command(base.into_iter().chain(["--offline-key-id", "selected"])),
+            Ok(CommandResult::ConnectClientPerformance(options)) if options.offline_key_id.as_deref() == Some("selected")
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn test_tls_inspect_subcommand_parses_tls_path_alias() {
+        let result =
+            Opt::parse_command(["rustfs", "tls", "inspect", "--tls-path", "/tmp/certs"]).expect("tls inspect alias should parse");
+
+        match result {
+            CommandResult::Tls(opts) => match opts.command {
+                TlsCommands::Inspect(inspect) => assert_eq!(inspect.path, "/tmp/certs"),
+            },
+            _ => panic!("expected TLS command result"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_inspect_subcommand_survives_legacy_preprocessing() {
+        let result = Opt::parse_command([
+            "rustfs",
+            "inspect",
+            "bucket-meta",
+            "--path",
+            "/data/drive-1",
+            "--bucket",
+            "example-bucket",
+        ])
+        .expect("inspect command should survive legacy preprocessing");
+
+        match result {
+            CommandResult::Inspect(opts) => match opts.command {
+                InspectCommands::BucketMeta(opts) => {
+                    assert_eq!(opts.paths, ["/data/drive-1"]);
+                    assert_eq!(opts.bucket, "example-bucket");
+                }
+            },
+            _ => panic!("expected inspect command result"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_connect_inspect_object_parses() {
+        let result = Opt::parse_command([
+            "rustfs", "connect", "inspect", "object", "--state-dir", "/state", "--output", "/tmp/inspect.zip",
+            "--organization", "organizations/019e3ae0-0000-7000-8000-000000000021", "--cluster",
+            "organizations/019e3ae0-0000-7000-8000-000000000021/clusters/019e3ae0-0000-7000-8000-000000000022",
+            "--device",
+            "organizations/019e3ae0-0000-7000-8000-000000000021/clusters/019e3ae0-0000-7000-8000-000000000022/clusterDevices/019e3ae0-0000-7000-8000-000000000023",
+            "--run-uid", "019e3ae0-0000-7000-8000-000000000024", "--artifact-uid",
+            "019e3ae0-0000-7000-8000-000000000025", "--consent-uid",
+            "019e3ae0-0000-7000-8000-000000000026", "--policy-revision", "3", "--consent-expires-at",
+            "2000000000", "--expires-at", "2000000000", "--path", "/data/drive-1", "--path", "/data/drive-2",
+            "--bucket", "customer-bucket", "--object", "private/report.bin", "--acknowledge-l3",
+        ])
+        .expect("connect inspect object should parse");
+
+        match result {
+            CommandResult::ConnectInspect(opts) => {
+                assert_eq!(
+                    opts.paths,
+                    [
+                        std::path::PathBuf::from("/data/drive-1"),
+                        std::path::PathBuf::from("/data/drive-2"),
+                    ]
+                );
+                assert_eq!(opts.bucket, "customer-bucket");
+                assert_eq!(opts.object, "private/report.bin");
+            }
+            _ => panic!("expected Connect inspect command result"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_parse_from_non_server_commands_falls_back_without_panicking() {
+        let info_opt = Opt::parse_from(["rustfs", "info"]);
+        let tls_opt = Opt::parse_from(["rustfs", "tls", "inspect", "--path", "/tmp/certs"]);
+
+        assert!(info_opt.volumes.is_empty());
+        assert!(tls_opt.volumes.is_empty());
+        assert_eq!(info_opt.address, default_server_opts().address);
+        assert_eq!(tls_opt.address, default_server_opts().address);
+    }
+
+    #[test]
+    #[serial]
     fn test_default_console_configuration() {
         // Test that default console configuration is correct
         let args = vec!["rustfs", "/test/volume"];
@@ -66,6 +271,37 @@ mod tests {
         assert!(opt.console_enable);
         assert_eq!(opt.console_address, ":9001");
         assert_eq!(opt.address, ":9000");
+    }
+
+    #[test]
+    #[serial]
+    fn test_config_new_defaults() {
+        let volumes = vec!["/tmp/rustfs-vol1".to_string()];
+        let address = "127.0.0.1:9100".to_string();
+        let config = Config::new(&address, volumes.clone());
+
+        assert_eq!(config.volumes, volumes);
+        assert_eq!(config.address, address);
+        assert_eq!(config.server_domains, Vec::<String>::new());
+        assert_eq!(config.access_key, DEFAULT_ACCESS_KEY);
+        assert_eq!(config.secret_key, DEFAULT_SECRET_KEY);
+        assert_eq!(config.console_enable, DEFAULT_CONSOLE_ENABLE);
+        assert_eq!(config.console_address, DEFAULT_CONSOLE_ADDRESS);
+        assert_eq!(config.obs_endpoint, DEFAULT_OBS_ENDPOINT);
+        assert_eq!(config.tls_path, None);
+        assert_eq!(config.license, None);
+        assert_eq!(config.region, Some(RUSTFS_REGION.to_string()));
+        assert!(!config.kms_enable);
+        assert_eq!(config.kms_backend, "local");
+        assert_eq!(config.kms_key_dir, None);
+        assert_eq!(config.kms_local_master_key, None);
+        assert_eq!(config.kms_vault_address, None);
+        assert_eq!(config.kms_vault_token, None);
+        assert_eq!(config.kms_vault_mount_path, None);
+        assert_eq!(config.kms_default_key_id, None);
+        assert!(!config.kms_allow_insecure_dev_defaults);
+        assert!(!config.buffer_profile_disable);
+        assert_eq!(config.buffer_profile, "GeneralPurpose");
     }
 
     #[test]
@@ -111,8 +347,111 @@ mod tests {
 
     #[test]
     #[serial]
+    fn test_external_prefixed_envs_are_accepted_by_parser() {
+        temp_env::with_vars(
+            [
+                ("MINIO_VOLUMES", Some("/compat/vol1")),
+                ("MINIO_ADDRESS", Some(":9100")),
+                ("RUSTFS_VOLUMES", None),
+                ("RUSTFS_ADDRESS", None),
+            ],
+            || {
+                let opt = Opt::parse_from(["rustfs"]);
+                assert_eq!(opt.volumes, vec!["/compat/vol1"]);
+                assert_eq!(opt.address, ":9100");
+                assert_eq!(std::env::var("RUSTFS_VOLUMES").as_deref(), Ok("/compat/vol1"));
+                assert_eq!(std::env::var("RUSTFS_ADDRESS").as_deref(), Ok(":9100"));
+            },
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn root_credential_lengths_are_checked_after_resolving_key_files() {
+        let dir = tempfile::tempdir().expect("temporary credential directory");
+        let file = dir.path().join("secret");
+        let config = |access_key| {
+            Config::from_opt(Opt::parse_from([
+                "rustfs",
+                "server",
+                "--access-key",
+                access_key,
+                "--secret-key-file",
+                file.to_str().expect("temporary secret key path"),
+                "/data",
+            ]))
+        };
+
+        std::fs::write(&file, "1234567\n").expect("write short secret");
+        let err = config("root").expect_err("seven-byte secret must be rejected after trimming");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(err.to_string(), "RUSTFS_SECRET_KEY must be at least 8 bytes");
+
+        std::fs::write(&file, "12345678\n").expect("write eight-byte secret");
+        let err = config("ab").expect_err("two-byte access key must be rejected");
+        assert_eq!(err.to_string(), "RUSTFS_ACCESS_KEY must be at least 3 bytes");
+        assert!(config("abc").is_ok());
+    }
+
+    #[test]
+    #[serial]
+    fn test_access_key_envs_are_used_for_bootstrap_credentials() {
+        temp_env::with_vars(
+            [
+                ("RUSTFS_VOLUMES", Some("/compat/vol1")),
+                ("RUSTFS_ACCESS_KEY", Some("canonical-access")),
+                ("RUSTFS_SECRET_KEY", Some("canonical-secret")),
+            ],
+            || {
+                let config = Config::from_opt(Opt::parse_from(["rustfs"])).expect("config should parse");
+                assert_eq!(config.access_key, "canonical-access");
+                assert_eq!(config.secret_key, "canonical-secret");
+            },
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_root_envs_fallback_for_bootstrap_credentials() {
+        temp_env::with_vars(
+            [
+                ("RUSTFS_VOLUMES", Some("/compat/vol1")),
+                ("RUSTFS_ROOT_USER", Some("root-user")),
+                ("RUSTFS_ROOT_PASSWORD", Some("root-password")),
+                ("RUSTFS_ACCESS_KEY", None),
+                ("RUSTFS_SECRET_KEY", None),
+            ],
+            || {
+                let config = Config::from_opt(Opt::parse_from(["rustfs"])).expect("config should parse");
+                assert_eq!(config.access_key, "root-user");
+                assert_eq!(config.secret_key, "root-password");
+            },
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_access_key_env_takes_precedence_over_root_aliases() {
+        temp_env::with_vars(
+            [
+                ("RUSTFS_VOLUMES", Some("/compat/vol1")),
+                ("RUSTFS_ACCESS_KEY", Some("canonical-access")),
+                ("RUSTFS_SECRET_KEY", Some("canonical-secret")),
+                ("RUSTFS_ROOT_USER", Some("root-user")),
+                ("RUSTFS_ROOT_PASSWORD", Some("root-password")),
+            ],
+            || {
+                let config = Config::from_opt(Opt::parse_from(["rustfs"])).expect("config should parse");
+                assert_eq!(config.access_key, "canonical-access");
+                assert_eq!(config.secret_key, "canonical-secret");
+            },
+        );
+    }
+
+    #[test]
+    #[serial]
     fn test_volumes_and_disk_layout_parsing() {
-        use rustfs_ecstore::disks_layout::DisksLayout;
+        use crate::storage_api::config_test::DisksLayout;
 
         // Test case 1: Single volume path
         let args = vec!["rustfs", "/data/vol1"];
@@ -248,7 +587,6 @@ mod tests {
     /// Uses #[serial] to avoid concurrent env var modifications.
     #[test]
     #[serial]
-    #[allow(unsafe_code)]
     fn test_rustfs_volumes_env_variable() {
         // Test case 1: Single volume via environment variable
         with_env_var("RUSTFS_VOLUMES", "/data/vol1", || {
@@ -393,7 +731,6 @@ mod tests {
     /// which means paths with spaces are NOT supported.
     #[test]
     #[serial]
-    #[allow(unsafe_code)]
     fn test_volumes_boundary_cases() {
         // Test case 1: Paths with spaces are not properly supported (known limitation)
         // This test documents the current behavior - space-separated paths will be split
@@ -552,7 +889,6 @@ mod tests {
 
     #[test]
     #[serial]
-    #[allow(unsafe_code)]
     fn test_access_key_arguments_mutually_exclusive_env_var() {
         // Test that env var args configuration fails on conflict
         with_env_var("RUSTFS_VOLUMES", "/data/my disk/vol1", || {
@@ -592,7 +928,6 @@ mod tests {
 
     #[test]
     #[serial]
-    #[allow(unsafe_code)]
     fn test_secret_key_arguments_mutually_exclusive_env_var() {
         // Test that env var args configuration fails on conflict
         with_env_var("RUSTFS_VOLUMES", "/data/my disk/vol1", || {
@@ -608,5 +943,62 @@ mod tests {
                 });
             });
         });
+    }
+
+    /// Resolves the server configuration with `RUSTFS_S3_STACK` set to `value`
+    /// (`None` removes it), so each case starts from a known environment.
+    fn config_with_s3_stack(value: Option<&str>) -> std::io::Result<Config> {
+        temp_env::with_var("RUSTFS_S3_STACK", value, || Config::from_opt(Opt::parse_from(["rustfs", "/data/vol1"])))
+    }
+
+    fn assert_s3_stack_rejected(value: &str) {
+        let err = match config_with_s3_stack(Some(value)) {
+            Ok(config) => panic!("RUSTFS_S3_STACK={value:?} must refuse startup, got {:?}", config.s3_stack),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            err.to_string(),
+            format!(r#"RUSTFS_S3_STACK must be "legacy" or "gateway", got "{value}""#)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn s3_stack_unset_selects_legacy() {
+        let config = config_with_s3_stack(None).expect("unset RUSTFS_S3_STACK should parse");
+        assert_eq!(config.s3_stack, S3Stack::Legacy);
+    }
+
+    #[test]
+    #[serial]
+    fn s3_stack_legacy_selects_legacy() {
+        let config = config_with_s3_stack(Some("legacy")).expect("RUSTFS_S3_STACK=legacy should parse");
+        assert_eq!(config.s3_stack, S3Stack::Legacy);
+    }
+
+    #[test]
+    #[serial]
+    fn s3_stack_gateway_selects_gateway() {
+        let config = config_with_s3_stack(Some("gateway")).expect("RUSTFS_S3_STACK=gateway should parse");
+        assert_eq!(config.s3_stack, S3Stack::Gateway);
+    }
+
+    #[test]
+    #[serial]
+    fn s3_stack_rejects_capitalized_gateway() {
+        assert_s3_stack_rejected("Gateway");
+    }
+
+    #[test]
+    #[serial]
+    fn s3_stack_rejects_both() {
+        assert_s3_stack_rejected("both");
+    }
+
+    #[test]
+    #[serial]
+    fn s3_stack_rejects_empty_value() {
+        assert_s3_stack_rejected("");
     }
 }

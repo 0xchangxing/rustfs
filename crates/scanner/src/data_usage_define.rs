@@ -12,569 +12,530 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use path_clean::PathClean;
-use s3s::dto::BucketLifecycleConfiguration;
-use serde::{Deserialize, Serialize};
+use rustfs_gateway_types::persistence::PersistedLifecycleConfiguration as BucketLifecycleConfiguration;
+use rustfs_gateway_types::persistence::PersistedObjectLockConfiguration as ObjectLockConfiguration;
+use serde::{Deserialize, Serialize, ser::SerializeMap};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
-    hash::{DefaultHasher, Hash, Hasher},
-    path::Path,
-    sync::{Arc, LazyLock},
+    future::Future,
+    sync::{Arc, LazyLock, Once},
     time::SystemTime,
 };
 
 use http::HeaderMap;
-use rustfs_ecstore::{
-    StorageAPI,
-    bucket::{lifecycle::lifecycle::TRANSITION_COMPLETE, replication::ReplicationConfig},
-    config::{com::save_config, storageclass},
-    disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
-    error::{Error, Result as StorageResult, StorageError},
-    store_api::{ObjectInfo, ObjectOptions},
+use metrics::{counter, describe_counter, describe_histogram, histogram};
+#[cfg(test)]
+use rustfs_config::ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS;
+pub use rustfs_data_usage::{
+    AllTierStats, BucketTargetUsageInfo, BucketUsageInfo, DATA_USAGE_OBJECT_NAME, DATA_USAGE_OBSERVED_OBJECT_NAME,
+    DataUsageEntry, DataUsageHash, DataUsageHashMap, DataUsageInfo, DataUsageSegmentInvalidationProof, DataUsageSnapshotSetState,
+    LEGACY_DATA_USAGE_OBJECT_NAME, PrefixUsageEntry, PrefixUsageQuery, PrefixUsageSummary, ReplTargetSizeSummary,
+    SizeReconciliationEntry, SizeReconciliationScope, SizeSummary, TierAccountingProof, TierStats, UNKNOWN_TIER,
+    UNKNOWN_TIER_DIAGNOSTIC_BYTE_CAP, UNKNOWN_TIER_DIAGNOSTIC_ENTRY_CAP, UnknownTierStats, clone_cache_value, hash_path,
+    prefix_usage_in_cache,
 };
+use rustfs_heal_contracts::heal_channel::HealScanMode;
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
-use tokio::time::{Duration, sleep, timeout};
-use tracing::{error, warn};
+use tokio::time::{Duration, Instant, sleep, timeout};
+use tracing::{debug, warn};
+
+use crate::raw_page_index::{RawEnumerationPageIndex, RawEnumerationPageOwnerStatus};
+use crate::storage_api::owner::HTTPPreconditions;
+use crate::{
+    BUCKET_META_PREFIX, EcstoreError as Error, EcstoreResult as StorageResult, RUSTFS_META_BUCKET, ReplicationConfig,
+    SCANNER_PUBLICATION_EPOCH_CHANGED, ScannerObjectInfo as ObjectInfo, ScannerObjectOptions as ObjectOptions, StorageError,
+    TRANSITION_COMPLETE, save_config, scanner_publication_admission_for_epoch, storageclass,
+};
+use crate::{ScannerConfigObjectDelete, ScannerObjectIO};
 
 // Data usage constants
 pub const DATA_USAGE_ROOT: &str = SLASH_SEPARATOR;
 
-const DATA_USAGE_OBJ_NAME: &str = ".usage.json";
-
 const DATA_USAGE_BLOOM_NAME: &str = ".bloomcycle.bin";
 
 pub const DATA_USAGE_CACHE_NAME: &str = ".usage-cache.bin";
+pub(crate) const DATA_USAGE_CACHE_KEY_FORMAT: u16 = 1;
 
-// Data usage paths (computed at runtime)
+const DATA_USAGE_CACHE_SAVE_RETRIES: u32 = 2;
+const DATA_USAGE_CACHE_BACKUP_SAVE_TIMEOUT_SECS_BASE: u64 = 5;
+const DATA_USAGE_CACHE_BACKUP_SAVE_RETRIES: u32 = 0;
+const DATA_USAGE_CACHE_SAVE_RETRY_BACKOFF_MAX: Duration = Duration::from_millis(350);
+const DATA_USAGE_CACHE_RECONCILE_BACKOFF_MAX: Duration = Duration::from_millis(150);
+const DATA_USAGE_CACHE_PERSISTENCE_MARGIN: Duration = Duration::from_secs(5);
+const METRIC_CACHE_SAVE_ATTEMPT_TOTAL: &str = "rustfs_scanner_cache_save_attempt_total";
+const METRIC_CACHE_SAVE_TIMEOUT_TOTAL: &str = "rustfs_scanner_cache_save_timeout_total";
+const METRIC_CACHE_SAVE_RETRY_TOTAL: &str = "rustfs_scanner_cache_save_retry_total";
+const METRIC_CACHE_SAVE_PAYLOAD_BYTES_TOTAL: &str = "rustfs_scanner_cache_save_payload_bytes_total";
+const METRIC_CACHE_SAVE_DURATION_SECONDS: &str = "rustfs_scanner_cache_save_duration_seconds";
+const METRIC_CACHE_BACKUP_REVISION_FAILURE_TOTAL: &str = "rustfs_scanner_cache_backup_revision_failure_total";
+const LOG_COMPONENT_SCANNER: &str = "scanner";
+const LOG_SUBSYSTEM_CACHE: &str = "cache";
+const EVENT_SCANNER_CACHE_LOAD_STATE: &str = "scanner_cache_load_state";
+const EVENT_SCANNER_CACHE_SAVE_STATE: &str = "scanner_cache_save_state";
+static CACHE_SAVE_METRICS_ONCE: Once = Once::new();
+
+pub const DATA_USAGE_SCAN_CHECKPOINT_VERSION: u16 = 1;
+pub const DATA_USAGE_RAW_ENUMERATION_CURSOR_VERSION: u16 = 1;
+const DATA_USAGE_SCAN_CURSOR_MAX_BYTES: usize = 16 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DataUsageCacheRevision {
+    Missing,
+    Etag(String),
+}
+
+impl DataUsageCacheRevision {
+    pub(crate) fn preconditions(&self) -> HTTPPreconditions {
+        match self {
+            Self::Missing => HTTPPreconditions {
+                if_none_match: Some("*".to_string()),
+                ..Default::default()
+            },
+            Self::Etag(etag) => HTTPPreconditions {
+                if_match: Some(etag.clone()),
+                ..Default::default()
+            },
+        }
+    }
+}
+
+pub(crate) async fn read_config_with_revision<S: ScannerObjectIO>(
+    store: Arc<S>,
+    path: &str,
+) -> StorageResult<(Option<Vec<u8>>, DataUsageCacheRevision)> {
+    let opts = ObjectOptions {
+        no_lock: true,
+        ..Default::default()
+    };
+    let read = store.get_object_reader(RUSTFS_META_BUCKET, path, None, HeaderMap::new(), &opts);
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let read = crate::storage_api::ecstore_diagnostic::with_read_version_entry(
+        crate::storage_api::ecstore_diagnostic::ReadVersionEntrySource::ScannerRevisionRead,
+        read,
+    );
+    match read.await {
+        Ok(mut reader) => {
+            let revision = reader
+                .object_info
+                .etag
+                .as_ref()
+                .filter(|etag| !etag.is_empty())
+                .cloned()
+                .map(DataUsageCacheRevision::Etag)
+                .ok_or_else(|| StorageError::other(format!("scanner config object {path} has no ETag")))?;
+            Ok((Some(reader.read_all().await?), revision))
+        }
+        Err(
+            Error::ConfigNotFound
+            | Error::FileNotFound
+            | Error::VolumeNotFound
+            | Error::ObjectNotFound(_, _)
+            | Error::BucketNotFound(_),
+        ) => Ok((None, DataUsageCacheRevision::Missing)),
+        Err(err) => Err(err),
+    }
+}
+
+pub(crate) fn usage_floor_primary_read_error_allows_backup(err: &Error) -> bool {
+    match err {
+        Error::FileCorrupt
+        | Error::CorruptedFormat
+        | Error::CorruptedBackend
+        | Error::PartMissingOrCorrupt
+        | Error::LessData
+        | Error::MoreData => true,
+        Error::Io(io_error) => {
+            matches!(io_error.kind(), std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof)
+                || error_chain_has_usage_floor_corruption_signature(io_error)
+        }
+        _ => false,
+    }
+}
+
+fn error_chain_has_usage_floor_corruption_signature(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(err) = current {
+        let message = err.to_string();
+        if message.contains("InlineData value out of range")
+            || message.contains("InlineData key out of range")
+            || message.contains("insufficient data for metadata")
+            || message.contains("insufficient data for meta length")
+            || message.contains("insufficient data for CRC")
+        {
+            return true;
+        }
+        current = err.source();
+    }
+    false
+}
+
+/// Read only the object revision without materializing its body.
+pub(crate) async fn read_config_revision<S: ScannerObjectIO>(store: Arc<S>, path: &str) -> StorageResult<DataUsageCacheRevision> {
+    let opts = ObjectOptions {
+        no_lock: true,
+        ..Default::default()
+    };
+    let read = store.get_object_reader(RUSTFS_META_BUCKET, path, None, HeaderMap::new(), &opts);
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let read = crate::storage_api::ecstore_diagnostic::with_read_version_entry(
+        crate::storage_api::ecstore_diagnostic::ReadVersionEntrySource::ScannerRevisionRead,
+        read,
+    );
+    match read.await {
+        Ok(reader) => reader
+            .object_info
+            .etag
+            .filter(|etag| !etag.is_empty())
+            .map(DataUsageCacheRevision::Etag)
+            .ok_or_else(|| StorageError::other(format!("scanner config object {path} has no ETag"))),
+        Err(
+            Error::ConfigNotFound
+            | Error::FileNotFound
+            | Error::VolumeNotFound
+            | Error::ObjectNotFound(_, _)
+            | Error::BucketNotFound(_),
+        ) => Ok(DataUsageCacheRevision::Missing),
+        Err(err) => Err(err),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DataUsageCacheRevisions {
+    main: DataUsageCacheRevision,
+    backup: Option<DataUsageCacheRevision>,
+}
+
 pub static DATA_USAGE_BUCKET: LazyLock<String> =
     LazyLock::new(|| format!("{RUSTFS_META_BUCKET}{SLASH_SEPARATOR}{BUCKET_META_PREFIX}"));
 
 pub static DATA_USAGE_OBJ_NAME_PATH: LazyLock<String> =
-    LazyLock::new(|| format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR}{DATA_USAGE_OBJ_NAME}"));
+    LazyLock::new(|| format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR}{DATA_USAGE_OBJECT_NAME}"));
+
+/// Durable evidence for recovery of the exact empty usage fence written by
+/// rc.2/rc.3 bucket cleanup before the first authoritative scanner snapshot.
+pub static DATA_USAGE_RECOVERY_PATH: LazyLock<String> =
+    LazyLock::new(|| format!("{}.recovery-pending.json", DATA_USAGE_OBJ_NAME_PATH.as_str()));
+
+pub static DATA_USAGE_OBSERVED_OBJ_NAME_PATH: LazyLock<String> =
+    LazyLock::new(|| format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR}{DATA_USAGE_OBSERVED_OBJECT_NAME}"));
+
+pub static LEGACY_DATA_USAGE_OBJ_NAME_PATH: LazyLock<String> =
+    LazyLock::new(|| format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR}{LEGACY_DATA_USAGE_OBJECT_NAME}"));
 
 pub static DATA_USAGE_BLOOM_NAME_PATH: LazyLock<String> =
     LazyLock::new(|| format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR}{DATA_USAGE_BLOOM_NAME}"));
 
+/// Durable companion object for a cycle-state object which cannot be decoded.
+/// The primary object is deliberately never replaced or deleted by recovery.
+pub static DATA_USAGE_BLOOM_RECOVERY_PATH: LazyLock<String> =
+    LazyLock::new(|| format!("{}.recovery-required.json", DATA_USAGE_BLOOM_NAME_PATH.as_str()));
+
 pub static BACKGROUND_HEAL_INFO_PATH: LazyLock<String> =
     LazyLock::new(|| format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR}.background-heal.json"));
 
-#[derive(Clone, Copy, Default, Debug, Serialize, Deserialize, PartialEq)]
-pub struct TierStats {
-    pub total_size: u64,
-    pub num_versions: i32,
-    pub num_objects: i32,
+pub(crate) const MAX_DATA_USAGE_CACHE_DEPTH: usize = 1024;
+
+/// Scanner-side accounting on the shared [`SizeSummary`].
+///
+/// The type itself lives in `rustfs-data-usage`, which sits below the storage
+/// layer and cannot see `ObjectInfo`, so this stays an extension trait rather
+/// than an inherent method (backlog#1828).
+pub trait ScannerSizeSummaryExt {
+    /// Fold one object's contribution into the summary, including its tier.
+    fn actions_accounting(&mut self, oi: &ObjectInfo, size: i64, actual_size: i64);
+    /// Fold counters and physical tier usage for an object whose metadata is
+    /// valid but whose logical size is currently unavailable. Logical totals
+    /// stay unchanged.
+    fn actions_accounting_unknown(&mut self, oi: &ObjectInfo);
 }
 
-impl TierStats {
-    pub fn add(&self, u: &TierStats) -> TierStats {
-        TierStats {
-            total_size: self.total_size + u.total_size,
-            num_versions: self.num_versions + u.num_versions,
-            num_objects: self.num_objects + u.num_objects,
-        }
-    }
-
-    pub fn from_object_info(oi: &ObjectInfo) -> Self {
-        TierStats {
-            total_size: oi.size as u64,
-            num_versions: 1,
-            num_objects: if oi.is_latest { 1 } else { 0 },
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-pub struct AllTierStats {
-    pub tiers: HashMap<String, TierStats>,
-}
-
-impl AllTierStats {
-    pub fn new() -> Self {
-        Self { tiers: HashMap::new() }
-    }
-
-    pub fn add_sizes(&mut self, tiers: HashMap<String, TierStats>) {
-        for (tier, st) in tiers {
-            self.tiers
-                .insert(tier.clone(), self.tiers.get(&tier).unwrap_or(&TierStats::default()).add(&st));
-        }
-    }
-
-    pub fn merge(&mut self, other: AllTierStats) {
-        for (tier, st) in other.tiers {
-            self.tiers
-                .insert(tier.clone(), self.tiers.get(&tier).unwrap_or(&TierStats::default()).add(&st));
-        }
-    }
-
-    pub fn populate_stats(&self, stats: &mut HashMap<String, TierStats>) {
-        for (tier, st) in &self.tiers {
-            stats.insert(
-                tier.clone(),
-                TierStats {
-                    total_size: st.total_size,
-                    num_versions: st.num_versions,
-                    num_objects: st.num_objects,
-                },
-            );
-        }
-    }
-}
-
-/// Bucket target usage info provides replication statistics
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct BucketTargetUsageInfo {
-    pub replication_pending_size: u64,
-    pub replication_failed_size: u64,
-    pub replicated_size: u64,
-    pub replica_size: u64,
-    pub replication_pending_count: u64,
-    pub replication_failed_count: u64,
-    pub replicated_count: u64,
-}
-
-/// Bucket usage info provides bucket-level statistics
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct BucketUsageInfo {
-    pub size: u64,
-    // Following five fields suffixed with V1 are here for backward compatibility
-    // Total Size for objects that have not yet been replicated
-    pub replication_pending_size_v1: u64,
-    // Total size for objects that have witness one or more failures and will be retried
-    pub replication_failed_size_v1: u64,
-    // Total size for objects that have been replicated to destination
-    pub replicated_size_v1: u64,
-    // Total number of objects pending replication
-    pub replication_pending_count_v1: u64,
-    // Total number of objects that failed replication
-    pub replication_failed_count_v1: u64,
-
-    pub objects_count: u64,
-    pub object_size_histogram: HashMap<String, u64>,
-    pub object_versions_histogram: HashMap<String, u64>,
-    pub versions_count: u64,
-    pub delete_markers_count: u64,
-    pub replica_size: u64,
-    pub replica_count: u64,
-    pub replication_info: HashMap<String, BucketTargetUsageInfo>,
-}
-
-/// DataUsageInfo represents data usage stats of the underlying storage
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct DataUsageInfo {
-    /// Total capacity
-    pub total_capacity: u64,
-    /// Total used capacity
-    pub total_used_capacity: u64,
-    /// Total free capacity
-    pub total_free_capacity: u64,
-
-    /// LastUpdate is the timestamp of when the data usage info was last updated
-    pub last_update: Option<SystemTime>,
-
-    /// Objects total count across all buckets
-    pub objects_total_count: u64,
-    /// Versions total count across all buckets
-    pub versions_total_count: u64,
-    /// Delete markers total count across all buckets
-    pub delete_markers_total_count: u64,
-    /// Objects total size across all buckets
-    pub objects_total_size: u64,
-    /// Replication info across all buckets
-    pub replication_info: HashMap<String, BucketTargetUsageInfo>,
-
-    /// Total number of buckets in this cluster
-    pub buckets_count: u64,
-    /// Buckets usage info provides following information across all buckets
-    pub buckets_usage: HashMap<String, BucketUsageInfo>,
-    /// Deprecated kept here for backward compatibility reasons
-    pub bucket_sizes: HashMap<String, u64>,
-    /// Per-disk snapshot information when available
-    #[serde(default)]
-    pub disk_usage_status: Vec<DiskUsageStatus>,
-}
-
-/// Metadata describing the status of a disk-level data usage snapshot.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct DiskUsageStatus {
-    pub disk_id: String,
-    pub pool_index: Option<usize>,
-    pub set_index: Option<usize>,
-    pub disk_index: Option<usize>,
-    pub last_update: Option<SystemTime>,
-    pub snapshot_exists: bool,
-}
-
-/// Size summary for a single object or group of objects
-#[derive(Debug, Default, Clone)]
-pub struct SizeSummary {
-    /// Total size
-    pub total_size: usize,
-    /// Number of versions
-    pub versions: usize,
-    /// Number of delete markers
-    pub delete_markers: usize,
-    /// Replicated size
-    pub replicated_size: i64,
-    /// Replicated count
-    pub replicated_count: usize,
-    /// Pending size
-    pub pending_size: i64,
-    /// Failed size
-    pub failed_size: i64,
-    /// Replica size
-    pub replica_size: i64,
-    /// Replica count
-    pub replica_count: usize,
-    /// Pending count
-    pub pending_count: usize,
-    /// Failed count
-    pub failed_count: usize,
-    /// Replication target stats
-    pub repl_target_stats: HashMap<String, ReplTargetSizeSummary>,
-    pub tier_stats: HashMap<String, TierStats>,
-}
-
-impl SizeSummary {
-    pub fn actions_accounting(&mut self, oi: &ObjectInfo, size: i64, actual_size: i64) {
+impl ScannerSizeSummaryExt for SizeSummary {
+    fn actions_accounting(&mut self, oi: &ObjectInfo, size: i64, actual_size: i64) {
         if oi.delete_marker {
-            self.delete_markers += 1;
-        }
-
-        if oi.version_id.is_some_and(|v| !v.is_nil()) && size == actual_size {
-            self.versions += 1;
-        }
-
-        self.total_size += if size > 0 { size as usize } else { 0 };
-
-        if oi.delete_marker || oi.transitioned_object.free_version {
+            self.delete_markers = self.delete_markers.saturating_add(1);
             return;
         }
 
-        let mut tier = oi.storage_class.clone().unwrap_or(storageclass::STANDARD.to_string());
-        if oi.transitioned_object.status == TRANSITION_COMPLETE {
-            tier = oi.transitioned_object.tier.clone();
+        if oi.version_id.is_some_and(|v| !v.is_nil()) && size == actual_size {
+            self.versions = self.versions.saturating_add(1);
         }
 
+        let logical_size = size.max(0);
+        let size = usize::try_from(logical_size).unwrap_or(usize::MAX);
+        self.total_size = self.total_size.saturating_add(size);
+        let logical_bytes = u64::try_from(logical_size).unwrap_or(u64::MAX);
+        let physical_bytes = u64::try_from(oi.size.max(0)).unwrap_or(0);
+        let mut proof = TierAccountingProof {
+            logical_total: logical_bytes,
+            logical_known: 0,
+            physical_total: physical_bytes,
+            physical_known: 0,
+            overflowed: false,
+        };
+
+        if oi.transitioned_object.free_version {
+            proof.logical_known = logical_bytes;
+            proof.physical_known = physical_bytes;
+            self.tier_accounting_proof.saturating_add(proof);
+            return;
+        }
+
+        let tier = if oi.transitioned_object.status == TRANSITION_COMPLETE {
+            oi.transitioned_object.tier.as_str()
+        } else {
+            oi.storage_class.as_deref().unwrap_or(storageclass::STANDARD)
+        };
+
+        let builtin_tier = tier == storageclass::STANDARD || tier == storageclass::RRS;
+        let tier_registry_is_empty =
+            self.tier_stats.is_empty() || (self.tier_stats.len() == 1 && self.tier_stats.contains_key(UNKNOWN_TIER));
+        let known_tier = tier != UNKNOWN_TIER && (builtin_tier || self.tier_stats.contains_key(tier));
+
+        // With no configured tier, retain the historical empty-map shape for
+        // ordinary STANDARD/RRS objects. A non-built-in key is still an
+        // observable unknown and must create only the fixed bucket.
+        if tier_registry_is_empty && known_tier {
+            proof.logical_known = logical_bytes;
+            proof.physical_known = physical_bytes;
+            self.tier_accounting_proof.saturating_add(proof);
+            return;
+        }
+
+        // Configured tiers and the fixed bucket are normally seeded, so the
+        // hot path can mutate them without allocating a key for every object.
+        // The fallback inserts only when a legacy/no-config summary sees its
+        // first unknown key.
+        let tier_stats = if known_tier {
+            if let Some(stats) = self.tier_stats.get_mut(tier) {
+                stats
+            } else {
+                self.tier_stats.entry(tier.to_owned()).or_default()
+            }
+        } else if let Some(stats) = self.tier_stats.get_mut(UNKNOWN_TIER) {
+            stats
+        } else {
+            self.tier_stats.entry(UNKNOWN_TIER.to_string()).or_default()
+        };
+        *tier_stats = tier_stats.add(&TierStats {
+            total_size: physical_bytes,
+            num_versions: 1,
+            num_objects: u64::from(oi.is_latest),
+        });
+        if known_tier {
+            proof.logical_known = logical_bytes;
+            proof.physical_known = physical_bytes;
+        }
+        if !known_tier {
+            self.unknown_tier_stats
+                .record_dimensions(tier, logical_bytes, physical_bytes, 1, u64::from(oi.is_latest));
+            if self.unknown_tier_stats.counter_overflowed {
+                proof.overflowed = true;
+            }
+        }
+        self.tier_accounting_proof.saturating_add(proof);
+    }
+
+    fn actions_accounting_unknown(&mut self, oi: &ObjectInfo) {
+        if oi.delete_marker {
+            self.delete_markers = self.delete_markers.saturating_add(1);
+            return;
+        }
+
+        if oi.version_id.is_some_and(|v| !v.is_nil()) {
+            self.versions = self.versions.saturating_add(1);
+        }
+
+        if oi.transitioned_object.free_version {
+            return;
+        }
+
+        let tier = if oi.transitioned_object.status == TRANSITION_COMPLETE {
+            oi.transitioned_object.tier.clone()
+        } else {
+            oi.storage_class.clone().unwrap_or_else(|| storageclass::STANDARD.to_string())
+        };
         if let Some(tier_stats) = self.tier_stats.get_mut(&tier) {
-            tier_stats.add(&TierStats::from_object_info(oi));
+            *tier_stats = tier_stats.add(&TierStats {
+                total_size: u64::try_from(oi.size).unwrap_or(0),
+                num_versions: 1,
+                num_objects: u64::from(oi.is_latest),
+            });
         }
     }
-}
-
-/// Replication target size summary
-#[derive(Debug, Default, Clone)]
-pub struct ReplTargetSizeSummary {
-    /// Replicated size
-    pub replicated_size: i64,
-    /// Replicated count
-    pub replicated_count: usize,
-    /// Pending size
-    pub pending_size: i64,
-    /// Failed size
-    pub failed_size: i64,
-    /// Pending count
-    pub pending_count: usize,
-    /// Failed count
-    pub failed_count: usize,
 }
 
 // ===== Cache-related data structures =====
 
-/// Data usage hash for path-based caching
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct DataUsageHash(pub String);
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DataUsageScanCheckpointReason {
+    Runtime,
+    Objects,
+    Directories,
+    Unknown,
+}
 
-impl DataUsageHash {
-    pub fn string(&self) -> String {
-        self.0.clone()
-    }
-
-    pub fn key(&self) -> String {
-        self.0.clone()
-    }
-
-    pub fn mod_(&self, cycle: u32, cycles: u32) -> bool {
-        if cycles <= 1 {
-            return cycles == 1;
+impl DataUsageScanCheckpointReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Runtime => "runtime",
+            Self::Objects => "objects",
+            Self::Directories => "directories",
+            Self::Unknown => "unknown",
         }
-
-        let hash = self.calculate_hash();
-        hash as u32 % cycles == cycle % cycles
-    }
-
-    pub fn mod_alt(&self, cycle: u32, cycles: u32) -> bool {
-        if cycles <= 1 {
-            return cycles == 1;
-        }
-
-        let hash = self.calculate_hash();
-
-        warn!(
-            "mod_alt: key: {} hash: {} cycle: {} cycles: {} mod: {} hash >> 32: {} result: {}",
-            self.0,
-            hash,
-            cycle,
-            cycles,
-            (hash >> 32) as u32,
-            (hash >> 32) as u32 % cycles,
-            cycle % cycles,
-        );
-
-        (hash >> 32) as u32 % cycles == cycle % cycles
-    }
-
-    fn calculate_hash(&self) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        self.0.hash(&mut hasher);
-        hasher.finish()
     }
 }
 
-/// Data usage hash map type
-pub type DataUsageHashMap = HashSet<String>;
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DataUsageScanCheckpoint {
+    pub version: u16,
+    pub resume_after: String,
+    pub reason: DataUsageScanCheckpointReason,
+}
 
-/// Size histogram for object size distribution
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SizeHistogram(Vec<u64>);
-
-impl Default for SizeHistogram {
-    fn default() -> Self {
-        Self(vec![0; 11]) // DATA_USAGE_BUCKET_LEN = 11
+impl DataUsageScanCheckpoint {
+    pub fn new(resume_after: String, reason: DataUsageScanCheckpointReason) -> Self {
+        Self {
+            version: DATA_USAGE_SCAN_CHECKPOINT_VERSION,
+            resume_after,
+            reason,
+        }
     }
 }
 
-impl SizeHistogram {
-    pub fn add(&mut self, size: u64) {
-        let intervals = [
-            (0, 1024),                                  // LESS_THAN_1024_B
-            (1024, 64 * 1024 - 1),                      // BETWEEN_1024_B_AND_64_KB
-            (64 * 1024, 256 * 1024 - 1),                // BETWEEN_64_KB_AND_256_KB
-            (256 * 1024, 512 * 1024 - 1),               // BETWEEN_256_KB_AND_512_KB
-            (512 * 1024, 1024 * 1024 - 1),              // BETWEEN_512_KB_AND_1_MB
-            (1024, 1024 * 1024 - 1),                    // BETWEEN_1024B_AND_1_MB
-            (1024 * 1024, 10 * 1024 * 1024 - 1),        // BETWEEN_1_MB_AND_10_MB
-            (10 * 1024 * 1024, 64 * 1024 * 1024 - 1),   // BETWEEN_10_MB_AND_64_MB
-            (64 * 1024 * 1024, 128 * 1024 * 1024 - 1),  // BETWEEN_64_MB_AND_128_MB
-            (128 * 1024 * 1024, 512 * 1024 * 1024 - 1), // BETWEEN_128_MB_AND_512_MB
-            (512 * 1024 * 1024, u64::MAX),              // GREATER_THAN_512_MB
-        ];
+/// Durable raw directory-page cursor for a bucket scan.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DataUsageRawEnumerationCursor {
+    pub version: u16,
+    pub parent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_entry: Option<String>,
+    pub entries_seen: u64,
+    pub page_digest: [u8; 32],
+}
 
-        for (idx, (start, end)) in intervals.iter().enumerate() {
-            if size >= *start && size <= *end {
-                self.0[idx] += 1;
-                break;
+impl DataUsageRawEnumerationCursor {
+    pub fn new(parent: String, last_entry: Option<String>, entries_seen: u64, page_digest: [u8; 32]) -> Self {
+        Self {
+            version: DATA_USAGE_RAW_ENUMERATION_CURSOR_VERSION,
+            parent,
+            last_entry,
+            entries_seen,
+            page_digest,
+        }
+    }
+
+    fn is_valid_for_bucket(&self, bucket: &str) -> bool {
+        self.version == DATA_USAGE_RAW_ENUMERATION_CURSOR_VERSION
+            && bucket != DATA_USAGE_ROOT
+            && path_is_in_bucket_scope(bucket, &self.parent)
+            && self.parent.len() <= DATA_USAGE_SCAN_CURSOR_MAX_BYTES
+            && self.page_digest != [0; 32]
+            && match &self.last_entry {
+                Some(last_entry) => {
+                    !last_entry.is_empty()
+                        && self.entries_seen > 0
+                        && last_entry.len() <= DATA_USAGE_SCAN_CURSOR_MAX_BYTES
+                        && !last_entry.contains(SLASH_SEPARATOR)
+                }
+                None => self.entries_seen == 0,
             }
-        }
-    }
-
-    pub fn to_map(&self) -> HashMap<String, u64> {
-        let names = [
-            "LESS_THAN_1024_B",
-            "BETWEEN_1024_B_AND_64_KB",
-            "BETWEEN_64_KB_AND_256_KB",
-            "BETWEEN_256_KB_AND_512_KB",
-            "BETWEEN_512_KB_AND_1_MB",
-            "BETWEEN_1024B_AND_1_MB",
-            "BETWEEN_1_MB_AND_10_MB",
-            "BETWEEN_10_MB_AND_64_MB",
-            "BETWEEN_64_MB_AND_128_MB",
-            "BETWEEN_128_MB_AND_512_MB",
-            "GREATER_THAN_512_MB",
-        ];
-
-        let mut res = HashMap::new();
-        let mut spl_count = 0;
-        for (count, name) in self.0.iter().zip(names.iter()) {
-            if name == &"BETWEEN_1024B_AND_1_MB" {
-                res.insert(name.to_string(), spl_count);
-            } else if name.starts_with("BETWEEN_") && name.contains("_KB_") && name.contains("_MB") {
-                spl_count += count;
-                res.insert(name.to_string(), *count);
-            } else {
-                res.insert(name.to_string(), *count);
-            }
-        }
-        res
     }
 }
 
-/// Versions histogram for version count distribution
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct VersionsHistogram(Vec<u64>);
+fn path_is_in_bucket_scope(bucket: &str, path: &str) -> bool {
+    path == bucket
+        || path
+            .strip_prefix(bucket)
+            .is_some_and(|suffix| suffix.starts_with(SLASH_SEPARATOR))
+}
 
-impl Default for VersionsHistogram {
-    fn default() -> Self {
-        Self(vec![0; 7]) // DATA_USAGE_VERSION_LEN = 7
+/// Durable scope of a bucket checkpoint, independent of namespace mutation counters.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DataUsageScanIdentity {
+    pub version: u16,
+    pub bucket_incarnation: uuid::Uuid,
+    pub set_layout: DataUsageScanPlanDigest,
+    pub publication_epoch: u64,
+    pub tier_registry_generation: u64,
+    pub scan_mode: HealScanMode,
+}
+
+impl Serialize for DataUsageScanIdentity {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(6))?;
+        map.serialize_entry("version", &self.version)?;
+        map.serialize_entry("bucket_incarnation", &self.bucket_incarnation)?;
+        map.serialize_entry("set_layout", &self.set_layout)?;
+        map.serialize_entry("publication_epoch", &self.publication_epoch)?;
+        map.serialize_entry("tier_registry_generation", &self.tier_registry_generation)?;
+        map.serialize_entry("scan_mode", &self.scan_mode)?;
+        map.end()
     }
 }
 
-impl VersionsHistogram {
-    pub fn add(&mut self, count: u64) {
-        let intervals = [
-            (0, 0),            // UNVERSIONED
-            (1, 1),            // SINGLE_VERSION
-            (2, 9),            // BETWEEN_2_AND_10
-            (10, 99),          // BETWEEN_10_AND_100
-            (100, 999),        // BETWEEN_100_AND_1000
-            (1000, 9999),      // BETWEEN_1000_AND_10000
-            (10000, u64::MAX), // GREATER_THAN_10000
-        ];
-
-        for (idx, (start, end)) in intervals.iter().enumerate() {
-            if count >= *start && count <= *end {
-                self.0[idx] += 1;
-                break;
-            }
-        }
-    }
-
-    pub fn to_map(&self) -> HashMap<String, u64> {
-        let names = [
-            "UNVERSIONED",
-            "SINGLE_VERSION",
-            "BETWEEN_2_AND_10",
-            "BETWEEN_10_AND_100",
-            "BETWEEN_100_AND_1000",
-            "BETWEEN_1000_AND_10000",
-            "GREATER_THAN_10000",
-        ];
-
-        let mut res = HashMap::new();
-        for (count, name) in self.0.iter().zip(names.iter()) {
-            res.insert(name.to_string(), *count);
-        }
-        res
+impl DataUsageScanIdentity {
+    pub(crate) fn is_valid(&self) -> bool {
+        self.version == 1
+            && !self.bucket_incarnation.is_nil()
+            && matches!(self.scan_mode, HealScanMode::Normal | HealScanMode::Deep)
     }
 }
 
-/// Replication statistics for a single target
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct ReplicationStats {
-    pub pending_size: u64,
-    pub replicated_size: u64,
-    pub failed_size: u64,
-    pub failed_count: u64,
-    pub pending_count: u64,
-    pub missed_threshold_size: u64,
-    pub after_threshold_size: u64,
-    pub missed_threshold_count: u64,
-    pub after_threshold_count: u64,
-    pub replicated_count: u64,
+/// A forward coverage sweep may span budgets, but not authorize mixed mutation generations.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DataUsageScanProgress {
+    pub started_plan: DataUsageScanPlanDigest,
+    pub requested_plan: DataUsageScanPlanDigest,
 }
 
-impl ReplicationStats {
-    pub fn empty(&self) -> bool {
-        self.replicated_size == 0 && self.failed_size == 0 && self.failed_count == 0
+impl Serialize for DataUsageScanProgress {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("started_plan", &self.started_plan)?;
+        map.serialize_entry("requested_plan", &self.requested_plan)?;
+        map.end()
     }
 }
 
-/// Replication statistics for all targets
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct ReplicationAllStats {
-    pub targets: HashMap<String, ReplicationStats>,
-    pub replica_size: u64,
-    pub replica_count: u64,
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DataUsageScanCoverageReceipt {
+    pub through: String,
+    pub digest: [u8; 32],
 }
 
-impl ReplicationAllStats {
-    pub fn empty(&self) -> bool {
-        if self.replica_size != 0 && self.replica_count != 0 {
-            return false;
-        }
-        for (_, v) in self.targets.iter() {
-            if !v.empty() {
-                return false;
-            }
-        }
-        true
+impl Serialize for DataUsageScanCoverageReceipt {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("through", &self.through)?;
+        map.serialize_entry("digest", &self.digest)?;
+        map.end()
     }
 }
 
-/// Data usage cache entry
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct DataUsageEntry {
-    pub children: DataUsageHashMap,
-    // These fields do not include any children.
-    pub size: usize,
-    pub objects: usize,
-    pub versions: usize,
-    pub delete_markers: usize,
-    pub obj_sizes: SizeHistogram,
-    pub obj_versions: VersionsHistogram,
-    pub replication_stats: Option<ReplicationAllStats>,
-    pub compacted: bool,
-    /// Number of objects that failed to scan (e.g., IO errors)
-    #[serde(default)]
-    pub failed_objects: usize,
+/// Coverage follows depth-first directory traversal, rather than raw path order.
+/// A completed subtree includes its descendants but never an unfinished ancestor.
+pub(crate) fn scan_frontier_covers_path(path: &str, frontier: &str) -> bool {
+    let ancestor = frontier.strip_prefix(path).is_some_and(|suffix| suffix.starts_with('/'));
+    let descendant = path.strip_prefix(frontier).is_some_and(|suffix| suffix.starts_with('/'));
+    (path.split('/').cmp(frontier.split('/')).is_le() && !ancestor) || descendant
 }
 
-impl DataUsageEntry {
-    pub fn add_child(&mut self, hash: &DataUsageHash) {
-        if self.children.contains(&hash.key()) {
-            return;
-        }
-        self.children.insert(hash.key());
+struct CheckpointDigestWriter(Sha256);
+
+impl std::io::Write for CheckpointDigestWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
     }
 
-    pub fn add_sizes(&mut self, summary: &SizeSummary) {
-        self.size += summary.total_size;
-        self.versions += summary.versions;
-        self.delete_markers += summary.delete_markers;
-        self.obj_sizes.add(summary.total_size as u64);
-        self.obj_versions.add(summary.versions as u64);
-
-        let replication_stats = self.replication_stats.get_or_insert_with(ReplicationAllStats::default);
-        replication_stats.replica_size += summary.replica_size as u64;
-        replication_stats.replica_count += summary.replica_count as u64;
-
-        for (arn, st) in &summary.repl_target_stats {
-            let tgt_stat = replication_stats.targets.entry(arn.to_string()).or_default();
-            tgt_stat.pending_size += st.pending_size as u64;
-            tgt_stat.failed_size += st.failed_size as u64;
-            tgt_stat.replicated_size += st.replicated_size as u64;
-            tgt_stat.replicated_count += st.replicated_count as u64;
-            tgt_stat.failed_count += st.failed_count as u64;
-            tgt_stat.pending_count += st.pending_count as u64;
-        }
-    }
-
-    pub fn merge(&mut self, other: &DataUsageEntry) {
-        self.objects += other.objects;
-        self.versions += other.versions;
-        self.delete_markers += other.delete_markers;
-        self.size += other.size;
-        self.failed_objects += other.failed_objects;
-
-        if let Some(o_rep) = &other.replication_stats {
-            if self.replication_stats.is_none() {
-                self.replication_stats = Some(ReplicationAllStats::default());
-            }
-            let s_rep = self.replication_stats.as_mut().unwrap();
-            s_rep.targets.clear();
-            s_rep.replica_size += o_rep.replica_size;
-            s_rep.replica_count += o_rep.replica_count;
-            for (arn, stat) in o_rep.targets.iter() {
-                let st = s_rep.targets.entry(arn.clone()).or_default();
-                *st = ReplicationStats {
-                    pending_size: stat.pending_size + st.pending_size,
-                    failed_size: stat.failed_size + st.failed_size,
-                    replicated_size: stat.replicated_size + st.replicated_size,
-                    pending_count: stat.pending_count + st.pending_count,
-                    failed_count: stat.failed_count + st.failed_count,
-                    replicated_count: stat.replicated_count + st.replicated_count,
-                    ..Default::default()
-                };
-            }
-        }
-
-        for (i, v) in other.obj_sizes.0.iter().enumerate() {
-            self.obj_sizes.0[i] += v;
-        }
-
-        for (i, v) in other.obj_versions.0.iter().enumerate() {
-            self.obj_versions.0[i] += v;
-        }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -583,19 +544,556 @@ pub struct DataUsageEntryInfo {
     pub name: String,
     pub parent: String,
     pub entry: DataUsageEntry,
+    /// Durable bucket incarnation that produced this bucket root. Missing
+    /// values are legacy/unproven and must not authorize cold-bucket reuse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket_incarnation: Option<uuid::Uuid>,
+    /// Registry generation used to classify this root entry. Older remote
+    /// workers omit it; callers must reject that result when a frozen cycle
+    /// requires generation fencing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier_registry_generation: Option<u64>,
+    /// Per-source provenance; absence is a readable legacy value, not a certificate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_origin: Option<DataUsageBucketValueOrigin>,
+}
+
+/// Diagnostic provenance of a canonical bucket contribution on one set.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DataUsageBucketValueOrigin {
+    pub epoch: u64,
+    pub cycle: u64,
+    pub completed_at: SystemTime,
+    pub carried: bool,
+}
+
+/// Evidence of forward motion within one admitted bucket sweep. This never
+/// proves completed coverage and is used only to schedule another service turn.
+#[derive(Clone, Debug)]
+pub(crate) struct DataUsageDurableProgress {
+    bucket: String,
+    source: Option<DataUsageCacheSource>,
+    identity: Option<DataUsageScanIdentity>,
+    started_plan: Option<DataUsageScanPlanDigest>,
+    frontier: Option<String>,
+    raw: HashMap<String, crate::raw_page_index::RawEnumerationDurableProgress>,
+}
+
+impl DataUsageDurableProgress {
+    pub(crate) fn advanced_from(&self, previous: &Self) -> bool {
+        if self.bucket != previous.bucket
+            || self.source.is_none()
+            || self.source != previous.source
+            || !self.identity.is_some_and(|identity| identity.is_valid())
+            || self.identity != previous.identity
+            || self.started_plan.is_none()
+            || self.started_plan != previous.started_plan
+        {
+            return false;
+        }
+        let mut advanced = match (&previous.frontier, &self.frontier) {
+            (Some(before), Some(after)) => {
+                if !scan_frontier_covers_path(before, after) {
+                    return false;
+                }
+                before != after
+            }
+            (Some(_), None) => return false,
+            (None, Some(_)) => true,
+            (None, None) => false,
+        };
+        for (parent, before) in &previous.raw {
+            match self.raw.get(parent) {
+                Some(after) if after.extends(before) => {}
+                None if self
+                    .frontier
+                    .as_ref()
+                    .is_some_and(|frontier| scan_frontier_covers_path(parent, frontier)) => {}
+                _ => return false,
+            }
+        }
+        for (parent, after) in &self.raw {
+            let before = previous.raw.get(parent).map_or(0, |value| value.committed_entries());
+            advanced |= after.committed_entries() > before;
+        }
+        advanced
+    }
+}
+
+/// Latest complete cross-cycle observation, never a canonical cache value.
+/// Keeping the flattened value separate lets subsequent partial walks retain it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DataUsageBucketObservation {
+    pub version: u16,
+    pub source: DataUsageCacheSource,
+    pub identity: DataUsageScanIdentity,
+    pub started_plan: DataUsageScanPlanDigest,
+    pub requested_plan: DataUsageScanPlanDigest,
+    pub completed_epoch: u64,
+    pub completed_cycle: u64,
+    pub completed_at: SystemTime,
+    pub entry: DataUsageEntry,
+}
+
+impl DataUsageBucketObservation {
+    pub(crate) fn matches(&self, source: DataUsageCacheSource, identity: DataUsageScanIdentity) -> bool {
+        self.version == 1
+            && self.source == source
+            && self.identity == identity
+            && identity.is_valid()
+            && self.started_plan != self.requested_plan
+            && self.entry.children.is_empty()
+            && self.entry.failed_objects == 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(deny_unknown_fields)]
+pub struct DataUsageCacheSource {
+    pub pool_index: usize,
+    pub set_index: usize,
+}
+
+impl DataUsageCacheSource {
+    pub const fn new(pool_index: usize, set_index: usize) -> Self {
+        Self { pool_index, set_index }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(transparent)]
+pub struct DataUsageScanPlanDigest(pub [u8; 32]);
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingScannerHealKind {
+    Bucket,
+    Object,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingScannerHeal {
+    pub kind: PendingScannerHealKind,
+    pub bucket: String,
+    #[serde(default)]
+    pub object: Option<String>,
+    #[serde(default)]
+    pub version_id: Option<String>,
+    pub scan_mode: HealScanMode,
+    pub first_seen: u64,
+    pub last_attempt: u64,
+    pub attempts: u32,
+    #[serde(default)]
+    pub last_admission_result: String,
+    #[serde(default)]
+    pub last_admission_reason: String,
+}
+
+/// One bucket's standing in its set's service order. The wait position, the
+/// quanta granted and the last certification are separate quantities: a bucket
+/// that keeps failing moves to the tail like any other and only adds debt.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct DataUsageBucketService {
+    #[serde(default)]
+    pub waiting_since: u64,
+    #[serde(default)]
+    pub service_quanta: u64,
+    #[serde(default)]
+    pub last_certified: Option<u64>,
+    #[serde(default)]
+    pub failure_debt: u64,
+    #[serde(default)]
+    pub incarnation: Option<uuid::Uuid>,
+}
+
+// Nested derives encode positionally; a map lets later fields stay optional.
+impl Serialize for DataUsageBucketService {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let field_count = 2
+            + usize::from(self.last_certified.is_some())
+            + usize::from(self.failure_debt != 0)
+            + usize::from(self.incarnation.is_some());
+        let mut map = serializer.serialize_map(Some(field_count))?;
+        map.serialize_entry("waiting_since", &self.waiting_since)?;
+        map.serialize_entry("service_quanta", &self.service_quanta)?;
+        if let Some(last_certified) = self.last_certified {
+            map.serialize_entry("last_certified", &last_certified)?;
+        }
+        if self.failure_debt != 0 {
+            map.serialize_entry("failure_debt", &self.failure_debt)?;
+        }
+        if let Some(incarnation) = self.incarnation {
+            map.serialize_entry("incarnation", &incarnation)?;
+        }
+        map.end()
+    }
+}
+
+/// Durable first-in-first-out service order of one set, in generations: every
+/// bucket at or below `generation_floor` still waits for its turn and everything
+/// above it was served, so a new bucket queues behind waiters but ahead of
+/// buckets that already had a turn. It only orders work:
+/// no entry proves coverage, authorizes a skip or releases a responsibility,
+/// so losing it restarts fairness and nothing else. Like the set cache's bucket
+/// entries and incarnations, it holds one record per bucket of the inventory.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct DataUsageBucketServiceLedger {
+    /// Movement epoch the order was built under; another epoch invalidates it.
+    #[serde(default)]
+    pub publication_epoch: u64,
+    /// Leader that saved the order; an incomplete save stamps nothing else.
+    #[serde(default)]
+    pub leader_epoch: u64,
+    #[serde(default)]
+    pub next_sequence: u64,
+    #[serde(default)]
+    pub generation_floor: u64,
+    #[serde(default)]
+    pub buckets: HashMap<String, DataUsageBucketService>,
+}
+
+impl Serialize for DataUsageBucketServiceLedger {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(5))?;
+        map.serialize_entry("publication_epoch", &self.publication_epoch)?;
+        map.serialize_entry("leader_epoch", &self.leader_epoch)?;
+        map.serialize_entry("next_sequence", &self.next_sequence)?;
+        map.serialize_entry("generation_floor", &self.generation_floor)?;
+        map.serialize_entry("buckets", &self.buckets)?;
+        map.end()
+    }
+}
+
+impl DataUsageBucketServiceLedger {
+    /// Rebuilds the order for this cycle's inventory. Decoded state that fails
+    /// validation or belongs to another movement epoch starts a new order;
+    /// a bucket whose incarnation changed is a new arrival behind all waiters.
+    pub(crate) fn restore<'a>(
+        persisted: Option<Self>,
+        publication_epoch: u64,
+        inventory: impl Iterator<Item = &'a str>,
+        incarnations: Option<&HashMap<String, uuid::Uuid>>,
+    ) -> Self {
+        let mut ledger = persisted
+            .filter(|ledger| ledger.publication_epoch == publication_epoch && ledger.is_valid())
+            .unwrap_or_else(|| Self {
+                publication_epoch,
+                ..Default::default()
+            });
+        let previous = std::mem::take(&mut ledger.buckets);
+        let mut arrivals = Vec::new();
+        for bucket in inventory {
+            let incarnation = incarnations.and_then(|current| current.get(bucket)).copied();
+            match previous.get(bucket) {
+                Some(service) if service.incarnation.is_none() || incarnation.is_none() || service.incarnation == incarnation => {
+                    ledger.buckets.insert(
+                        bucket.to_owned(),
+                        DataUsageBucketService {
+                            incarnation: incarnation.or(service.incarnation),
+                            ..*service
+                        },
+                    );
+                }
+                _ => arrivals.push((bucket, incarnation)),
+            }
+        }
+        if arrivals.is_empty() {
+            let floor = ledger.generation_floor;
+            if ledger.buckets.values().all(|service| service.waiting_since > floor) {
+                ledger.generation_floor = ledger.next_sequence;
+            }
+            return ledger;
+        }
+        // Open one position between the waiters and the served buckets.
+        let floor = ledger.generation_floor;
+        ledger.generation_floor = floor.saturating_add(1);
+        ledger.next_sequence = ledger.next_sequence.saturating_add(1);
+        for service in ledger.buckets.values_mut().filter(|service| service.waiting_since > floor) {
+            service.waiting_since = service.waiting_since.saturating_add(1);
+        }
+        for (bucket, incarnation) in arrivals {
+            ledger.buckets.insert(
+                bucket.to_owned(),
+                DataUsageBucketService {
+                    waiting_since: ledger.generation_floor,
+                    incarnation,
+                    ..Default::default()
+                },
+            );
+        }
+        ledger
+    }
+
+    fn is_valid(&self) -> bool {
+        self.generation_floor <= self.next_sequence
+            && self
+                .buckets
+                .iter()
+                .all(|(bucket, service)| !bucket.is_empty() && service.waiting_since <= self.next_sequence)
+    }
+
+    /// Smaller positions have waited longer; an untracked bucket queues last.
+    pub(crate) fn wait_position(&self, bucket: &str) -> u64 {
+        self.buckets.get(bucket).map_or(u64::MAX, |service| service.waiting_since)
+    }
+
+    /// Moves a bucket to the tail and returns its previous wait position.
+    pub(crate) fn record_service(&mut self, bucket: &str) -> Option<u64> {
+        let service = self.buckets.get_mut(bucket)?;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        let previous = std::mem::replace(&mut service.waiting_since, self.next_sequence);
+        service.service_quanta = service.service_quanta.saturating_add(1);
+        Some(previous)
+    }
+
+    /// Undoes `record_service` for an admission a resource veto turned back.
+    pub(crate) fn return_service(&mut self, bucket: &str, waiting_since: u64) {
+        if let Some(service) = self.buckets.get_mut(bucket) {
+            service.waiting_since = waiting_since;
+            service.service_quanta = service.service_quanta.saturating_sub(1);
+        }
+    }
+
+    pub(crate) fn record_certified(&mut self, bucket: &str) {
+        if let Some(service) = self.buckets.get_mut(bucket) {
+            service.last_certified = Some(service.waiting_since);
+            service.failure_debt = 0;
+        }
+    }
+
+    pub(crate) fn record_failure(&mut self, bucket: &str) {
+        if let Some(service) = self.buckets.get_mut(bucket) {
+            service.failure_debt = service.failure_debt.saturating_add(1);
+        }
+    }
+
+    /// Buckets holding unpaid failures and the first of them by name.
+    pub(crate) fn failure_debt(&self) -> (usize, Option<&str>) {
+        let mut debtors = self
+            .buckets
+            .iter()
+            .filter(|(_, service)| service.failure_debt > 0)
+            .map(|(bucket, _)| bucket.as_str());
+        let first = debtors.next();
+        let (count, first) = debtors.fold((usize::from(first.is_some()), first), |(count, first), bucket| {
+            (count + 1, first.min(Some(bucket)))
+        });
+        (count, first)
+    }
 }
 
 /// Data usage cache info
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct DataUsageCacheInfo {
+    /// In-memory only: this partial stopped on admission pressure, not a failure.
+    #[serde(skip)]
+    pub scan_resource_deferred: bool,
     pub name: String,
     pub next_cycle: u64,
     pub last_update: Option<SystemTime>,
     pub skip_healing: bool,
+    #[serde(default, deserialize_with = "crate::lifecycle_cache::deserialize")]
     pub lifecycle: Option<Arc<BucketLifecycleConfiguration>>,
     pub replication: Option<Arc<ReplicationConfig>>,
     #[serde(default)]
     pub failed_objects: HashMap<String, u64>,
+    #[serde(default)]
+    pub scan_resume_after: Option<String>,
+    #[serde(default)]
+    pub scan_checkpoint: Option<DataUsageScanCheckpoint>,
+    #[serde(default)]
+    pub scan_raw_enumeration_cursor: Option<DataUsageRawEnumerationCursor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_raw_enumeration_page_index: Option<RawEnumerationPageIndex>,
+    /// Indexes of the other directories on the active walk path. A restart
+    /// must replay every wide ancestor before it reaches the selected one, and
+    /// recharging those replays would stop a fixed budget from ever advancing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scan_raw_enumeration_path_page_indexes: Vec<RawEnumerationPageIndex>,
+    #[serde(default)]
+    pub scan_identity: Option<DataUsageScanIdentity>,
+    #[serde(default)]
+    pub scan_progress: Option<DataUsageScanProgress>,
+    /// Original per-owner mutation witness for the complete sweep. Absent on
+    /// legacy/global coverage plans; renewal never rewrites its start revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_usage_watch: Option<crate::scanner_io::ScannerUsageWatchProof>,
+    #[serde(default)]
+    pub scan_coverage_receipt: Option<DataUsageScanCoverageReceipt>,
+    #[serde(default)]
+    pub pending_heals: Vec<PendingScannerHeal>,
+    #[serde(default, deserialize_with = "crate::object_lock_cache::deserialize")]
+    pub object_lock: Option<Arc<ObjectLockConfiguration>>,
+    #[serde(default)]
+    pub leader_epoch: u64,
+    #[serde(default)]
+    pub source: Option<DataUsageCacheSource>,
+    #[serde(default)]
+    pub snapshot_complete: bool,
+    #[serde(default)]
+    pub scan_plan_digest: Option<DataUsageScanPlanDigest>,
+    /// Full activity and inventory scope of a set scan; only a complete
+    /// snapshot proves coverage. Bucket caches bind this scope into their
+    /// opaque scan plan digest instead.
+    #[serde(default)]
+    pub scan_coverage_digest: Option<DataUsageScanPlanDigest>,
+    #[serde(default)]
+    pub cache_key_format: u16,
+    /// Registry generation used for the completed/partial scan. This is
+    /// process-local audit data; older cache writers omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier_registry_generation: Option<u64>,
+    /// Bounded durable debts for versions whose logical size was not trusted.
+    /// The map key is an identity key, never a user-controlled metric label.
+    #[serde(default)]
+    pub size_reconciliation: HashMap<String, SizeReconciliationEntry>,
+    /// Whether the entries retained while a set scan was incomplete come
+    /// from a prior complete set snapshot.  This is observational input only.
+    #[serde(default)]
+    pub lkg_snapshot_complete: bool,
+    #[serde(default)]
+    pub lkg_next_cycle: Option<u64>,
+    #[serde(default)]
+    pub lkg_last_update: Option<SystemTime>,
+    #[serde(default)]
+    pub lkg_leader_epoch: Option<u64>,
+    #[serde(default)]
+    pub lkg_scan_plan_digest: Option<DataUsageScanPlanDigest>,
+    /// Activity-sensitive identity for same-cycle set snapshot reuse. The
+    /// structural plan remains reusable across ordinary bucket writes.
+    #[serde(default)]
+    pub scan_execution_digest: Option<DataUsageScanPlanDigest>,
+    /// Process-epoch and generation window that produced a complete set cache
+    /// with all known segment invalidation producers wired. This proof is
+    /// additive compatibility metadata; absence keeps segment reuse disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segment_invalidation_proof: Option<DataUsageSegmentInvalidationProof>,
+    /// Durable bucket incarnations captured for a complete set aggregate.
+    /// Missing or nil entries are legacy/unproven and cannot authorize
+    /// skipping an unselected bucket in a later scoped set scan.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub scan_bucket_incarnations: HashMap<String, uuid::Uuid>,
+    /// Bucket service order of a set cache; absent from bucket caches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_bucket_service: Option<DataUsageBucketServiceLedger>,
+    /// One immutable completed observation per bucket on this source. Older readers ignore it.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub scan_bucket_observations: HashMap<String, DataUsageBucketObservation>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub scan_bucket_value_origins: HashMap<String, DataUsageBucketValueOrigin>,
+}
+
+impl Serialize for DataUsageCacheInfo {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // Keep this metadata map-encoded so older readers can ignore fields
+        // appended by newer scanner versions during rolling upgrades.
+        let field_count = 16
+            + usize::from(self.scan_raw_enumeration_cursor.is_some())
+            + usize::from(self.scan_raw_enumeration_page_index.is_some())
+            + usize::from(!self.scan_raw_enumeration_path_page_indexes.is_empty())
+            + usize::from(self.scan_identity.is_some())
+            + usize::from(self.scan_progress.is_some())
+            + usize::from(self.scan_usage_watch.is_some())
+            + usize::from(self.scan_coverage_receipt.is_some())
+            + usize::from(self.scan_coverage_digest.is_some())
+            + usize::from(self.tier_registry_generation.is_some())
+            + usize::from(!self.size_reconciliation.is_empty())
+            + usize::from(self.lkg_snapshot_complete)
+            + usize::from(self.lkg_next_cycle.is_some())
+            + usize::from(self.lkg_last_update.is_some())
+            + usize::from(self.lkg_leader_epoch.is_some())
+            + usize::from(self.lkg_scan_plan_digest.is_some())
+            + usize::from(self.scan_execution_digest.is_some())
+            + usize::from(self.segment_invalidation_proof.is_some())
+            + usize::from(!self.scan_bucket_incarnations.is_empty())
+            + usize::from(self.scan_bucket_service.is_some())
+            + usize::from(!self.scan_bucket_observations.is_empty())
+            + usize::from(!self.scan_bucket_value_origins.is_empty());
+        let mut state = serializer.serialize_map(Some(field_count))?;
+        state.serialize_entry("name", &self.name)?;
+        state.serialize_entry("next_cycle", &self.next_cycle)?;
+        state.serialize_entry("leader_epoch", &self.leader_epoch)?;
+        state.serialize_entry("last_update", &self.last_update)?;
+        state.serialize_entry("skip_healing", &self.skip_healing)?;
+        state.serialize_entry("lifecycle", &crate::lifecycle_cache::LifecycleCache(&self.lifecycle))?;
+        state.serialize_entry("replication", &self.replication)?;
+        state.serialize_entry("failed_objects", &self.failed_objects)?;
+        state.serialize_entry("scan_resume_after", &self.scan_resume_after)?;
+        state.serialize_entry("scan_checkpoint", &self.scan_checkpoint)?;
+        if let Some(cursor) = &self.scan_raw_enumeration_cursor {
+            state.serialize_entry("scan_raw_enumeration_cursor", cursor)?;
+        }
+        if let Some(index) = &self.scan_raw_enumeration_page_index {
+            state.serialize_entry("scan_raw_enumeration_page_index", index)?;
+        }
+        if !self.scan_raw_enumeration_path_page_indexes.is_empty() {
+            state.serialize_entry("scan_raw_enumeration_path_page_indexes", &self.scan_raw_enumeration_path_page_indexes)?;
+        }
+        if let Some(identity) = self.scan_identity {
+            state.serialize_entry("scan_identity", &identity)?;
+        }
+        if let Some(progress) = self.scan_progress {
+            state.serialize_entry("scan_progress", &progress)?;
+        }
+        if let Some(watch) = &self.scan_usage_watch {
+            state.serialize_entry("scan_usage_watch", watch)?;
+        }
+        if let Some(receipt) = &self.scan_coverage_receipt {
+            state.serialize_entry("scan_coverage_receipt", receipt)?;
+        }
+        state.serialize_entry("pending_heals", &self.pending_heals)?;
+        state.serialize_entry("object_lock", &crate::object_lock_cache::ObjectLockCache(&self.object_lock))?;
+        state.serialize_entry("source", &self.source)?;
+        state.serialize_entry("snapshot_complete", &self.snapshot_complete)?;
+        state.serialize_entry("scan_plan_digest", &self.scan_plan_digest)?;
+        if let Some(coverage) = self.scan_coverage_digest {
+            state.serialize_entry("scan_coverage_digest", &coverage)?;
+        }
+        state.serialize_entry("cache_key_format", &self.cache_key_format)?;
+        if let Some(generation) = self.tier_registry_generation {
+            state.serialize_entry("tier_registry_generation", &generation)?;
+        }
+        if !self.size_reconciliation.is_empty() {
+            state.serialize_entry("size_reconciliation", &self.size_reconciliation)?;
+        }
+        if self.lkg_snapshot_complete {
+            state.serialize_entry("lkg_snapshot_complete", &true)?;
+        }
+        if let Some(next_cycle) = self.lkg_next_cycle {
+            state.serialize_entry("lkg_next_cycle", &next_cycle)?;
+        }
+        if let Some(last_update) = self.lkg_last_update {
+            state.serialize_entry("lkg_last_update", &last_update)?;
+        }
+        if let Some(leader_epoch) = self.lkg_leader_epoch {
+            state.serialize_entry("lkg_leader_epoch", &leader_epoch)?;
+        }
+        if let Some(scan_plan_digest) = self.lkg_scan_plan_digest {
+            state.serialize_entry("lkg_scan_plan_digest", &scan_plan_digest)?;
+        }
+        if let Some(scan_execution_digest) = self.scan_execution_digest {
+            state.serialize_entry("scan_execution_digest", &scan_execution_digest)?;
+        }
+        if let Some(proof) = &self.segment_invalidation_proof {
+            state.serialize_entry("segment_invalidation_proof", proof)?;
+        }
+        if !self.scan_bucket_incarnations.is_empty() {
+            state.serialize_entry("scan_bucket_incarnations", &self.scan_bucket_incarnations)?;
+        }
+        if let Some(ledger) = &self.scan_bucket_service {
+            state.serialize_entry("scan_bucket_service", ledger)?;
+        }
+        if !self.scan_bucket_observations.is_empty() {
+            state.serialize_entry("scan_bucket_observations", &self.scan_bucket_observations)?;
+        }
+        if !self.scan_bucket_value_origins.is_empty() {
+            state.serialize_entry("scan_bucket_value_origins", &self.scan_bucket_value_origins)?;
+        }
+        state.end()
+    }
 }
 
 /// Data usage cache
@@ -605,88 +1103,846 @@ pub struct DataUsageCache {
     pub cache: HashMap<String, DataUsageEntry>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DataUsageCachePrepareOutcome {
+    Reused,
+    Reset,
+    RejectedNewerCycle,
+    RejectedNewerLeader,
+}
+
 impl DataUsageCache {
+    /// Reconcile tier keys loaded from an older cache against the registry
+    /// frozen for this scan. New metadata is already routed through
+    /// `UNKNOWN_TIER`; this pass handles retired keys that predate that rule.
+    /// Legacy `TierStats` carries physical bytes only, so this migration does
+    /// not manufacture a logical unknown-byte value from that physical total.
+    pub(crate) fn fold_retired_tiers(&mut self, tier_names: &[String]) {
+        let known_tiers = tier_names.iter().map(String::as_str).collect::<HashSet<_>>();
+        for entry in self.cache.values_mut() {
+            let Some(tiers) = entry.all_tier_stats.as_mut() else { continue };
+            let existing_unknown = tiers.tiers.get(UNKNOWN_TIER).map(clone_cache_value).unwrap_or_default();
+            let companion_present = entry.unknown_tier_stats.as_ref().is_some_and(|stats| !stats.is_empty());
+            let migrate_existing_unknown = !companion_present;
+            let mut retired = TierStats::default();
+            let mut retired_key_found = false;
+            if migrate_existing_unknown {
+                retired = retired.add(&existing_unknown);
+            }
+            for (tier, stats) in &tiers.tiers {
+                if tier != UNKNOWN_TIER
+                    && tier != storageclass::STANDARD
+                    && tier != storageclass::RRS
+                    && !known_tiers.contains(tier.as_str())
+                {
+                    retired_key_found = true;
+                    retired = retired.add(stats);
+                }
+            }
+            tiers.fold_unknown_tiers(tier_names.iter().map(String::as_str));
+            if !retired.is_empty() && !companion_present {
+                entry.add_unknown_tier_stats(&UnknownTierStats {
+                    // The legacy map stores physical bytes only. Logical
+                    // bytes remain zero until a fresh object scan observes
+                    // them under the current metadata format.
+                    unknown_physical_bytes: retired.total_size,
+                    unknown_objects: retired.num_objects,
+                    unknown_versions: retired.num_versions,
+                    ..Default::default()
+                });
+                // The legacy tier map has no logical-byte dimension, so a
+                // proof that classified this retired key as known cannot be
+                // repaired safely. Mark it unvalidated and require a fresh
+                // scan rather than guessing a logical subtraction.
+                entry.tier_accounting_proof = None;
+            } else if retired_key_found {
+                // A nonempty companion has no provenance tying it to the
+                // retired map keys. Reject the mixed cache until a fresh scan
+                // reconciles the dimensions instead of double-counting them.
+                entry.tier_accounting_proof = None;
+            }
+        }
+    }
+
+    /// Prefix-level usage query over this (writer-side) cache; see
+    /// [`prefix_usage_in_cache`] for the semantics
+    /// (rustfs/backlog#1872).
+    pub fn prefix_usage(&self, bucket: &str, prefix: &str, max_entries: usize) -> Option<PrefixUsageQuery> {
+        prefix_usage_in_cache(&self.cache, bucket, prefix, max_entries)
+    }
+
+    pub(crate) fn prepare_for_scan(
+        &mut self,
+        name: &str,
+        next_cycle: u64,
+        leader_epoch: u64,
+        source: DataUsageCacheSource,
+        scan_plan_digest: DataUsageScanPlanDigest,
+        require_source: bool,
+    ) -> DataUsageCachePrepareOutcome {
+        if self.info.next_cycle > next_cycle {
+            return DataUsageCachePrepareOutcome::RejectedNewerCycle;
+        }
+        if self.info.leader_epoch > leader_epoch {
+            return DataUsageCachePrepareOutcome::RejectedNewerLeader;
+        }
+
+        let source_matches = self.info.source == Some(source);
+        let plan_matches = self.info.scan_plan_digest == Some(scan_plan_digest);
+        let metadata_is_reusable = self.info.name == name
+            && self.info.leader_epoch == leader_epoch
+            && plan_matches
+            && (source_matches || (!require_source && self.info.source.is_none()))
+            && self.info.cache_key_format == DATA_USAGE_CACHE_KEY_FORMAT;
+        let reusable = metadata_is_reusable
+            && (self.cache.is_empty()
+                || if name == DATA_USAGE_ROOT || self.info.snapshot_complete {
+                    self.checked_flatten_complete_scope(name).is_some()
+                } else {
+                    self.checked_flatten(name).is_some()
+                });
+        if !reusable {
+            let (pending_heals, size_reconciliation) = if self.info.name == name {
+                (
+                    std::mem::take(&mut self.info.pending_heals),
+                    std::mem::take(&mut self.info.size_reconciliation),
+                )
+            } else {
+                (Vec::new(), HashMap::new())
+            };
+            *self = Self::default();
+            self.info.name = name.to_string();
+            self.info.pending_heals = pending_heals;
+            self.info.size_reconciliation = size_reconciliation;
+        }
+
+        self.info.next_cycle = next_cycle;
+        self.info.leader_epoch = leader_epoch;
+        self.info.source = Some(source);
+        self.info.scan_plan_digest = Some(scan_plan_digest);
+        self.info.cache_key_format = DATA_USAGE_CACHE_KEY_FORMAT;
+        self.info.snapshot_complete = false;
+        if reusable {
+            DataUsageCachePrepareOutcome::Reused
+        } else {
+            DataUsageCachePrepareOutcome::Reset
+        }
+    }
+
+    pub(crate) fn durable_scan_progress(&self) -> DataUsageDurableProgress {
+        DataUsageDurableProgress {
+            bucket: self.info.name.clone(),
+            source: self.info.source,
+            identity: self.info.scan_identity,
+            started_plan: self.info.scan_progress.map(|progress| progress.started_plan),
+            frontier: self.validated_scan_frontier().map(str::to_owned),
+            raw: self
+                .info
+                .scan_raw_enumeration_page_index
+                .iter()
+                .chain(&self.info.scan_raw_enumeration_path_page_indexes)
+                .filter_map(|index| index.durable_progress())
+                .filter(|progress| path_is_in_bucket_scope(&self.info.name, &progress.parent))
+                .map(|progress| (progress.parent.clone(), progress))
+                .collect(),
+        }
+    }
+
+    pub(crate) fn has_scan_position(&self) -> bool {
+        self.info.scan_resume_after.is_some()
+            || self.info.scan_checkpoint.is_some()
+            || self.info.scan_raw_enumeration_cursor.is_some()
+            || self.info.scan_raw_enumeration_page_index.is_some()
+            || self.info.scan_coverage_receipt.is_some()
+    }
+
+    /// Resume and reuse under one plan; fixtures that model a single digest.
+    #[cfg(test)]
+    pub(crate) fn prepare_bucket_checkpoint(
+        &mut self,
+        name: &str,
+        next_cycle: u64,
+        leader_epoch: u64,
+        source: DataUsageCacheSource,
+        scan_plan_digest: DataUsageScanPlanDigest,
+        identity: DataUsageScanIdentity,
+    ) -> DataUsageCachePrepareOutcome {
+        self.prepare_bucket_checkpoint_with_coverage(
+            name,
+            next_cycle,
+            leader_epoch,
+            source,
+            scan_plan_digest,
+            scan_plan_digest,
+            identity,
+        )
+    }
+
+    /// `scan_plan_digest` is the reuse plan a complete cache is current under;
+    /// `checkpoint_plan_digest` is the coverage plan a sweep is started and
+    /// resumed under (`scanner_activity_coverage_digest`). The two differ by
+    /// the inputs that force a new walk without changing the namespace a
+    /// walk traverses, so a coordinator restart invalidates finished results
+    /// but not a sweep in progress.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_bucket_checkpoint_with_coverage(
+        &mut self,
+        name: &str,
+        next_cycle: u64,
+        leader_epoch: u64,
+        source: DataUsageCacheSource,
+        scan_plan_digest: DataUsageScanPlanDigest,
+        checkpoint_plan_digest: DataUsageScanPlanDigest,
+        identity: DataUsageScanIdentity,
+    ) -> DataUsageCachePrepareOutcome {
+        if self.info.next_cycle > next_cycle {
+            return DataUsageCachePrepareOutcome::RejectedNewerCycle;
+        }
+        if self.info.leader_epoch > leader_epoch {
+            return DataUsageCachePrepareOutcome::RejectedNewerLeader;
+        }
+        let previous_cycle = self.info.next_cycle;
+        let previous_leader_epoch = self.info.leader_epoch;
+        let retained_observations = std::mem::take(&mut self.info.scan_bucket_observations)
+            .into_iter()
+            .filter(|(bucket, observation)| bucket == name && observation.matches(source, identity))
+            .collect();
+        // A checkpoint is a durable traversal frontier, not a publication
+        // result.  A newer leader may adopt it only when the frontier is
+        // independently fenced by the bucket identity and has a validated
+        // cursor/coverage receipt.  Caches without that proof still take the
+        // normal rebuild path; this keeps an old, incomplete writer from
+        // authorizing a new leader to skip namespace coverage.
+        // Cycle deadlines advance both counters, so a validated frontier from
+        // an earlier cycle must remain eligible for adoption.
+        let cross_epoch_checkpoint = self.info.leader_epoch < leader_epoch
+            && self.info.scan_identity == Some(identity)
+            && (self.validated_scan_frontier().is_some()
+                || self.validated_raw_enumeration_cursor().is_some()
+                || self.validated_raw_enumeration_page_index().is_some());
+        let handoff_frontier = cross_epoch_checkpoint
+            .then(|| self.validated_scan_frontier().map(clone_cache_value))
+            .flatten();
+        let reusable = identity.is_valid()
+            && name != DATA_USAGE_ROOT
+            && self.info.name == name
+            && self.info.source == Some(source)
+            && (self.info.leader_epoch == leader_epoch || cross_epoch_checkpoint)
+            && self.info.cache_key_format == DATA_USAGE_CACHE_KEY_FORMAT
+            && self.info.scan_identity == Some(identity)
+            && self.info.tier_registry_generation == Some(identity.tier_registry_generation)
+            && (self.cache.is_empty() || self.checked_flatten_complete_scope(name).is_some());
+        if reusable
+            && self.info.snapshot_complete
+            && self.info.scan_progress.is_none()
+            && !self.has_scan_position()
+            && self.info.scan_plan_digest == Some(scan_plan_digest)
+        {
+            return self.prepare_for_scan(name, next_cycle, leader_epoch, source, scan_plan_digest, true);
+        }
+        if !reusable {
+            if self.has_scan_position() {
+                let reason = if name == DATA_USAGE_ROOT {
+                    "invalid_bucket_scope"
+                } else if !identity.is_valid() {
+                    "invalid_identity"
+                } else if self.info.name != name {
+                    "bucket_mismatch"
+                } else if self.info.source != Some(source) {
+                    "source_mismatch"
+                } else if self.info.cache_key_format != DATA_USAGE_CACHE_KEY_FORMAT {
+                    "key_format_mismatch"
+                } else if self.info.scan_identity != Some(identity)
+                    || self.info.tier_registry_generation != Some(identity.tier_registry_generation)
+                {
+                    "identity_mismatch"
+                } else if self.info.leader_epoch != leader_epoch && !cross_epoch_checkpoint {
+                    "unvalidated_handoff"
+                } else {
+                    "incomplete_cache_scope"
+                };
+                warn!(
+                    target: "rustfs::scanner::data_usage",
+                    event = EVENT_SCANNER_CACHE_LOAD_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_CACHE,
+                    state = "checkpoint_reset",
+                    bucket = %name,
+                    reason,
+                    "Scanner bucket checkpoint cannot be adopted"
+                );
+            }
+            let keep_debts = self.info.name == name
+                && self
+                    .info
+                    .scan_identity
+                    .is_none_or(|previous| previous.bucket_incarnation == identity.bucket_incarnation);
+            let (pending_heals, size_reconciliation) = if keep_debts {
+                (
+                    std::mem::take(&mut self.info.pending_heals),
+                    std::mem::take(&mut self.info.size_reconciliation),
+                )
+            } else {
+                (Vec::new(), HashMap::new())
+            };
+            *self = Self::default();
+            self.info.pending_heals = pending_heals;
+            self.info.size_reconciliation = size_reconciliation;
+        }
+        if self.validated_raw_enumeration_cursor().is_none() {
+            self.info.scan_raw_enumeration_cursor = None;
+        }
+        self.info.scan_bucket_observations = retained_observations;
+        self.info.scan_bucket_value_origins.clear();
+        if self.validated_raw_enumeration_page_index().is_none() {
+            self.info.scan_raw_enumeration_page_index = None;
+            self.info.scan_raw_enumeration_path_page_indexes.clear();
+        }
+        let path_indexes = std::mem::take(&mut self.info.scan_raw_enumeration_path_page_indexes);
+        self.info.scan_raw_enumeration_path_page_indexes = path_indexes
+            .into_iter()
+            .take(MAX_DATA_USAGE_CACHE_DEPTH)
+            .filter(|index| self.raw_enumeration_page_index_is_valid(index))
+            .collect();
+        let cursor_is_valid = !self.has_scan_position()
+            || self.validated_scan_frontier().is_some()
+            || self.info.scan_raw_enumeration_cursor.is_some()
+            || self.info.scan_raw_enumeration_page_index.is_some();
+        if !cursor_is_valid {
+            self.info.scan_progress = None;
+        }
+        self.info.name = name.to_owned();
+        self.info.next_cycle = next_cycle;
+        self.info.leader_epoch = leader_epoch;
+        self.info.source = Some(source);
+        self.info.cache_key_format = DATA_USAGE_CACHE_KEY_FORMAT;
+        self.info.tier_registry_generation = Some(identity.tier_registry_generation);
+        self.info.scan_identity = Some(identity);
+        self.info.snapshot_complete = false;
+        if let Some(frontier) = handoff_frontier
+            && let Ok(digest) = self.coverage_prefix_digest(&frontier)
+            && let Some(receipt) = self.info.scan_coverage_receipt.as_mut()
+        {
+            // Migrate a legacy epoch-bound receipt while the old epoch is
+            // still available for validation.  New receipts deliberately do
+            // not bind to the process-local leader epoch.
+            receipt.digest = digest;
+        }
+        // A sweep without a durable position restarts from the first entry,
+        // so it observes nothing under the plan that finished the previous
+        // sweep. Keeping that plan would mark every sweep of a bucket written
+        // between cycles as mixed, and the bucket could never certify.
+        let has_position = self.has_scan_position();
+        if let Some(progress) = &mut self.info.scan_progress
+            && has_position
+        {
+            progress.requested_plan = checkpoint_plan_digest;
+        } else {
+            self.info.scan_progress = Some(DataUsageScanProgress {
+                started_plan: checkpoint_plan_digest,
+                requested_plan: checkpoint_plan_digest,
+            });
+            self.info.scan_resume_after = None;
+            self.info.scan_checkpoint = None;
+            self.info.scan_raw_enumeration_cursor = None;
+            self.info.scan_raw_enumeration_page_index = None;
+            self.info.scan_raw_enumeration_path_page_indexes.clear();
+            self.info.scan_coverage_receipt = None;
+        }
+        // Old readers do not understand coverage sweeps. An absent plan makes
+        // their existing prepare path rebuild instead of promoting mixed data.
+        self.info.scan_plan_digest = None;
+        debug!(
+            target: "rustfs::scanner::data_usage",
+            event = EVENT_SCANNER_CACHE_LOAD_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_CACHE,
+            state = "bucket_checkpoint_prepared",
+            bucket = %name,
+            pool = source.pool_index,
+            set = source.set_index,
+            cycle = next_cycle,
+            leader_epoch,
+            previous_cycle,
+            previous_leader_epoch,
+            resume_position = self.has_scan_position(),
+            mixed_coverage = self.info.scan_progress.is_some_and(|progress| progress.started_plan != progress.requested_plan),
+            "Scanner bucket checkpoint prepared for a coverage sweep"
+        );
+        if reusable {
+            DataUsageCachePrepareOutcome::Reused
+        } else {
+            DataUsageCachePrepareOutcome::Reset
+        }
+    }
+
+    fn coverage_prefix_digest(&self, through: &str) -> Result<[u8; 32], serde_json::Error> {
+        self.coverage_prefix_digest_with_epoch(through, None, 3)
+    }
+
+    fn v2_coverage_prefix_digest(&self, through: &str) -> Result<[u8; 32], serde_json::Error> {
+        self.coverage_prefix_digest_with_epoch(through, None, 2)
+    }
+
+    fn legacy_coverage_prefix_digest(&self, through: &str) -> Result<[u8; 32], serde_json::Error> {
+        self.coverage_prefix_digest_with_epoch(through, Some(self.info.leader_epoch), 0)
+    }
+
+    fn coverage_prefix_digest_with_epoch(
+        &self,
+        through: &str,
+        legacy_leader_epoch: Option<u64>,
+        domain_version: u8,
+    ) -> Result<[u8; 32], serde_json::Error> {
+        let mut writer = CheckpointDigestWriter(Sha256::new());
+        if let Some(leader_epoch) = legacy_leader_epoch {
+            // Keep the old tuple available for one-way migration of caches
+            // written before leader handoff recovery was introduced.
+            serde_json::to_writer(
+                &mut writer,
+                &(
+                    &self.info.name,
+                    self.info.scan_identity,
+                    self.info.source,
+                    leader_epoch,
+                    self.info.cache_key_format,
+                    self.info.scan_progress.map(|progress| progress.started_plan),
+                    through,
+                ),
+            )?;
+        } else {
+            // The receipt must survive a scanner leader handoff.  The bucket
+            // identity and publication epoch below fence the namespace; the
+            // process-local leader epoch is intentionally excluded because it
+            // changes during a safe handoff.  The domain version also keeps
+            // old epoch-bound receipts from colliding with this digest.
+            // Domain 3 permits object-health debt behind the frontier. Older
+            // readers must reject it because they skip covered failures.
+            serde_json::to_writer(
+                &mut writer,
+                &(
+                    domain_version,
+                    &self.info.name,
+                    self.info.scan_identity,
+                    self.info.source,
+                    self.info.cache_key_format,
+                    self.info.scan_progress.map(|progress| progress.started_plan),
+                    through,
+                ),
+            )?;
+        }
+        let mut prefix = self
+            .cache
+            .iter()
+            .filter(|(key, _)| {
+                // Sign exactly the subtrees the reader can reuse, including
+                // descendants whose raw path order differs from traversal order.
+                if legacy_leader_epoch.is_none() && domain_version >= 3 {
+                    return scan_frontier_covers_path(key, through);
+                }
+                let ancestor = through
+                    .strip_prefix(key.as_str())
+                    .is_some_and(|suffix| suffix.starts_with('/'));
+                let descendant = key.strip_prefix(through).is_some_and(|suffix| suffix.starts_with('/'));
+                (key.as_str() <= through && !ancestor) || descendant
+            })
+            .collect::<Vec<_>>();
+        prefix.sort_unstable_by_key(|(key, _)| *key);
+        for (key, entry) in prefix {
+            let mut value = serde_json::to_value(entry)?;
+            value.sort_all_objects();
+            if let Some(children) = value.get_mut("children").and_then(serde_json::Value::as_array_mut) {
+                children.sort_unstable_by(|left, right| left.as_str().cmp(&right.as_str()));
+            }
+            serde_json::to_writer(&mut writer, &(key, value))?;
+        }
+        Ok(writer.0.finalize().into())
+    }
+
+    pub(crate) fn validated_scan_frontier(&self) -> Option<&str> {
+        let receipt = self.info.scan_coverage_receipt.as_ref()?;
+        let checkpoint = self.info.scan_checkpoint.as_ref()?;
+        (self.info.scan_progress.is_some()
+            && self.info.scan_identity.is_some_and(|identity| identity.is_valid())
+            && self.info.source.is_some()
+            && receipt.through.len() <= 16 * 1024
+            && checkpoint.version == DATA_USAGE_SCAN_CHECKPOINT_VERSION
+            && checkpoint.resume_after == receipt.through
+            && self.info.scan_resume_after.as_deref() == Some(receipt.through.as_str())
+            && receipt
+                .through
+                .strip_prefix(&self.info.name)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+            && self.find(&receipt.through).is_some()
+            && (self.coverage_prefix_digest(&receipt.through).ok() == Some(receipt.digest)
+                || self.v2_coverage_prefix_digest(&receipt.through).ok() == Some(receipt.digest)
+                || self.legacy_coverage_prefix_digest(&receipt.through).ok() == Some(receipt.digest)))
+        .then_some(receipt.through.as_str())
+    }
+
+    pub(crate) fn validated_raw_enumeration_cursor(&self) -> Option<&DataUsageRawEnumerationCursor> {
+        let cursor = self.info.scan_raw_enumeration_cursor.as_ref()?;
+        (self.info.scan_progress.is_some()
+            && self.info.scan_identity.is_some_and(|identity| identity.is_valid())
+            && self.info.source.is_some()
+            && cursor.is_valid_for_bucket(&self.info.name))
+        .then_some(cursor)
+    }
+
+    pub(crate) fn validated_raw_enumeration_page_index(&self) -> Option<&RawEnumerationPageIndex> {
+        self.info
+            .scan_raw_enumeration_page_index
+            .as_ref()
+            .filter(|index| self.raw_enumeration_page_index_is_valid(index))
+    }
+
+    /// The durable index of one directory on the saved walk path.
+    pub(crate) fn validated_raw_enumeration_page_index_for_parent(&self, parent: &str) -> Option<&RawEnumerationPageIndex> {
+        self.info
+            .scan_raw_enumeration_page_index
+            .iter()
+            .chain(&self.info.scan_raw_enumeration_path_page_indexes)
+            .find(|index| index.parent() == Some(parent))
+            .filter(|index| self.raw_enumeration_page_index_is_valid(index))
+    }
+
+    fn raw_enumeration_page_index_is_valid(&self, index: &RawEnumerationPageIndex) -> bool {
+        if self.info.scan_progress.is_none()
+            || !self.info.scan_identity.is_some_and(|identity| identity.is_valid())
+            || self.info.source.is_none()
+            || index.committed_entries().is_err()
+            || index.indexed_entries().is_err()
+        {
+            return false;
+        }
+        match index.status() {
+            RawEnumerationPageOwnerStatus::Unsupported => false,
+            RawEnumerationPageOwnerStatus::Building { parent, .. } | RawEnumerationPageOwnerStatus::Ready { parent, .. } => {
+                path_is_in_bucket_scope(&self.info.name, &parent)
+            }
+        }
+    }
+
+    /// Seal only the frontier supplied by completed traversal, never a restored cursor.
+    pub(crate) fn seal_scan_frontier(&mut self, frontier: Option<&str>) -> Result<(), serde_json::Error> {
+        if self.info.scan_progress.is_none() {
+            self.info.scan_coverage_receipt = None;
+            return Ok(());
+        }
+        let frontier = frontier.filter(|path| path.len() <= 16 * 1024 && self.find(path).is_some());
+        self.info.scan_coverage_receipt = match frontier {
+            Some(through) => Some(DataUsageScanCoverageReceipt {
+                through: clone_cache_value(through),
+                digest: self.coverage_prefix_digest(through)?,
+            }),
+            None => None,
+        };
+        self.info.scan_resume_after = frontier.map(clone_cache_value);
+        let reason = self
+            .info
+            .scan_checkpoint
+            .as_ref()
+            .map_or(DataUsageScanCheckpointReason::Unknown, |checkpoint| checkpoint.reason);
+        self.info.scan_checkpoint = frontier.map(|through| DataUsageScanCheckpoint::new(clone_cache_value(through), reason));
+        Ok(())
+    }
+
+    /// Record only a fully traversed, healthy mixed sweep. Persistence callers
+    /// save this companion together with terminal cursor cleanup and retry debt.
+    pub(crate) fn record_completed_bucket_observation(&mut self) {
+        let (Some(source), Some(identity), Some(progress), Some(completed_at)) =
+            (self.info.source, self.info.scan_identity, self.info.scan_progress, self.info.last_update)
+        else {
+            return;
+        };
+        if !identity.is_valid() || progress.started_plan == progress.requested_plan {
+            return;
+        }
+        let Some(mut entry) = self.checked_flatten_complete_scope(&self.info.name) else {
+            return;
+        };
+        if entry.failed_objects != 0 || !self.info.failed_objects.is_empty() || !self.info.size_reconciliation.is_empty() {
+            return;
+        }
+        entry.children.clear();
+        self.info.scan_bucket_observations.insert(
+            self.info.name.clone(),
+            DataUsageBucketObservation {
+                version: 1,
+                source,
+                identity,
+                started_plan: progress.started_plan,
+                requested_plan: progress.requested_plan,
+                completed_epoch: self.info.leader_epoch,
+                completed_cycle: self.info.next_cycle,
+                completed_at,
+                entry,
+            },
+        );
+    }
+
+    pub(crate) fn completed_bucket_observation(&self) -> Option<&DataUsageBucketObservation> {
+        let observation = self.info.scan_bucket_observations.get(&self.info.name)?;
+        (observation.matches(self.info.source?, self.info.scan_identity?)
+            && observation.completed_epoch <= self.info.leader_epoch
+            && observation.completed_cycle <= self.info.next_cycle)
+            .then_some(observation)
+    }
+
+    fn ensure_cache_save_metrics_registered() {
+        CACHE_SAVE_METRICS_ONCE.call_once(|| {
+            describe_counter!(
+                METRIC_CACHE_SAVE_ATTEMPT_TOTAL,
+                "Total scanner data usage cache save attempts by result and cache type."
+            );
+            describe_counter!(
+                METRIC_CACHE_SAVE_TIMEOUT_TOTAL,
+                "Total scanner data usage cache save timeouts by cache type."
+            );
+            describe_counter!(
+                METRIC_CACHE_SAVE_RETRY_TOTAL,
+                "Total scanner data usage cache save retries by cache type."
+            );
+            describe_counter!(
+                METRIC_CACHE_SAVE_PAYLOAD_BYTES_TOTAL,
+                metrics::Unit::Bytes,
+                "Payload bytes submitted to scanner cache saves, including failed attempts, by cache type."
+            );
+            describe_histogram!(
+                METRIC_CACHE_SAVE_DURATION_SECONDS,
+                "Duration of scanner data usage cache save attempts in seconds."
+            );
+        });
+    }
+
+    fn cache_path_type(path: &str) -> &'static str {
+        if path.ends_with(".bkp") { "backup" } else { "main" }
+    }
+
     pub fn replace(&mut self, path: &str, parent: &str, e: DataUsageEntry) {
         let hash = hash_path(path);
-        self.cache.insert(hash.key(), e);
+        self.cache.insert(clone_cache_value(&hash.0), e);
         if !parent.is_empty() {
-            let phash = hash_path(parent);
-            let p = {
-                let p = self.cache.entry(phash.key()).or_default();
-                p.add_child(&hash);
-                p.clone()
-            };
-            self.cache.insert(phash.key(), p);
+            let parent_hash = hash_path(parent);
+            self.cache
+                .entry(clone_cache_value(&parent_hash.0))
+                .or_default()
+                .add_child(&hash);
         }
     }
 
     pub fn replace_hashed(&mut self, hash: &DataUsageHash, parent: &Option<DataUsageHash>, e: &DataUsageEntry) {
-        self.cache.insert(hash.key(), e.clone());
+        self.cache.insert(clone_cache_value(&hash.0), clone_cache_value(e));
         if let Some(parent) = parent {
-            self.cache.entry(parent.key()).or_default().add_child(hash);
+            self.cache.entry(clone_cache_value(&parent.0)).or_default().add_child(hash);
         }
     }
 
     pub fn find(&self, path: &str) -> Option<&DataUsageEntry> {
-        self.cache.get(&hash_path(path).key())
+        self.cache.get(&clone_cache_value(&hash_path(path).0))
     }
 
-    pub fn find_children_copy(&mut self, h: DataUsageHash) -> DataUsageHashMap {
-        self.cache.entry(h.string()).or_default().children.clone()
+    pub fn find_children_copy(&self, h: &DataUsageHash) -> DataUsageHashMap {
+        self.cache
+            .get(&h.0)
+            .map(|entry| clone_cache_value(&entry.children))
+            .unwrap_or_default()
     }
 
     pub fn flatten(&self, root: &DataUsageEntry) -> DataUsageEntry {
-        let mut root = root.clone();
-        for id in root.children.clone().iter() {
-            if let Some(e) = self.cache.get(id) {
-                let mut e = e.clone();
-                if !e.children.is_empty() {
-                    e = self.flatten(&e);
-                }
-                root.merge(&e);
+        let mut visited = HashSet::new();
+        self.flatten_with_guard(root, &mut visited, 0)
+    }
+
+    pub(crate) fn checked_flatten(&self, path: &str) -> Option<DataUsageEntry> {
+        self.checked_flatten_inner(path).map(|(entry, _)| entry)
+    }
+
+    pub(crate) fn checked_flatten_complete(&self, path: &str) -> Option<DataUsageEntry> {
+        self.checked_flatten_inner(path)
+            .filter(|(_, visited)| *visited == self.cache.len())
+            .map(|(entry, _)| entry)
+    }
+
+    pub(crate) fn checked_flatten_complete_scope(&self, path: &str) -> Option<DataUsageEntry> {
+        if path == DATA_USAGE_ROOT {
+            return self.checked_flatten_complete(path);
+        }
+        let (entry, visited) = self.checked_flatten_inner(path)?;
+        let root_parent_only = {
+            let path_key = clone_cache_value(&hash_path(path).0);
+            self.cache
+                .get(DATA_USAGE_ROOT)
+                .is_some_and(|root| root_is_parent_only(root, &path_key))
+        };
+        let expected_entries = self.cache.len().saturating_sub(usize::from(root_parent_only));
+        (visited == expected_entries).then_some(entry)
+    }
+
+    pub(crate) fn has_complete_root_inventory(&self, bucket_keys: &HashSet<String>) -> bool {
+        let Some(root) = self.find(DATA_USAGE_ROOT) else {
+            return false;
+        };
+        // Set roots only connect bucket entries. Scalar data at the root, an
+        // extra bucket, or an orphan must not disappear during bucket folding.
+        root.children.len() == bucket_keys.len()
+            && bucket_keys.iter().all(|key| root.children.contains(key))
+            && root.size == 0
+            && root.objects == 0
+            && root.versions == 0
+            && root.delete_markers == 0
+            && root.failed_objects == 0
+            && !root.compacted
+            && root.obj_sizes.is_empty()
+            && root.obj_versions.is_empty()
+            && root.replication_stats.is_none()
+            && root.all_tier_stats.is_none()
+            && root.unknown_tier_stats.is_none()
+            && root.tier_accounting_proof.is_none()
+            && self.checked_flatten_complete(DATA_USAGE_ROOT).is_some()
+    }
+
+    fn checked_flatten_inner(&self, path: &str) -> Option<(DataUsageEntry, usize)> {
+        let root_key = clone_cache_value(&hash_path(path).0);
+        let (root_key, root) = self.cache.get_key_value(&root_key)?;
+        if root.compacted && !root.children.is_empty() {
+            return None;
+        }
+        let mut visited = HashSet::from([root_key.as_str()]);
+        let mut pending = root.children.iter().map(|child| (child.as_str(), 1usize)).collect::<Vec<_>>();
+        let mut flattened = DataUsageEntry::default();
+        if !flattened.checked_merge(root) {
+            return None;
+        }
+        flattened.compacted = root.compacted;
+
+        while let Some((key, depth)) = pending.pop() {
+            if depth > MAX_DATA_USAGE_CACHE_DEPTH || !visited.insert(key) {
+                return None;
+            }
+            let entry = self.cache.get(key)?;
+            if (entry.compacted || depth == MAX_DATA_USAGE_CACHE_DEPTH) && !entry.children.is_empty() {
+                return None;
+            }
+            pending.extend(entry.children.iter().map(|child| (child.as_str(), depth + 1)));
+
+            if !flattened.checked_merge(entry) {
+                return None;
             }
         }
-        root.children.clear();
-        root
+
+        Some((flattened, visited.len()))
+    }
+
+    fn flatten_with_guard<'a>(
+        &'a self,
+        root: &'a DataUsageEntry,
+        visited: &mut HashSet<&'a str>,
+        depth: usize,
+    ) -> DataUsageEntry {
+        // A summary never owns child links. Cloning and clearing the set
+        // retains its allocation in every completed subtree and update.
+        let mut flat = DataUsageEntry {
+            children: HashSet::new(),
+            size: root.size,
+            objects: root.objects,
+            versions: root.versions,
+            delete_markers: root.delete_markers,
+            obj_sizes: root.obj_sizes.clone(),
+            obj_versions: root.obj_versions.clone(),
+            replication_stats: root.replication_stats.clone(),
+            compacted: root.compacted,
+            failed_objects: root.failed_objects,
+            all_tier_stats: root.all_tier_stats.clone(),
+            unknown_tier_stats: root.unknown_tier_stats.clone(),
+            tier_accounting_proof: root.tier_accounting_proof,
+        };
+        if depth >= MAX_DATA_USAGE_CACHE_DEPTH {
+            return flat;
+        }
+
+        for id in &root.children {
+            if !visited.insert(id.as_str()) {
+                continue;
+            }
+            if let Some(e) = self.cache.get(id) {
+                if e.children.is_empty() {
+                    flat.merge(e);
+                } else {
+                    flat.merge(&self.flatten_with_guard(e, visited, depth + 1));
+                }
+            }
+        }
+        flat
     }
 
     pub fn copy_with_children(&mut self, src: &DataUsageCache, hash: &DataUsageHash, parent: &Option<DataUsageHash>) {
-        if let Some(e) = src.cache.get(&hash.string()) {
-            self.cache.insert(hash.key(), e.clone());
-            for ch in e.children.iter() {
-                if *ch == hash.key() {
-                    return;
+        let mut visited = HashSet::new();
+        self.copy_with_children_guard(src, hash, parent, &mut visited, 0);
+    }
+
+    fn copy_with_children_guard(
+        &mut self,
+        src: &DataUsageCache,
+        hash: &DataUsageHash,
+        parent: &Option<DataUsageHash>,
+        visited: &mut HashSet<String>,
+        depth: usize,
+    ) {
+        if !visited.insert(clone_cache_value(&hash.0)) {
+            return;
+        }
+
+        if let Some(e) = src.cache.get(&clone_cache_value(&hash.0)) {
+            self.cache.insert(clone_cache_value(&hash.0), clone_cache_value(e));
+            if depth < MAX_DATA_USAGE_CACHE_DEPTH {
+                for ch in e.children.iter() {
+                    if *ch == clone_cache_value(&hash.0) {
+                        continue;
+                    }
+                    self.copy_with_children_guard(
+                        src,
+                        &DataUsageHash(clone_cache_value(ch)),
+                        &Some(clone_cache_value(hash)),
+                        visited,
+                        depth + 1,
+                    );
                 }
-                self.copy_with_children(src, &DataUsageHash(ch.to_string()), &Some(hash.clone()));
             }
             if let Some(parent) = parent {
-                let p = self.cache.entry(parent.key()).or_default();
-                p.add_child(hash);
+                self.cache.entry(clone_cache_value(&parent.0)).or_default().add_child(hash);
             }
         }
     }
 
     pub fn delete_recursive(&mut self, hash: &DataUsageHash) {
-        let mut need_remove = Vec::new();
-        if let Some(v) = self.cache.get(&hash.string()) {
-            for child in v.children.iter() {
-                need_remove.push(child.clone());
-            }
+        self.delete_recursive_guard(&hash.0, 0);
+    }
+
+    fn delete_recursive_guard(&mut self, path: &str, depth: usize) {
+        // Removal transfers child ownership and makes cyclic/shared references
+        // no-ops, without cloning paths or maintaining a second visited set.
+        let Some(children) = self.cache.remove(path).map(|entry| entry.children) else {
+            return;
+        };
+        if depth >= MAX_DATA_USAGE_CACHE_DEPTH {
+            return;
         }
-        self.cache.remove(&hash.string());
-        need_remove.iter().for_each(|child| {
-            self.delete_recursive(&DataUsageHash(child.to_string()));
-        });
+        for child in children {
+            self.delete_recursive_guard(&child, depth + 1);
+        }
     }
 
     pub fn size_recursive(&self, path: &str) -> Option<DataUsageEntry> {
-        match self.find(path) {
-            Some(root) => {
+        match self.cache.get_key_value(&hash_path(path).key()) {
+            Some((key, root)) => {
                 if root.children.is_empty() {
-                    return Some(root.clone());
+                    return Some(clone_cache_value(root));
                 }
-                let mut flat = self.flatten(root);
-                if flat.replication_stats.as_ref().is_some_and(|rs| rs.empty()) {
+                let mut visited = HashSet::new();
+                visited.insert(key.as_str());
+                let mut flat = self.flatten_with_guard(root, &mut visited, 0);
+                if flat.replication_stats.as_ref().is_some_and(|stats| stats.is_empty()) {
                     flat.replication_stats = None;
                 }
                 Some(flat)
@@ -696,44 +1952,41 @@ impl DataUsageCache {
     }
 
     pub fn search_parent(&self, hash: &DataUsageHash) -> Option<DataUsageHash> {
-        let want = hash.key();
+        let want = clone_cache_value(&hash.0);
         if let Some(last_index) = want.rfind('/')
             && let Some(v) = self.find(&want[0..last_index])
             && v.children.contains(&want)
         {
-            let found = hash_path(&want[0..last_index]);
-            return Some(found);
+            return Some(hash_path(&want[0..last_index]));
         }
 
         for (k, v) in self.cache.iter() {
             if v.children.contains(&want) {
-                let found = DataUsageHash(k.clone());
-                return Some(found);
+                return Some(DataUsageHash(clone_cache_value(k)));
             }
         }
         None
     }
 
     pub fn is_compacted(&self, hash: &DataUsageHash) -> bool {
-        match self.cache.get(&hash.key()) {
-            Some(due) => due.compacted,
-            None => false,
-        }
+        self.cache.get(&clone_cache_value(&hash.0)).is_some_and(|due| due.compacted)
     }
 
     pub fn force_compact(&mut self, limit: usize) {
         if self.cache.len() < limit {
             return;
         }
-        let top = hash_path(&self.info.name).key();
-        let top_e = match self.find(&top) {
-            Some(e) => e.clone(),
-            None => return,
+        let top = clone_cache_value(&hash_path(&self.info.name).0);
+        let Some(top_e) = self.find(&top).map(clone_cache_value) else {
+            return;
         };
-        // Note: DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS constant would need to be passed as parameter
-        // or defined in common crate if needed
-        if top_e.children.len() > 250_000 {
-            // DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS
+
+        // Wide bucket roots previously only flattened above a hardcoded 250k
+        // fanout, so caches with 10k–250k direct children (common with many
+        // top-level prefixes) never shrank and retained one entry per prefix
+        // after #8971's non-root compaction. Honor `limit` here so completed
+        // sweeps and emergency compaction actually bound root fanout (#8961).
+        if top_e.children.len() > limit {
             self.reduce_children_of(&hash_path(&self.info.name), limit, true);
         }
         if self.cache.len() <= limit {
@@ -743,18 +1996,12 @@ impl DataUsageCache {
         let mut found = HashSet::new();
         found.insert(top);
         mark(self, &top_e, &mut found);
-        self.cache.retain(|k, _| {
-            if !found.contains(k) {
-                return false;
-            }
-            true
-        });
+        self.cache.retain(|k, _| found.contains(k));
     }
 
     pub fn reduce_children_of(&mut self, path: &DataUsageHash, limit: usize, compact_self: bool) {
-        let e = match self.cache.get(&path.key()) {
-            Some(e) => e,
-            None => return,
+        let Some(e) = self.cache.get(&path.0) else {
+            return;
         };
 
         if e.compacted {
@@ -762,33 +2009,35 @@ impl DataUsageCache {
         }
 
         if e.children.len() > limit && compact_self {
-            let mut flat = self.size_recursive(&path.key()).unwrap_or_default();
+            let mut flat = self.size_recursive(&clone_cache_value(&path.0)).unwrap_or_default();
             flat.compacted = true;
             self.delete_recursive(path);
             self.replace_hashed(path, &None, &flat);
             return;
         }
-        let total = self.total_children_rec(&path.key());
+
+        let total = self.total_children_rec(&clone_cache_value(&path.0));
         if total < limit {
             return;
         }
 
-        let mut leaves = Vec::new();
+        let mut candidates = Vec::new();
         let mut remove = total - limit;
-        add(self, path, &mut leaves);
-        leaves.sort_by(|a, b| a.objects.cmp(&b.objects));
+        add(self, path, &mut candidates);
+        candidates.sort_by_key(|a| a.objects);
 
-        while remove > 0 && !leaves.is_empty() {
-            let e = leaves.first().unwrap();
-            let candidate = e.path.clone();
+        let mut candidate_index = 0;
+        while remove > 0 && candidate_index < candidates.len() {
+            let e = &candidates[candidate_index];
+            let candidate = clone_cache_value(&e.path);
             if candidate == *path && !compact_self {
                 break;
             }
-            let removing = self.total_children_rec(&candidate.key());
-            let mut flat = match self.size_recursive(&candidate.key()) {
+            let removing = self.total_children_rec(&clone_cache_value(&candidate.0));
+            let mut flat = match self.size_recursive(&clone_cache_value(&candidate.0)) {
                 Some(flat) => flat,
                 None => {
-                    leaves.remove(0);
+                    candidate_index += 1;
                     continue;
                 }
             };
@@ -797,52 +2046,67 @@ impl DataUsageCache {
             self.delete_recursive(&candidate);
             self.replace_hashed(&candidate, &None, &flat);
 
-            remove -= removing;
-            leaves.remove(0);
+            remove = remove.saturating_sub(removing);
+            candidate_index += 1;
         }
     }
 
     pub fn total_children_rec(&self, path: &str) -> usize {
+        let root = hash_path(path);
+        let mut visited = HashSet::new();
+        visited.insert(root.0.as_str());
+        self.total_children_rec_guard(path, &mut visited, 0)
+    }
+
+    fn total_children_rec_guard<'a>(&'a self, path: &str, visited: &mut HashSet<&'a str>, depth: usize) -> usize {
         let Some(root) = self.find(path) else {
             return 0;
         };
-        if root.children.is_empty() {
+        if root.children.is_empty() || depth >= MAX_DATA_USAGE_CACHE_DEPTH {
             return 0;
         }
 
-        let mut n = root.children.len();
+        let mut n = 0;
         for ch in root.children.iter() {
-            n += self.total_children_rec(ch);
+            if visited.insert(ch.as_str()) {
+                n += 1 + self.total_children_rec_guard(ch, visited, depth + 1);
+            }
         }
         n
     }
 
     pub fn merge(&mut self, o: &DataUsageCache) {
-        let mut existing_root = self.root();
-        let other_root = o.root();
-        if existing_root.is_none() && other_root.is_none() {
+        let Some(mut existing_root) = self.root() else {
+            if o.root().is_none() {
+                return;
+            }
+            *self = clone_cache_value(o);
             return;
-        }
-        if other_root.is_none() {
+        };
+
+        let Some(other_root) = o.root() else {
             return;
-        }
-        if existing_root.is_none() {
-            *self = o.clone();
-            return;
-        }
-        if o.info.last_update.gt(&self.info.last_update) {
+        };
+
+        if o.info.last_update > self.info.last_update {
             self.info.last_update = o.info.last_update;
         }
 
-        existing_root.as_mut().unwrap().merge(other_root.as_ref().unwrap());
-        self.cache.insert(hash_path(&self.info.name).key(), existing_root.unwrap());
-        let e_hash = self.root_hash();
-        for key in other_root.as_ref().unwrap().children.iter() {
-            let entry = &o.cache[key];
+        existing_root.merge(&other_root);
+        self.cache
+            .insert(clone_cache_value(&hash_path(&self.info.name).0), existing_root);
+
+        let root_hash = self.root_hash();
+        for key in other_root.children.iter() {
+            let Some(entry) = o.cache.get(key) else {
+                continue;
+            };
             let flat = o.flatten(entry);
-            let mut existing = self.cache[key].clone();
-            existing.merge(&flat);
-            self.replace_hashed(&DataUsageHash(key.clone()), &Some(e_hash.clone()), &existing);
+            if let Some(existing) = self.cache.get_mut(key) {
+                existing.merge(&flat);
+            } else {
+                self.replace_hashed(&DataUsageHash(clone_cache_value(key)), &Some(clone_cache_value(&root_hash)), &flat);
+            }
         }
     }
 
@@ -851,7 +2115,7 @@ impl DataUsageCache {
     }
 
     pub fn root(&self) -> Option<DataUsageEntry> {
-        self.find(&self.info.name).cloned()
+        self.find(&self.info.name).map(clone_cache_value)
     }
 
     /// Convert cache to DataUsageInfo for a specific path
@@ -885,7 +2149,7 @@ impl DataUsageCache {
 
                 for (arn, stat) in rs.targets.iter() {
                     bui.replication_info.insert(
-                        arn.clone(),
+                        clone_cache_value(arn),
                         BucketTargetUsageInfo {
                             replication_pending_size: stat.pending_size,
                             replicated_size: stat.replicated_size,
@@ -898,7 +2162,7 @@ impl DataUsageCache {
                     );
                 }
             }
-            buckets_usage.insert(bucket_name.clone(), bui);
+            buckets_usage.insert(clone_cache_value(bucket_name), bui);
         }
 
         DataUsageInfo {
@@ -907,7 +2171,9 @@ impl DataUsageCache {
             versions_total_count: flat.versions as u64,
             delete_markers_total_count: flat.delete_markers as u64,
             objects_total_size: flat.size as u64,
-            buckets_count: e.children.len() as u64,
+            tier_stats: flat.all_tier_stats.filter(|tiers| !tiers.is_empty()),
+            unknown_tier_stats: flat.unknown_tier_stats.filter(|stats| !stats.is_empty()),
+            buckets_count: u64::try_from(buckets.len()).unwrap_or(u64::MAX),
             buckets_usage,
             ..Default::default()
         }
@@ -923,224 +2189,83 @@ impl DataUsageCache {
         let t: Self = rmp_serde::from_slice(buf)?;
         Ok(t)
     }
+}
 
-    /// Only backend errors are returned as errors.
-    /// The loader is optimistic and has no locking, but tries 5 times before giving up.
-    /// If the object is not found, a nil error with empty data usage cache is returned.
-    pub async fn load<S: StorageAPI>(&mut self, store: Arc<S>, name: &str) -> StorageResult<()> {
-        // By default, empty data usage cache
-        *self = DataUsageCache::default();
+mod persistence;
 
-        // Caches are read+written without locks
-        let mut retries = 0;
-        while retries < 5 {
-            let (should_retry, cache_opt, result) = Self::try_load_inner(store.clone(), name, Duration::from_secs(60)).await;
-            result?;
-            if let Some(cache) = cache_opt {
-                *self = cache;
-                return Ok(());
-            }
-            if !should_retry {
-                break;
-            }
+#[derive(Default, Clone)]
+struct Inner {
+    objects: usize,
+    path: DataUsageHash,
+}
 
-            // Try backup file
-            let backup_name = format!("{name}.bkp");
-            let (backup_retry, backup_cache_opt, backup_result) =
-                Self::try_load_inner(store.clone(), &backup_name, Duration::from_secs(30)).await;
-            if backup_result.is_err() {
-                // Error loading backup, continue retry
-            } else if let Some(cache) = backup_cache_opt {
-                // Only return when we have valid data from the backup
-                *self = cache;
-                return Ok(());
-            } else if !backup_retry {
-                // Backup not found and not retryable
-                break;
-            }
+fn add(data_usage_cache: &DataUsageCache, path: &DataUsageHash, candidates: &mut Vec<Inner>) -> usize {
+    let mut visited = HashSet::new();
+    visited.insert(clone_cache_value(&path.0));
+    add_with_guard(data_usage_cache, path, candidates, &mut visited, 0)
+}
 
-            retries += 1;
-            // Random sleep between 0 and 1 second
-            let sleep_ms: u64 = rand::random::<u64>() % 1000;
-            sleep(Duration::from_millis(sleep_ms)).await;
-        }
-
-        if retries == 5 {
-            warn!("maximum retry reached to load the data usage cache `{}`", name);
-        }
-
-        Ok(())
-    }
-    // Inner load function that attempts to load from a specific path
-    // Returns (should_retry, cache_option, error_option)
-    async fn try_load_inner<S: StorageAPI>(
-        store: Arc<S>,
-        load_name: &str,
-        timeout_duration: Duration,
-    ) -> (bool, Option<DataUsageCache>, StorageResult<()>) {
-        // Abandon if more than time.Minute, so we don't hold up scanner.
-        // drive timeout by default is 2 minutes, we do not need to wait longer.
-        let load_fut = async {
-            // First try: RUSTFS_META_BUCKET + BUCKET_META_PREFIX/name
-            let path = path_join_buf(&[BUCKET_META_PREFIX, load_name]);
-            match store
-                .get_object_reader(
-                    RUSTFS_META_BUCKET,
-                    &path,
-                    None,
-                    HeaderMap::new(),
-                    &ObjectOptions {
-                        no_lock: true,
-                        ..Default::default()
-                    },
-                )
-                .await
-            {
-                Ok(mut reader) => {
-                    match reader.read_all().await {
-                        Ok(data) => {
-                            match DataUsageCache::unmarshal(&data) {
-                                Ok(cache) => Ok(Some(cache)),
-                                Err(_) => {
-                                    // Deserialization failed, but we got data
-                                    Ok(None)
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            // Read error
-                            Err(e)
-                        }
-                    }
-                }
-                Err(err) => {
-                    match err {
-                        Error::FileNotFound | Error::VolumeNotFound | Error::ObjectNotFound(_, _) | Error::BucketNotFound(_) => {
-                            // Try second location: DATA_USAGE_BUCKET/name
-                            match store
-                                .get_object_reader(
-                                    &DATA_USAGE_BUCKET,
-                                    load_name,
-                                    None,
-                                    HeaderMap::new(),
-                                    &ObjectOptions {
-                                        no_lock: true,
-                                        ..Default::default()
-                                    },
-                                )
-                                .await
-                            {
-                                Ok(mut reader) => match reader.read_all().await {
-                                    Ok(data) => match DataUsageCache::unmarshal(&data) {
-                                        Ok(cache) => Ok(Some(cache)),
-                                        Err(_) => Ok(None),
-                                    },
-                                    Err(e) => Err(e),
-                                },
-                                Err(inner_err) => match inner_err {
-                                    Error::FileNotFound
-                                    | Error::VolumeNotFound
-                                    | Error::ObjectNotFound(_, _)
-                                    | Error::BucketNotFound(_) => {
-                                        // Object not found in both locations
-                                        Ok(None)
-                                    }
-                                    Error::ErasureReadQuorum => {
-                                        // InsufficientReadQuorum - retry
-                                        Ok(None)
-                                    }
-                                    _ => {
-                                        // Other storage errors - retry
-                                        if matches!(
-                                            inner_err,
-                                            Error::FaultyDisk | Error::DiskFull | Error::StorageFull | Error::SlowDown
-                                        ) {
-                                            return Ok(None);
-                                        }
-                                        Err(inner_err)
-                                    }
-                                },
-                            }
-                        }
-                        Error::ErasureReadQuorum => {
-                            // InsufficientReadQuorum - retry
-                            Ok(None)
-                        }
-                        _ => {
-                            // Other storage errors - retry
-                            if matches!(err, Error::FaultyDisk | Error::DiskFull | Error::StorageFull | Error::SlowDown) {
-                                return Ok(None);
-                            }
-                            Err(err)
-                        }
-                    }
-                }
-            }
-        };
-
-        match timeout(timeout_duration, load_fut).await {
-            Ok(result) => match result {
-                Ok(Some(cache)) => (false, Some(cache), Ok(())),
-                Ok(None) => {
-                    // Not found or deserialization failed - check if we should retry
-                    // For now, we don't retry on not found
-                    (false, None, Ok(()))
-                }
-                Err(e) => {
-                    // Check if it's a retryable error
-                    if matches!(
-                        e,
-                        Error::ErasureReadQuorum | Error::FaultyDisk | Error::DiskFull | Error::StorageFull | Error::SlowDown
-                    ) {
-                        (true, None, Ok(()))
-                    } else {
-                        (false, None, Err(e))
-                    }
-                }
-            },
-            Err(_) => {
-                // Timeout - retry
-                (true, None, Ok(()))
+fn add_with_guard(
+    data_usage_cache: &DataUsageCache,
+    path: &DataUsageHash,
+    candidates: &mut Vec<Inner>,
+    visited: &mut HashSet<String>,
+    depth: usize,
+) -> usize {
+    let e = match data_usage_cache.cache.get(&clone_cache_value(&path.0)) {
+        Some(e) => e,
+        None => return 0,
+    };
+    let mut objects = e.objects;
+    if depth < MAX_DATA_USAGE_CACHE_DEPTH {
+        for ch in e.children.iter() {
+            if visited.insert(clone_cache_value(ch)) {
+                objects +=
+                    add_with_guard(data_usage_cache, &DataUsageHash(clone_cache_value(ch)), candidates, visited, depth + 1);
             }
         }
     }
-
-    pub async fn save<S: StorageAPI>(&self, store: Arc<S>, name: &str) -> StorageResult<()> {
-        let mut buf = Vec::new();
-        self.serialize(&mut rmp_serde::Serializer::new(&mut buf))?;
-
-        let path = path_join_buf(&[BUCKET_META_PREFIX, name]);
-
-        let store_clone = store.clone();
-        let buf_clone = buf.clone();
-        let path_clone = path.clone();
-        let res = timeout(Duration::from_secs(5), async move {
-            save_config(store_clone, &path_clone, buf_clone).await?;
-            Ok::<(), StorageError>(())
-        })
-        .await
-        .map_err(|e| StorageError::other(format!("Failed to save data usage cache: {e}")))?;
-
-        if let Err(e) = res {
-            error!("Failed to save data usage cache: {e}");
-            return Err(e);
-        }
-
-        let store_clone = store.clone();
-        let backup_name = format!("{name}.bkp");
-        let backup_path = path_join_buf(&[BUCKET_META_PREFIX, &backup_name]);
-        let res = timeout(Duration::from_secs(5), async move {
-            save_config(store_clone, &backup_path, buf).await?;
-            Ok::<(), StorageError>(())
-        })
-        .await
-        .map_err(|e| StorageError::other(format!("Failed to save data usage cache: {e}")))?;
-        if let Err(e) = res {
-            error!("Failed to save data usage cache backup: {e}");
-            return Err(e);
-        }
-        Ok(())
+    // Collect internal nodes (with children) as compaction candidates.
+    // Leaf nodes have no children to remove, so compacting them is a no-op —
+    // total_children_rec returns 0 for leaves, so `remove` would never decrement.
+    if !e.children.is_empty() {
+        candidates.push(Inner {
+            objects,
+            path: clone_cache_value(path),
+        });
     }
+    objects
+}
+
+fn mark(duc: &DataUsageCache, entry: &DataUsageEntry, found: &mut HashSet<String>) {
+    mark_with_depth(duc, entry, found, 0);
+}
+
+fn mark_with_depth(duc: &DataUsageCache, entry: &DataUsageEntry, found: &mut HashSet<String>, depth: usize) {
+    if depth >= MAX_DATA_USAGE_CACHE_DEPTH {
+        return;
+    }
+
+    for k in entry.children.iter() {
+        if !found.insert(clone_cache_value(k)) {
+            continue;
+        }
+        if let Some(ch) = duc.cache.get(k) {
+            mark_with_depth(duc, ch, found, depth + 1);
+        }
+    }
+}
+
+fn root_is_parent_only(root: &DataUsageEntry, child: &str) -> bool {
+    root.children.len() == 1
+        && root.children.contains(child)
+        && root.size == 0
+        && root.objects == 0
+        && root.versions == 0
+        && root.delete_markers == 0
+        && root.replication_stats.is_none()
+        && !root.compacted
+        && root.failed_objects == 0
 }
 
 /// Trait for storage-specific operations on DataUsageCache
@@ -1155,479 +2280,5 @@ pub trait DataUsageCacheStorage {
     async fn save(&self, name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
-// Helper structs and functions for cache operations
-#[derive(Default, Clone)]
-struct Inner {
-    objects: usize,
-    path: DataUsageHash,
-}
-
-fn add(data_usage_cache: &DataUsageCache, path: &DataUsageHash, leaves: &mut Vec<Inner>) {
-    let e = match data_usage_cache.cache.get(&path.key()) {
-        Some(e) => e,
-        None => return,
-    };
-    if !e.children.is_empty() {
-        return;
-    }
-
-    let sz = data_usage_cache.size_recursive(&path.key()).unwrap_or_default();
-    leaves.push(Inner {
-        objects: sz.objects,
-        path: path.clone(),
-    });
-    for ch in e.children.iter() {
-        add(data_usage_cache, &DataUsageHash(ch.clone()), leaves);
-    }
-}
-
-fn mark(duc: &DataUsageCache, entry: &DataUsageEntry, found: &mut HashSet<String>) {
-    for k in entry.children.iter() {
-        found.insert(k.to_string());
-        if let Some(ch) = duc.cache.get(k) {
-            mark(duc, ch, found);
-        }
-    }
-}
-
-/// Hash a path for data usage caching
-pub fn hash_path(data: &str) -> DataUsageHash {
-    DataUsageHash(Path::new(&data).clean().to_string_lossy().to_string())
-}
-
-impl DataUsageInfo {
-    /// Create a new DataUsageInfo
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Add object metadata to data usage statistics
-    pub fn add_object(&mut self, object_path: &str, meta_object: &rustfs_filemeta::MetaObject) {
-        // This method is kept for backward compatibility
-        // For accurate version counting, use add_object_from_file_meta instead
-        let bucket_name = match self.extract_bucket_from_path(object_path) {
-            Ok(name) => name,
-            Err(_) => return,
-        };
-
-        // Update bucket statistics
-        if let Some(bucket_usage) = self.buckets_usage.get_mut(&bucket_name) {
-            bucket_usage.size += meta_object.size as u64;
-            bucket_usage.objects_count += 1;
-            bucket_usage.versions_count += 1; // Simplified: assume 1 version per object
-
-            // Update size histogram
-            let total_size = meta_object.size as u64;
-            let size_ranges = [
-                ("0-1KB", 0, 1024),
-                ("1KB-1MB", 1024, 1024 * 1024),
-                ("1MB-10MB", 1024 * 1024, 10 * 1024 * 1024),
-                ("10MB-100MB", 10 * 1024 * 1024, 100 * 1024 * 1024),
-                ("100MB-1GB", 100 * 1024 * 1024, 1024 * 1024 * 1024),
-                ("1GB+", 1024 * 1024 * 1024, u64::MAX),
-            ];
-
-            for (range_name, min_size, max_size) in size_ranges {
-                if total_size >= min_size && total_size < max_size {
-                    *bucket_usage.object_size_histogram.entry(range_name.to_string()).or_insert(0) += 1;
-                    break;
-                }
-            }
-
-            // Update version histogram (simplified - count as single version)
-            *bucket_usage
-                .object_versions_histogram
-                .entry("SINGLE_VERSION".to_string())
-                .or_insert(0) += 1;
-        } else {
-            // Create new bucket usage
-            let mut bucket_usage = BucketUsageInfo {
-                size: meta_object.size as u64,
-                objects_count: 1,
-                versions_count: 1,
-                ..Default::default()
-            };
-            bucket_usage.object_size_histogram.insert("0-1KB".to_string(), 1);
-            bucket_usage.object_versions_histogram.insert("SINGLE_VERSION".to_string(), 1);
-            self.buckets_usage.insert(bucket_name, bucket_usage);
-        }
-
-        // Update global statistics
-        self.objects_total_size += meta_object.size as u64;
-        self.objects_total_count += 1;
-        self.versions_total_count += 1;
-    }
-
-    /// Add object from FileMeta for accurate version counting
-    pub fn add_object_from_file_meta(&mut self, object_path: &str, file_meta: &rustfs_filemeta::FileMeta) {
-        let bucket_name = match self.extract_bucket_from_path(object_path) {
-            Ok(name) => name,
-            Err(_) => return,
-        };
-
-        // Calculate accurate statistics from all versions
-        let mut total_size = 0u64;
-        let mut versions_count = 0u64;
-        let mut delete_markers_count = 0u64;
-        let mut latest_object_size = 0u64;
-
-        // Process all versions to get accurate counts
-        for version in &file_meta.versions {
-            match rustfs_filemeta::FileMetaVersion::try_from(version.clone()) {
-                Ok(ver) => {
-                    if let Some(obj) = ver.object {
-                        total_size += obj.size as u64;
-                        versions_count += 1;
-                        latest_object_size = obj.size as u64; // Keep track of latest object size
-                    } else if ver.delete_marker.is_some() {
-                        delete_markers_count += 1;
-                    }
-                }
-                Err(_) => {
-                    // Skip invalid versions
-                    continue;
-                }
-            }
-        }
-
-        // Update bucket statistics
-        if let Some(bucket_usage) = self.buckets_usage.get_mut(&bucket_name) {
-            bucket_usage.size += total_size;
-            bucket_usage.objects_count += 1;
-            bucket_usage.versions_count += versions_count;
-            bucket_usage.delete_markers_count += delete_markers_count;
-
-            // Update size histogram based on latest object size
-            let size_ranges = [
-                ("0-1KB", 0, 1024),
-                ("1KB-1MB", 1024, 1024 * 1024),
-                ("1MB-10MB", 1024 * 1024, 10 * 1024 * 1024),
-                ("10MB-100MB", 10 * 1024 * 1024, 100 * 1024 * 1024),
-                ("100MB-1GB", 100 * 1024 * 1024, 1024 * 1024 * 1024),
-                ("1GB+", 1024 * 1024 * 1024, u64::MAX),
-            ];
-
-            for (range_name, min_size, max_size) in size_ranges {
-                if latest_object_size >= min_size && latest_object_size < max_size {
-                    *bucket_usage.object_size_histogram.entry(range_name.to_string()).or_insert(0) += 1;
-                    break;
-                }
-            }
-
-            // Update version histogram based on actual version count
-            let version_ranges = [
-                ("1", 1, 1),
-                ("2-5", 2, 5),
-                ("6-10", 6, 10),
-                ("11-50", 11, 50),
-                ("51-100", 51, 100),
-                ("100+", 101, usize::MAX),
-            ];
-
-            for (range_name, min_versions, max_versions) in version_ranges {
-                if versions_count as usize >= min_versions && versions_count as usize <= max_versions {
-                    *bucket_usage
-                        .object_versions_histogram
-                        .entry(range_name.to_string())
-                        .or_insert(0) += 1;
-                    break;
-                }
-            }
-        } else {
-            // Create new bucket usage
-            let mut bucket_usage = BucketUsageInfo {
-                size: total_size,
-                objects_count: 1,
-                versions_count,
-                delete_markers_count,
-                ..Default::default()
-            };
-
-            // Set size histogram
-            let size_ranges = [
-                ("0-1KB", 0, 1024),
-                ("1KB-1MB", 1024, 1024 * 1024),
-                ("1MB-10MB", 1024 * 1024, 10 * 1024 * 1024),
-                ("10MB-100MB", 10 * 1024 * 1024, 100 * 1024 * 1024),
-                ("100MB-1GB", 100 * 1024 * 1024, 1024 * 1024 * 1024),
-                ("1GB+", 1024 * 1024 * 1024, u64::MAX),
-            ];
-
-            for (range_name, min_size, max_size) in size_ranges {
-                if latest_object_size >= min_size && latest_object_size < max_size {
-                    bucket_usage.object_size_histogram.insert(range_name.to_string(), 1);
-                    break;
-                }
-            }
-
-            // Set version histogram
-            let version_ranges = [
-                ("1", 1, 1),
-                ("2-5", 2, 5),
-                ("6-10", 6, 10),
-                ("11-50", 11, 50),
-                ("51-100", 51, 100),
-                ("100+", 101, usize::MAX),
-            ];
-
-            for (range_name, min_versions, max_versions) in version_ranges {
-                if versions_count as usize >= min_versions && versions_count as usize <= max_versions {
-                    bucket_usage.object_versions_histogram.insert(range_name.to_string(), 1);
-                    break;
-                }
-            }
-
-            self.buckets_usage.insert(bucket_name, bucket_usage);
-            // Update buckets count when adding new bucket
-            self.buckets_count = self.buckets_usage.len() as u64;
-        }
-
-        // Update global statistics
-        self.objects_total_size += total_size;
-        self.objects_total_count += 1;
-        self.versions_total_count += versions_count;
-        self.delete_markers_total_count += delete_markers_count;
-    }
-
-    /// Extract bucket name from object path
-    pub fn extract_bucket_from_path(&self, object_path: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let parts: Vec<&str> = object_path.split('/').collect();
-        if parts.is_empty() {
-            return Err("Invalid object path: empty".into());
-        }
-        Ok(parts[0].to_string())
-    }
-
-    /// Update capacity information
-    pub fn update_capacity(&mut self, total: u64, used: u64, free: u64) {
-        self.total_capacity = total;
-        self.total_used_capacity = used;
-        self.total_free_capacity = free;
-        self.last_update = Some(SystemTime::now());
-    }
-
-    /// Add bucket usage info
-    pub fn add_bucket_usage(&mut self, bucket: String, usage: BucketUsageInfo) {
-        self.buckets_usage.insert(bucket.clone(), usage);
-        self.buckets_count = self.buckets_usage.len() as u64;
-        self.last_update = Some(SystemTime::now());
-    }
-
-    /// Get bucket usage info
-    pub fn get_bucket_usage(&self, bucket: &str) -> Option<&BucketUsageInfo> {
-        self.buckets_usage.get(bucket)
-    }
-
-    /// Calculate total statistics from all buckets
-    pub fn calculate_totals(&mut self) {
-        self.objects_total_count = 0;
-        self.versions_total_count = 0;
-        self.delete_markers_total_count = 0;
-        self.objects_total_size = 0;
-
-        for usage in self.buckets_usage.values() {
-            self.objects_total_count += usage.objects_count;
-            self.versions_total_count += usage.versions_count;
-            self.delete_markers_total_count += usage.delete_markers_count;
-            self.objects_total_size += usage.size;
-        }
-    }
-
-    /// Merge another DataUsageInfo into this one
-    pub fn merge(&mut self, other: &DataUsageInfo) {
-        // Merge bucket usage
-        for (bucket, usage) in &other.buckets_usage {
-            if let Some(existing) = self.buckets_usage.get_mut(bucket) {
-                existing.merge(usage);
-            } else {
-                self.buckets_usage.insert(bucket.clone(), usage.clone());
-            }
-        }
-
-        self.disk_usage_status.extend(other.disk_usage_status.iter().cloned());
-
-        // Recalculate totals
-        self.calculate_totals();
-
-        // Ensure buckets_count stays consistent with buckets_usage
-        self.buckets_count = self.buckets_usage.len() as u64;
-
-        // Update last update time
-        if let Some(other_update) = other.last_update
-            && (self.last_update.is_none() || other_update > self.last_update.unwrap())
-        {
-            self.last_update = Some(other_update);
-        }
-    }
-}
-
-impl BucketUsageInfo {
-    /// Create a new BucketUsageInfo
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Add size summary to this bucket usage
-    pub fn add_size_summary(&mut self, summary: &SizeSummary) {
-        self.size += summary.total_size as u64;
-        self.versions_count += summary.versions as u64;
-        self.delete_markers_count += summary.delete_markers as u64;
-        self.replica_size += summary.replica_size as u64;
-        self.replica_count += summary.replica_count as u64;
-    }
-
-    /// Merge another BucketUsageInfo into this one
-    pub fn merge(&mut self, other: &BucketUsageInfo) {
-        self.size += other.size;
-        self.objects_count += other.objects_count;
-        self.versions_count += other.versions_count;
-        self.delete_markers_count += other.delete_markers_count;
-        self.replica_size += other.replica_size;
-        self.replica_count += other.replica_count;
-
-        // Merge histograms
-        for (key, value) in &other.object_size_histogram {
-            *self.object_size_histogram.entry(key.clone()).or_insert(0) += value;
-        }
-
-        for (key, value) in &other.object_versions_histogram {
-            *self.object_versions_histogram.entry(key.clone()).or_insert(0) += value;
-        }
-
-        // Merge replication info
-        for (target, info) in &other.replication_info {
-            let entry = self.replication_info.entry(target.clone()).or_default();
-            entry.replicated_size += info.replicated_size;
-            entry.replica_size += info.replica_size;
-            entry.replication_pending_size += info.replication_pending_size;
-            entry.replication_failed_size += info.replication_failed_size;
-            entry.replication_pending_count += info.replication_pending_count;
-            entry.replication_failed_count += info.replication_failed_count;
-            entry.replicated_count += info.replicated_count;
-        }
-
-        // Merge backward compatibility fields
-        self.replication_pending_size_v1 += other.replication_pending_size_v1;
-        self.replication_failed_size_v1 += other.replication_failed_size_v1;
-        self.replicated_size_v1 += other.replicated_size_v1;
-        self.replication_pending_count_v1 += other.replication_pending_count_v1;
-        self.replication_failed_count_v1 += other.replication_failed_count_v1;
-    }
-}
-
-impl SizeSummary {
-    /// Create a new SizeSummary
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Add another SizeSummary to this one
-    pub fn add(&mut self, other: &SizeSummary) {
-        self.total_size += other.total_size;
-        self.versions += other.versions;
-        self.delete_markers += other.delete_markers;
-        self.replicated_size += other.replicated_size;
-        self.replicated_count += other.replicated_count;
-        self.pending_size += other.pending_size;
-        self.failed_size += other.failed_size;
-        self.replica_size += other.replica_size;
-        self.replica_count += other.replica_count;
-        self.pending_count += other.pending_count;
-        self.failed_count += other.failed_count;
-
-        // Merge replication target stats
-        for (target, stats) in &other.repl_target_stats {
-            let entry = self.repl_target_stats.entry(target.clone()).or_default();
-            entry.replicated_size += stats.replicated_size;
-            entry.replicated_count += stats.replicated_count;
-            entry.pending_size += stats.pending_size;
-            entry.failed_size += stats.failed_size;
-            entry.pending_count += stats.pending_count;
-            entry.failed_count += stats.failed_count;
-        }
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::Value;
-
-    #[test]
-    fn test_data_usage_info_creation() {
-        let mut info = DataUsageInfo::new();
-        info.update_capacity(1000, 500, 500);
-
-        assert_eq!(info.total_capacity, 1000);
-        assert_eq!(info.total_used_capacity, 500);
-        assert_eq!(info.total_free_capacity, 500);
-        assert!(info.last_update.is_some());
-    }
-
-    #[test]
-    fn test_bucket_usage_info_merge() {
-        let mut usage1 = BucketUsageInfo::new();
-        usage1.size = 100;
-        usage1.objects_count = 10;
-        usage1.versions_count = 5;
-
-        let mut usage2 = BucketUsageInfo::new();
-        usage2.size = 200;
-        usage2.objects_count = 20;
-        usage2.versions_count = 10;
-
-        usage1.merge(&usage2);
-
-        assert_eq!(usage1.size, 300);
-        assert_eq!(usage1.objects_count, 30);
-        assert_eq!(usage1.versions_count, 15);
-    }
-
-    #[test]
-    fn test_size_summary_add() {
-        let mut summary1 = SizeSummary::new();
-        summary1.total_size = 100;
-        summary1.versions = 5;
-
-        let mut summary2 = SizeSummary::new();
-        summary2.total_size = 200;
-        summary2.versions = 10;
-
-        summary1.add(&summary2);
-
-        assert_eq!(summary1.total_size, 300);
-        assert_eq!(summary1.versions, 15);
-    }
-
-    #[test]
-    fn test_data_usage_entry_merge_sums_failed_objects() {
-        let mut left = DataUsageEntry {
-            failed_objects: 2,
-            ..Default::default()
-        };
-
-        let right = DataUsageEntry {
-            failed_objects: 3,
-            ..Default::default()
-        };
-
-        left.merge(&right);
-
-        assert_eq!(left.failed_objects, 5);
-    }
-
-    #[test]
-    fn test_data_usage_entry_deserialize_defaults_failed_objects() {
-        let entry = DataUsageEntry::default();
-        let mut value = serde_json::to_value(&entry).expect("Failed to serialize entry");
-
-        let Value::Object(ref mut map) = value else {
-            panic!("Expected entry to serialize into an object");
-        };
-
-        map.remove("failed_objects");
-
-        let decoded: DataUsageEntry = serde_json::from_value(value).expect("Failed to deserialize entry");
-        assert_eq!(decoded.failed_objects, 0);
-    }
-}
+mod tests;

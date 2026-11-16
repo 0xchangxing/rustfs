@@ -12,7 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod header_compat;
 pub mod headers;
 pub mod ip;
+pub mod metadata_compat;
+pub mod object_encryption_keys;
+pub use header_compat::*;
 pub use headers::*;
 pub use ip::*;
+pub use metadata_compat::*;
+pub use object_encryption_keys::*;

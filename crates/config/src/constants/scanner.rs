@@ -14,6 +14,120 @@
 
 use std::time::Duration;
 
+/// Scanner admin config subsystem name.
+pub const SCANNER_SUB_SYS: &str = "scanner";
+
+/// Scanner config key selecting the speed preset.
+pub const SCANNER_SPEED: &str = "speed";
+
+/// Scanner config key overriding the scanner sleep multiplier.
+pub const SCANNER_DELAY: &str = "delay";
+
+/// Scanner config key overriding the maximum scanner sleep in seconds.
+pub const SCANNER_MAX_WAIT: &str = "max_wait";
+
+/// Scanner config key overriding the cycle interval in seconds.
+pub const SCANNER_CYCLE: &str = "cycle";
+
+/// Scanner config key setting the startup delay in seconds.
+///
+/// For compatibility, this also acts as the scanner cycle interval when
+/// `cycle` is unset.
+pub const SCANNER_START_DELAY: &str = "start_delay";
+
+/// Scanner config key capping one cycle's runtime in seconds.
+pub const SCANNER_CYCLE_MAX_DURATION: &str = "cycle_max_duration";
+
+/// Scanner config key capping objects processed by one cycle.
+pub const SCANNER_CYCLE_MAX_OBJECTS: &str = "cycle_max_objects";
+
+/// Scanner config key capping directories entered by one cycle.
+pub const SCANNER_CYCLE_MAX_DIRECTORIES: &str = "cycle_max_directories";
+
+/// Per-bucket admission limit in seconds; zero disables this dimension.
+pub const SCANNER_BUCKET_QUANTUM_DURATION: &str = "bucket_quantum_duration";
+
+/// Per-bucket admission limit in objects; zero disables this dimension.
+pub const SCANNER_BUCKET_QUANTUM_OBJECTS: &str = "bucket_quantum_objects";
+
+/// Per-bucket admission limit in directories; zero disables this dimension.
+pub const SCANNER_BUCKET_QUANTUM_DIRECTORIES: &str = "bucket_quantum_directories";
+
+/// Per-bucket admission limit in raw entries; zero disables this dimension.
+pub const SCANNER_BUCKET_QUANTUM_ENTRIES: &str = "bucket_quantum_entries";
+
+/// Per-bucket admission limit in raw entry-name bytes; zero disables this dimension.
+pub const SCANNER_BUCKET_QUANTUM_NAME_BYTES: &str = "bucket_quantum_name_bytes";
+
+/// Scanner config key setting the periodic bitrot scan cycle in seconds.
+pub const SCANNER_BITROT_CYCLE: &str = "bitrot_cycle";
+
+/// Scanner config key controlling whether scanner throttling is enabled.
+pub const SCANNER_IDLE_MODE: &str = "idle_mode";
+
+/// Scanner config key controlling scanner cache save timeout in seconds.
+pub const SCANNER_CACHE_SAVE_TIMEOUT: &str = "cache_save_timeout";
+
+/// Scanner config key capping automatic recovery retry waits in seconds.
+pub const SCANNER_RECOVERY_BACKOFF_CAP: &str = "recovery_backoff_cap";
+
+/// Scanner config key capping concurrent scanner set tasks.
+pub const SCANNER_MAX_CONCURRENT_SET_SCANS: &str = "max_concurrent_set_scans";
+
+/// Scanner config key capping concurrent scanner disk bucket walks per set.
+pub const SCANNER_MAX_CONCURRENT_DISK_SCANS: &str = "max_concurrent_disk_scans";
+
+/// Scanner config key setting how many bucket walkers each local disk runs.
+pub const SCANNER_WALKERS_PER_DISK: &str = "walkers_per_disk";
+
+/// Per-local-disk scanner I/O ceiling in operations per second.
+pub const SCANNER_DISK_IO_BUDGET_IOPS: &str = "disk_io_budget_iops";
+
+/// Per-local-disk scanner I/O ceiling in bytes per second.
+pub const SCANNER_DISK_IO_BUDGET_BYTES_PER_SEC: &str = "disk_io_budget_bytes_per_sec";
+
+/// Scanner config key controlling how often object loops yield.
+pub const SCANNER_YIELD_EVERY_N_OBJECTS: &str = "yield_every_n_objects";
+
+/// Scanner config key controlling object version count alerts.
+pub const SCANNER_ALERT_EXCESS_VERSIONS: &str = "alert_excess_versions";
+
+/// Scanner config key controlling retained version size alerts.
+pub const SCANNER_ALERT_EXCESS_VERSION_SIZE: &str = "alert_excess_version_size";
+
+/// Scanner config key controlling direct subfolder count alerts.
+pub const SCANNER_ALERT_EXCESS_FOLDERS: &str = "alert_excess_folders";
+
+/// Scanner config keys supported by the admin config subsystem.
+pub const SCANNER_KEYS: &[&str] = &[
+    SCANNER_SPEED,
+    SCANNER_DELAY,
+    SCANNER_MAX_WAIT,
+    SCANNER_CYCLE,
+    SCANNER_START_DELAY,
+    SCANNER_CYCLE_MAX_DURATION,
+    SCANNER_CYCLE_MAX_OBJECTS,
+    SCANNER_CYCLE_MAX_DIRECTORIES,
+    SCANNER_BUCKET_QUANTUM_DURATION,
+    SCANNER_BUCKET_QUANTUM_OBJECTS,
+    SCANNER_BUCKET_QUANTUM_DIRECTORIES,
+    SCANNER_BUCKET_QUANTUM_ENTRIES,
+    SCANNER_BUCKET_QUANTUM_NAME_BYTES,
+    SCANNER_BITROT_CYCLE,
+    SCANNER_IDLE_MODE,
+    SCANNER_CACHE_SAVE_TIMEOUT,
+    SCANNER_RECOVERY_BACKOFF_CAP,
+    SCANNER_MAX_CONCURRENT_SET_SCANS,
+    SCANNER_MAX_CONCURRENT_DISK_SCANS,
+    SCANNER_WALKERS_PER_DISK,
+    SCANNER_DISK_IO_BUDGET_IOPS,
+    SCANNER_DISK_IO_BUDGET_BYTES_PER_SEC,
+    SCANNER_YIELD_EVERY_N_OBJECTS,
+    SCANNER_ALERT_EXCESS_VERSIONS,
+    SCANNER_ALERT_EXCESS_VERSION_SIZE,
+    SCANNER_ALERT_EXCESS_FOLDERS,
+];
+
 /// Canonical environment variable name that specifies the scanner start delay in seconds.
 /// If set, this overrides the cycle interval derived from `RUSTFS_SCANNER_SPEED`.
 /// - Unit: seconds (u64).
@@ -25,22 +139,213 @@ pub const ENV_SCANNER_START_DELAY_SECS: &str = "RUSTFS_SCANNER_START_DELAY_SECS"
 #[deprecated(note = "Use RUSTFS_SCANNER_START_DELAY_SECS instead")]
 pub const ENV_DATA_SCANNER_START_DELAY_SECS: &str = "RUSTFS_DATA_SCANNER_START_DELAY_SECS";
 
+/// Environment variable that specifies the scanner cycle interval in seconds.
+/// If set, this overrides the cycle interval derived from `RUSTFS_SCANNER_SPEED`.
+/// - Unit: seconds (u64).
+/// - Example: `export RUSTFS_SCANNER_CYCLE=3600` (1 hour)
+pub const ENV_SCANNER_CYCLE: &str = "RUSTFS_SCANNER_CYCLE";
+
+/// Environment variable that caps one scanner cycle's runtime in seconds.
+/// A value of `0` disables the cycle runtime budget.
+/// - Unit: seconds (u64).
+/// - Example: `export RUSTFS_SCANNER_CYCLE_MAX_DURATION_SECS=1800`
+pub const ENV_SCANNER_CYCLE_MAX_DURATION_SECS: &str = "RUSTFS_SCANNER_CYCLE_MAX_DURATION_SECS";
+
+/// Environment variable that caps objects processed by one scanner cycle.
+/// A value of `0` disables the per-cycle object budget.
+/// - Example: `export RUSTFS_SCANNER_CYCLE_MAX_OBJECTS=1000000`
+pub const ENV_SCANNER_CYCLE_MAX_OBJECTS: &str = "RUSTFS_SCANNER_CYCLE_MAX_OBJECTS";
+
+/// Environment variable that caps directories entered by one scanner cycle.
+/// A value of `0` disables the per-cycle directory budget.
+/// - Example: `export RUSTFS_SCANNER_CYCLE_MAX_DIRECTORIES=100000`
+pub const ENV_SCANNER_CYCLE_MAX_DIRECTORIES: &str = "RUSTFS_SCANNER_CYCLE_MAX_DIRECTORIES";
+
+/// Per-bucket admission limit in seconds; zero disables this dimension.
+pub const ENV_SCANNER_BUCKET_QUANTUM_DURATION_SECS: &str = "RUSTFS_SCANNER_BUCKET_QUANTUM_DURATION_SECS";
+
+/// Disabled until controlled-fleet acceptance selects production limits.
+pub const DEFAULT_SCANNER_BUCKET_QUANTUM_DURATION_SECS: u64 = 0;
+
+/// Per-bucket admission limit in objects; zero disables this dimension.
+pub const ENV_SCANNER_BUCKET_QUANTUM_OBJECTS: &str = "RUSTFS_SCANNER_BUCKET_QUANTUM_OBJECTS";
+
+/// Disabled until controlled-fleet acceptance selects production limits.
+pub const DEFAULT_SCANNER_BUCKET_QUANTUM_OBJECTS: u64 = 0;
+
+/// Per-bucket admission limit in directories; zero disables this dimension.
+pub const ENV_SCANNER_BUCKET_QUANTUM_DIRECTORIES: &str = "RUSTFS_SCANNER_BUCKET_QUANTUM_DIRECTORIES";
+
+/// Disabled until controlled-fleet acceptance selects production limits.
+pub const DEFAULT_SCANNER_BUCKET_QUANTUM_DIRECTORIES: u64 = 0;
+
+/// Per-bucket admission limit in raw entries; zero disables this dimension.
+pub const ENV_SCANNER_BUCKET_QUANTUM_ENTRIES: &str = "RUSTFS_SCANNER_BUCKET_QUANTUM_ENTRIES";
+
+/// Disabled until controlled-fleet acceptance selects production limits.
+pub const DEFAULT_SCANNER_BUCKET_QUANTUM_ENTRIES: u64 = 0;
+
+/// Per-bucket admission limit in raw entry-name bytes; zero disables this dimension.
+pub const ENV_SCANNER_BUCKET_QUANTUM_NAME_BYTES: &str = "RUSTFS_SCANNER_BUCKET_QUANTUM_NAME_BYTES";
+
+/// Disabled until controlled-fleet acceptance selects production limits.
+pub const DEFAULT_SCANNER_BUCKET_QUANTUM_NAME_BYTES: u64 = 0;
+
 /// Environment variable that selects the scanner speed preset.
 /// Valid values: `fastest`, `fast`, `default`, `slow`, `slowest`.
 /// Controls the sleep factor, maximum sleep duration, and cycle interval.
 /// - Example: `export RUSTFS_SCANNER_SPEED=slow`
 pub const ENV_SCANNER_SPEED: &str = "RUSTFS_SCANNER_SPEED";
 
+/// Environment variable that overrides the scanner sleep multiplier.
+/// - Example: `export RUSTFS_SCANNER_DELAY=30.0`
+pub const ENV_SCANNER_DELAY: &str = "RUSTFS_SCANNER_DELAY";
+
+/// Environment variable that overrides the maximum scanner sleep in seconds.
+/// - Unit: seconds (u64).
+/// - Example: `export RUSTFS_SCANNER_MAX_WAIT_SECS=15`
+pub const ENV_SCANNER_MAX_WAIT_SECS: &str = "RUSTFS_SCANNER_MAX_WAIT_SECS";
+
 /// Default scanner speed preset.
 pub const DEFAULT_SCANNER_SPEED: &str = "default";
+
+/// Default scanner cycle runtime budget when no override is configured.
+///
+/// An explicit `0` remains the compatibility escape hatch for an unbounded
+/// cycle. Keeping the unset default finite prevents a stalled scanner I/O
+/// operation from holding the leader lease forever.
+pub const DEFAULT_SCANNER_CYCLE_MAX_DURATION_SECS: u64 = 30 * 60;
+
+/// Default scanner per-cycle object budget.
+/// `0` keeps the existing unbounded per-cycle behavior.
+pub const DEFAULT_SCANNER_CYCLE_MAX_OBJECTS: u64 = 0;
+
+/// Default scanner per-cycle directory budget.
+/// `0` keeps the existing unbounded per-cycle behavior.
+pub const DEFAULT_SCANNER_CYCLE_MAX_DIRECTORIES: u64 = 0;
+
+/// Environment variable that specifies the periodic bitrot scan cycle in seconds.
+/// When set to `0`, `true`, `on`, or `yes`, every scanner cycle runs in deep mode.
+/// When set to `false`, `off`, `no`, or `disabled`, periodic deep scans are disabled.
+/// - Unit: seconds (u64).
+/// - Example: `export RUSTFS_SCANNER_BITROT_CYCLE_SECS=2592000` (30 days)
+pub const ENV_SCANNER_BITROT_CYCLE_SECS: &str = "RUSTFS_SCANNER_BITROT_CYCLE_SECS";
+
+/// Default bitrot scan cycle used by the scanner.
+pub const DEFAULT_SCANNER_BITROT_CYCLE_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// Environment variable that controls how many object versions trigger scanner alerts.
+/// - Example: `export RUSTFS_SCANNER_ALERT_EXCESS_VERSIONS=100`
+pub const ENV_SCANNER_ALERT_EXCESS_VERSIONS: &str = "RUSTFS_SCANNER_ALERT_EXCESS_VERSIONS";
+
+/// Default object version count that triggers scanner alerts.
+pub const DEFAULT_SCANNER_ALERT_EXCESS_VERSIONS: u64 = 100;
+
+/// Environment variable that controls how many cumulative bytes across object versions trigger scanner alerts.
+/// - Example: `export RUSTFS_SCANNER_ALERT_EXCESS_VERSION_SIZE=1099511627776`
+pub const ENV_SCANNER_ALERT_EXCESS_VERSION_SIZE: &str = "RUSTFS_SCANNER_ALERT_EXCESS_VERSION_SIZE";
+
+/// Default cumulative object version bytes that trigger scanner alerts.
+pub const DEFAULT_SCANNER_ALERT_EXCESS_VERSION_SIZE: u64 = 1024 * 1024 * 1024 * 1024;
+
+/// Environment variable that controls how many subfolders trigger scanner alerts.
+/// - Example: `export RUSTFS_SCANNER_ALERT_EXCESS_FOLDERS=65538`
+pub const ENV_SCANNER_ALERT_EXCESS_FOLDERS: &str = "RUSTFS_SCANNER_ALERT_EXCESS_FOLDERS";
+
+/// Default subfolder count that triggers scanner alerts.
+/// Allows Proxmox Backup Server's chunk namespace layout.
+pub const DEFAULT_SCANNER_ALERT_EXCESS_FOLDERS: u64 = 65_538;
 
 /// Environment variable that controls whether the scanner sleeps between operations.
 /// When `true` (default), the scanner throttles itself. When `false`, it runs at full speed.
 /// - Example: `export RUSTFS_SCANNER_IDLE_MODE=false`
 pub const ENV_SCANNER_IDLE_MODE: &str = "RUSTFS_SCANNER_IDLE_MODE";
 
+/// Environment variable that controls scanner cache save timeout in seconds.
+/// The scanner enforces a minimum value of `1`.
+/// - Unit: seconds (u64).
+/// - Example: `export RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS=14`
+pub const ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS: &str = "RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS";
+
+/// Default scanner cache save timeout in seconds.
+pub const DEFAULT_SCANNER_CACHE_SAVE_TIMEOUT_SECS: u64 = 14;
+
+/// Environment variable that caps automatic scanner recovery retry waits.
+/// The value must be a positive integer number of seconds within the timer range.
+/// - Example: `export RUSTFS_SCANNER_RECOVERY_BACKOFF_CAP_SECS=600`
+pub const ENV_SCANNER_RECOVERY_BACKOFF_CAP_SECS: &str = "RUSTFS_SCANNER_RECOVERY_BACKOFF_CAP_SECS";
+
+/// Default maximum wait between automatic scanner recovery retries.
+pub const DEFAULT_SCANNER_RECOVERY_BACKOFF_CAP_SECS: u64 = 10 * 60;
+
+/// Environment variable that caps concurrent scanner set tasks.
+/// A value of `0` keeps the existing topology-based concurrency.
+/// - Example: `export RUSTFS_SCANNER_MAX_CONCURRENT_SET_SCANS=2`
+pub const ENV_SCANNER_MAX_CONCURRENT_SET_SCANS: &str = "RUSTFS_SCANNER_MAX_CONCURRENT_SET_SCANS";
+
+/// Environment variable that caps concurrent scanner disk bucket walks per set.
+/// A value of `0` keeps the existing disk-count-based concurrency.
+/// - Example: `export RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS=1`
+pub const ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS: &str = "RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS";
+
+/// Environment variable that sets how many bucket walkers each local disk runs.
+/// The walkers of one disk share its scanner admission, so a peer still sees one
+/// scan session per physical disk. Remote disks keep one walker. The product of
+/// local disks and this factor is what `RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS`
+/// caps; the disk count stays the floor. Valid range is `1` through `16`.
+/// - Example: `export RUSTFS_SCANNER_WALKERS_PER_DISK=4`
+pub const ENV_SCANNER_WALKERS_PER_DISK: &str = "RUSTFS_SCANNER_WALKERS_PER_DISK";
+
+pub const ENV_SCANNER_DISK_IO_BUDGET_IOPS: &str = "RUSTFS_SCANNER_DISK_IO_BUDGET_IOPS";
+
+pub const ENV_SCANNER_DISK_IO_BUDGET_BYTES_PER_SEC: &str = "RUSTFS_SCANNER_DISK_IO_BUDGET_BYTES_PER_SEC";
+
+/// Environment variable that controls how often scanner object loops yield to the async runtime.
+/// A value of `0` disables this extra object-count yield.
+/// - Example: `export RUSTFS_SCANNER_YIELD_EVERY_N_OBJECTS=32`
+pub const ENV_SCANNER_YIELD_EVERY_N_OBJECTS: &str = "RUSTFS_SCANNER_YIELD_EVERY_N_OBJECTS";
+
 /// Default scanner idle mode.
 pub const DEFAULT_SCANNER_IDLE_MODE: bool = true;
+
+/// Default set scan concurrency budget.
+pub const DEFAULT_SCANNER_MAX_CONCURRENT_SET_SCANS: usize = 4;
+
+/// Default disk scan concurrency budget.
+pub const DEFAULT_SCANNER_MAX_CONCURRENT_DISK_SCANS: usize = 4;
+
+/// Default bucket walkers per local disk.
+///
+/// One walker per disk keeps today's I/O profile, which is what rotational
+/// media needs. Flash is meant to default higher once a local disk can report
+/// its media type; `rustfs_utils::os::Info::rotational` is never populated
+/// today, so every deployment starts from one walker.
+pub const DEFAULT_SCANNER_WALKERS_PER_DISK: usize = 1;
+
+/// Upper bound for `walkers_per_disk`; a larger factor only multiplies
+/// contention on one spindle or NVMe queue without more disks to spread it.
+pub const MAX_SCANNER_WALKERS_PER_DISK: usize = 16;
+
+/// Default spelling of both per-disk scanner I/O budget keys: resolve the
+/// rate from the detected media. `off` removes the cap; a number is explicit.
+pub const DEFAULT_SCANNER_DISK_IO_BUDGET: &str = "auto";
+
+/// Rotational media budget, also used when media cannot be detected: about
+/// half of a 7200 rpm spindle's random reads stay available to foreground
+/// requests, and the byte ceiling sits well above the steady ~2 MB/s a paced
+/// single-disk scan was measured at once admission landed (rustfs/rustfs#8377).
+pub const DEFAULT_SCANNER_DISK_IO_BUDGET_ROTATIONAL_IOPS: u64 = 100;
+
+pub const DEFAULT_SCANNER_DISK_IO_BUDGET_ROTATIONAL_BYTES_PER_SEC: u64 = 16 * 1024 * 1024;
+
+/// Flash media budget: a few percent of a SATA SSD's random-read capacity,
+/// enough to keep metadata walks far from saturating the device.
+pub const DEFAULT_SCANNER_DISK_IO_BUDGET_FLASH_IOPS: u64 = 4000;
+
+pub const DEFAULT_SCANNER_DISK_IO_BUDGET_FLASH_BYTES_PER_SEC: u64 = 256 * 1024 * 1024;
+
+/// Default object interval for cooperative scanner yields.
+pub const DEFAULT_SCANNER_YIELD_EVERY_N_OBJECTS: u64 = 128;
 
 /// Scanner speed preset controlling throttling behavior.
 ///
@@ -56,6 +361,10 @@ pub const DEFAULT_SCANNER_IDLE_MODE: bool = true;
 /// | `default` | 2x     | 1 second  | 1 minute       |
 /// | `slow`    | 10x    | 15 seconds| 1 minute       |
 /// | `slowest` | 100x   | 15 seconds| 30 minutes     |
+///
+/// The sleep factor, max sleep, and cycle interval can be overridden by
+/// `RUSTFS_SCANNER_DELAY`, `RUSTFS_SCANNER_MAX_WAIT_SECS`, and
+/// `RUSTFS_SCANNER_CYCLE`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScannerSpeed {
     Fastest,
@@ -94,14 +403,19 @@ impl ScannerSpeed {
         }
     }
 
-    pub fn from_env_str(s: &str) -> Self {
+    pub fn parse_str(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "fastest" => Self::Fastest,
-            "fast" => Self::Fast,
-            "slow" => Self::Slow,
-            "slowest" => Self::Slowest,
-            _ => Self::Default,
+            "fastest" => Some(Self::Fastest),
+            "fast" => Some(Self::Fast),
+            "default" => Some(Self::Default),
+            "slow" => Some(Self::Slow),
+            "slowest" => Some(Self::Slowest),
+            _ => None,
         }
+    }
+
+    pub fn from_env_str(s: &str) -> Self {
+        Self::parse_str(s).unwrap_or_default()
     }
 }
 

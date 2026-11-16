@@ -15,9 +15,93 @@
 // Default encryption block size - aligned with system default read buffer size (1MB)
 pub const DEFAULT_ENCRYPTION_BLOCK_SIZE: usize = 1024 * 1024;
 
+/// Feature-gated wrapper around `hotpath::measure_block!` for expression
+/// positions (e.g. inside `poll_read`) where an attribute cannot be used.
+/// With the `hotpath` feature off it expands to the body unchanged, so the
+/// default build carries zero profiling overhead and no hotpath dependency.
+#[cfg(feature = "hotpath")]
+#[macro_export]
+macro_rules! hp_measure_block {
+    ($label:expr, $body:expr) => {
+        ::hotpath::measure_block!($label, $body)
+    };
+}
+
+#[cfg(not(feature = "hotpath"))]
+#[macro_export]
+macro_rules! hp_measure_block {
+    ($label:expr, $body:expr) => {
+        $body
+    };
+}
+
+macro_rules! delegate_reader_capabilities_generic {
+    ($name:ident<$inner_ty:ident>, $inner:ident) => {
+        impl<$inner_ty> crate::EtagResolvable for $name<$inner_ty>
+        where
+            $inner_ty: crate::EtagResolvable,
+        {
+            fn try_resolve_etag(&mut self) -> Option<String> {
+                self.$inner.try_resolve_etag()
+            }
+        }
+
+        impl<$inner_ty> crate::HashReaderDetector for $name<$inner_ty>
+        where
+            $inner_ty: crate::HashReaderDetector,
+        {
+            fn is_hash_reader(&self) -> bool {
+                self.$inner.is_hash_reader()
+            }
+
+            fn as_hash_reader_mut(&mut self) -> Option<&mut dyn crate::HashReaderMut> {
+                self.$inner.as_hash_reader_mut()
+            }
+        }
+
+        impl<$inner_ty> crate::TryGetIndex for $name<$inner_ty>
+        where
+            $inner_ty: crate::TryGetIndex,
+        {
+            fn try_get_index(&self) -> Option<&crate::compress_index::Index> {
+                self.$inner.try_get_index()
+            }
+        }
+    };
+}
+
+macro_rules! delegate_reader_capabilities_generic_no_index {
+    ($name:ident<$inner_ty:ident>, $inner:ident) => {
+        impl<$inner_ty> crate::EtagResolvable for $name<$inner_ty>
+        where
+            $inner_ty: crate::EtagResolvable,
+        {
+            fn try_resolve_etag(&mut self) -> Option<String> {
+                self.$inner.try_resolve_etag()
+            }
+        }
+
+        impl<$inner_ty> crate::HashReaderDetector for $name<$inner_ty>
+        where
+            $inner_ty: crate::HashReaderDetector,
+        {
+            fn is_hash_reader(&self) -> bool {
+                self.$inner.is_hash_reader()
+            }
+
+            fn as_hash_reader_mut(&mut self) -> Option<&mut dyn crate::HashReaderMut> {
+                self.$inner.as_hash_reader_mut()
+            }
+        }
+    };
+}
+
 mod limit_reader;
 
 pub use limit_reader::LimitReader;
+
+mod s2_decoder;
+pub use s2_decoder::{MAX_S2_DECOMPRESSED_BLOCK_SIZE, S2Decoder};
 
 mod etag_reader;
 pub use etag_reader::EtagReader;
@@ -27,13 +111,22 @@ mod compress_reader;
 pub use compress_reader::{CompressReader, DecompressReader};
 
 mod encrypt_reader;
-pub use encrypt_reader::{DecryptReader, EncryptReader};
+pub use encrypt_reader::{DecryptReader, EncryptReader, multipart_part_nonce};
 
 mod hardlimit_reader;
 pub use hardlimit_reader::HardLimitReader;
 
 mod hash_reader;
 pub use hash_reader::*;
+
+mod trailer;
+pub use trailer::{SharedTrailerSource, TrailerSource, TrailerValue};
+
+mod tee_reader;
+pub use tee_reader::{
+    DEFAULT_TEE_MAX_DRAIN_BYTES, TeeDrainLimitExceeded, TeeOptions, TeePrimary, TeeSecondary, TeeStream, tee_reader,
+    tee_reader_with_options,
+};
 mod checksum;
 pub use checksum::*;
 
@@ -48,12 +141,22 @@ pub use writer::*;
 
 mod http_reader;
 pub use http_reader::*;
+mod http_runtime_sources;
 
-pub use compress_index::TryGetIndex;
+pub use compress_index::{Index, TryGetIndex};
 
 mod etag;
 
-pub trait Reader: tokio::io::AsyncRead + Unpin + Send + Sync + EtagResolvable + HashReaderDetector + TryGetIndex {}
+pub trait ReadStream: tokio::io::AsyncRead + Unpin + Send + Sync {}
+impl<T> ReadStream for T where T: tokio::io::AsyncRead + Unpin + Send + Sync {}
+
+pub trait ReaderCapabilities: EtagResolvable + HashReaderDetector + TryGetIndex {}
+impl<T> ReaderCapabilities for T where T: EtagResolvable + HashReaderDetector + TryGetIndex {}
+
+pub trait Reader: ReadStream + ReaderCapabilities {}
+impl<T> Reader for T where T: ReadStream + ReaderCapabilities {}
+
+pub type DynReader = Box<dyn Reader>;
 
 // Trait for types that can be recursively searched for etag capability
 pub trait EtagResolvable {
@@ -84,20 +187,54 @@ pub trait HashReaderDetector {
     }
 }
 
-impl Reader for crate::HashReader {}
-impl Reader for crate::HardLimitReader {}
-impl Reader for crate::EtagReader {}
-impl<R> Reader for crate::LimitReader<R> where R: Reader {}
-impl<R> Reader for crate::CompressReader<R> where R: Reader {}
-impl<R> Reader for crate::EncryptReader<R> where R: Reader {}
-impl<R> Reader for crate::DecryptReader<R> where R: Reader {}
-impl EtagResolvable for Box<dyn Reader> {
+pub fn boxed_reader<R>(reader: R) -> DynReader
+where
+    R: Reader + 'static,
+{
+    Box::new(reader)
+}
+
+pub fn wrap_reader<R>(reader: R) -> DynReader
+where
+    R: ReadStream + 'static,
+{
+    boxed_reader(WarpReader::new(reader))
+}
+
+impl<T> EtagResolvable for std::io::Cursor<T> {}
+
+impl EtagResolvable for &[u8] {}
+
+impl<R> EtagResolvable for tokio::io::BufReader<R>
+where
+    R: tokio::io::AsyncRead + EtagResolvable,
+{
+    fn is_etag_reader(&self) -> bool {
+        self.get_ref().is_etag_reader()
+    }
+
+    fn try_resolve_etag(&mut self) -> Option<String> {
+        self.get_mut().try_resolve_etag()
+    }
+}
+
+impl<T> EtagResolvable for Box<T>
+where
+    T: EtagResolvable + ?Sized,
+{
+    fn is_etag_reader(&self) -> bool {
+        self.as_ref().is_etag_reader()
+    }
+
     fn try_resolve_etag(&mut self) -> Option<String> {
         self.as_mut().try_resolve_etag()
     }
 }
 
-impl HashReaderDetector for Box<dyn Reader> {
+impl<T> HashReaderDetector for Box<T>
+where
+    T: HashReaderDetector + ?Sized,
+{
     fn is_hash_reader(&self) -> bool {
         self.as_ref().is_hash_reader()
     }
@@ -107,10 +244,11 @@ impl HashReaderDetector for Box<dyn Reader> {
     }
 }
 
-impl TryGetIndex for Box<dyn Reader> {
+impl<T> TryGetIndex for Box<T>
+where
+    T: TryGetIndex + ?Sized,
+{
     fn try_get_index(&self) -> Option<&compress_index::Index> {
         self.as_ref().try_get_index()
     }
 }
-
-impl Reader for Box<dyn Reader> {}

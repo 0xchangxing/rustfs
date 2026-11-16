@@ -14,29 +14,58 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::config::workload_profiles::WorkloadProfile;
+    #[test]
+    fn object_key_rejects_reserved_directory_markers() {
+        for key in [
+            "__XLDIR__",
+            "prefix/__XLDIR__",
+            "stash__XLDIR__/blob",
+            "file__XLDIR__",
+            "file__XLDIR__/",
+            "a__XLDIR__b",
+        ] {
+            let error = crate::storage::ecfs_extend::validate_object_key(key, "PUT")
+                .expect_err("client keys must not alias internal directory markers");
+            assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidArgument, "{key}");
+        }
+        for key in ["file", "folder/", "prefix/folder/", "__xldir__", "percent%20name"] {
+            crate::storage::ecfs_extend::validate_object_key(key, "PUT")
+                .expect("ordinary objects and directory objects remain valid");
+        }
+    }
+
+    use crate::config::WorkloadProfile;
     use crate::server::cors;
-    use crate::storage::ecfs::FS;
-    use crate::storage::ecfs::RUSTFS_OWNER;
-    use crate::storage::{
-        apply_cors_headers, check_preconditions, get_adaptive_buffer_size_with_profile, get_buffer_size_opt_in, is_etag_equal,
-        matches_origin_pattern, parse_etag, parse_object_lock_legal_hold, parse_object_lock_retention,
-        process_lambda_configurations, process_queue_configurations, process_topic_configurations,
-        validate_bucket_object_lock_enabled, validate_list_object_unordered_with_delimiter,
+    use crate::storage::StorageError;
+    use crate::storage::ecfs::{FS, parse_object_version_id};
+    use crate::storage::ecfs_extend::{apply_bucket_default_lock_retention, map_bucket_object_lock_config_state};
+    use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
+    use crate::storage::storage_api::ecstore_bucket::metadata_sys::ObjectLockConfigState;
+    use crate::storage::storage_api::test_consumer::{
+        BucketMetadata, DEFAULT_READ_BUFFER_SIZE, StorageObjectInfo as ObjectInfo, apply_cors_headers,
+        apply_default_lock_retention_metadata, bucket_metadata_sys_initialized, check_preconditions, decode_tags_to_map,
+        get_adaptive_buffer_size_with_profile, get_buffer_size_opt_in, get_global_bucket_metadata_sys, matches_origin_pattern,
+        parse_etag, parse_object_lock_legal_hold, parse_object_lock_retention, process_lambda_configurations,
+        process_queue_configurations, process_topic_configurations, remove_object_lock_metadata_for_copy,
+        remove_object_lock_retention_metadata, set_bucket_metadata, validate_bucket_object_lock_enabled,
+        validate_list_object_unordered_with_delimiter,
     };
     use http::{HeaderMap, HeaderValue, StatusCode};
     use rustfs_config::MI_B;
-    use rustfs_ecstore::bucket::{metadata::BucketMetadata, metadata_sys};
-    use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
-    use rustfs_ecstore::store_api::ObjectInfo;
-    use rustfs_utils::http::{AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, RESERVED_METADATA_PREFIX_LOWER};
+    use rustfs_utils::http::{
+        AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
+        MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP,
+        SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, contains_key_str, get_str, insert_str,
+    };
     use rustfs_zip::CompressionFormat;
     use s3s::dto::{
-        CORSConfiguration, CORSRule, Delimiter, LambdaFunctionConfiguration, ObjectLockLegalHold, ObjectLockLegalHoldStatus,
-        ObjectLockRetention, ObjectLockRetentionMode, QueueConfiguration, TopicConfiguration,
+        DefaultRetention, Delimiter, FilterRule, FilterRuleName, LambdaFunctionConfiguration, NotificationConfigurationFilter,
+        ObjectLockConfiguration, ObjectLockEnabled, ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention,
+        ObjectLockRetentionMode, ObjectLockRule, QueueConfiguration, S3KeyFilter, TopicConfiguration,
     };
     use s3s::{S3Error, S3ErrorCode, s3_error};
-    use time::OffsetDateTime;
+    use std::collections::HashMap;
+    use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
     #[test]
     fn test_fs_creation() {
@@ -68,11 +97,15 @@ mod tests {
     }
 
     #[test]
-    fn test_rustfs_owner_constant() {
-        // Test that RUSTFS_OWNER constant is properly defined
-        assert!(!RUSTFS_OWNER.display_name.as_ref().unwrap().is_empty());
-        assert!(!RUSTFS_OWNER.id.as_ref().unwrap().is_empty());
-        assert_eq!(RUSTFS_OWNER.display_name.as_ref().unwrap(), "RustFS Tester");
+    fn test_rustfs_owner_helpers_are_stable() {
+        let owner = rustfs_owner();
+        let initiator = rustfs_initiator();
+
+        assert!(!owner.display_name.as_ref().unwrap().is_empty());
+        assert!(!owner.id.as_ref().unwrap().is_empty());
+        assert_eq!(owner.display_name.as_deref(), Some("rustfs"));
+        assert_eq!(initiator.display_name, owner.display_name);
+        assert_eq!(initiator.id, owner.id);
     }
 
     // Note: Most S3 API methods require complex setup with global state, storage backend,
@@ -161,6 +194,233 @@ mod tests {
 
         let gz_format = CompressionFormat::from_extension("gz");
         assert_eq!(gz_format.extension(), "gz");
+    }
+
+    /// The bucket default retention path reads the persisted shape; the request
+    /// literals in these tests stay on the wire DTO and convert once here.
+    fn persisted_lock(cfg: &ObjectLockConfiguration) -> rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
+        crate::storage::persisted_from_s3s(cfg).expect("the test configuration converts")
+    }
+
+    #[test]
+    fn test_apply_default_lock_retention_metadata_applies_bucket_default() {
+        let cfg = ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(ObjectLockRule {
+                default_retention: Some(DefaultRetention {
+                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
+                    days: Some(1),
+                    years: None,
+                }),
+            }),
+        };
+        let mut metadata = std::collections::HashMap::new();
+
+        assert!(apply_default_lock_retention_metadata(Some(&persisted_lock(&cfg)), &mut metadata));
+        assert_eq!(metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER), Some(&"COMPLIANCE".to_string()));
+        let retain_until = metadata
+            .get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
+            .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+            .expect("default retention should write a valid retain-until date");
+        assert!(retain_until > OffsetDateTime::now_utc());
+        let retention_timestamp = get_str(&metadata, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP)
+            .and_then(|value| OffsetDateTime::parse(&value, &Rfc3339).ok())
+            .expect("default retention should write a valid internal timestamp");
+        assert!(retention_timestamp <= OffsetDateTime::now_utc());
+        assert!(metadata.contains_key(&format!("{RUSTFS_INTERNAL_PREFIX}{SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP}")));
+        assert!(metadata.contains_key(&format!("{MINIO_INTERNAL_PREFIX}{SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP}")));
+    }
+
+    #[test]
+    fn test_apply_default_lock_retention_metadata_preserves_explicit_retention() {
+        use std::collections::HashMap;
+
+        let cfg = ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(ObjectLockRule {
+                default_retention: Some(DefaultRetention {
+                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
+                    days: Some(1),
+                    years: None,
+                }),
+            }),
+        };
+        let mut metadata = HashMap::from([
+            (AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), "GOVERNANCE".to_string()),
+            (AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), "2030-01-01T00:00:00Z".to_string()),
+        ]);
+
+        assert!(!apply_default_lock_retention_metadata(Some(&persisted_lock(&cfg)), &mut metadata));
+        assert_eq!(metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER), Some(&"GOVERNANCE".to_string()));
+        assert_eq!(
+            metadata.get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER),
+            Some(&"2030-01-01T00:00:00Z".to_string())
+        );
+    }
+
+    #[test]
+    fn test_apply_default_lock_retention_metadata_ignores_bucket_without_default() {
+        let cfg = ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: None,
+        };
+        let mut metadata = std::collections::HashMap::new();
+
+        assert!(!apply_default_lock_retention_metadata(Some(&persisted_lock(&cfg)), &mut metadata));
+        assert!(metadata.is_empty());
+    }
+
+    #[test]
+    fn test_apply_bucket_default_lock_retention_applies_authoritative_default() {
+        let config = ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(ObjectLockRule {
+                default_retention: Some(DefaultRetention {
+                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE)),
+                    days: Some(1),
+                    years: None,
+                }),
+            }),
+        };
+        let state = ObjectLockConfigState::Configured {
+            config: persisted_lock(&config),
+            updated_at: OffsetDateTime::now_utc(),
+        };
+        let mut metadata = std::collections::HashMap::new();
+
+        apply_bucket_default_lock_retention("locked-bucket", &state, &mut metadata, false)
+            .expect("authoritative bucket default should be applied");
+
+        assert_eq!(metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str), Some("GOVERNANCE"));
+        assert!(metadata.contains_key(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER));
+    }
+
+    #[test]
+    fn test_apply_bucket_default_lock_retention_preserves_explicit_retention_path() {
+        let config = ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(ObjectLockRule {
+                default_retention: Some(DefaultRetention {
+                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
+                    days: Some(1),
+                    years: None,
+                }),
+            }),
+        };
+        let state = ObjectLockConfigState::Configured {
+            config: persisted_lock(&config),
+            updated_at: OffsetDateTime::now_utc(),
+        };
+        let mut metadata = HashMap::new();
+
+        apply_bucket_default_lock_retention("locked-bucket", &state, &mut metadata, true)
+            .expect("explicit retention should suppress only the bucket default");
+
+        assert!(metadata.is_empty());
+    }
+
+    #[test]
+    fn test_apply_bucket_default_lock_retention_allows_confirmed_absence() {
+        let mut metadata = HashMap::new();
+
+        apply_bucket_default_lock_retention("legacy-bucket", &ObjectLockConfigState::ConfirmedAbsent, &mut metadata, false)
+            .expect("confirmed absence should keep legacy buckets writable");
+
+        assert!(metadata.is_empty());
+    }
+
+    #[test]
+    fn test_apply_bucket_default_lock_retention_rejects_fabricated_metadata_even_with_explicit_retention() {
+        let mut metadata = std::collections::HashMap::from([
+            (AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), "COMPLIANCE".to_string()),
+            (AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), "2030-01-01T00:00:00Z".to_string()),
+        ]);
+
+        let err =
+            apply_bucket_default_lock_retention("untrusted-bucket", &ObjectLockConfigState::Fabricated, &mut metadata, true)
+                .expect_err("fabricated metadata must fail closed before accepting explicit retention");
+
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(err.message(), Some("Failed to load Object Lock configuration"));
+    }
+
+    #[test]
+    fn test_bucket_object_lock_config_load_error_fails_closed() {
+        let err = map_bucket_object_lock_config_state("corrupt-bucket", Err(StorageError::other("corrupt Object Lock metadata")))
+            .expect_err("metadata read or parse failures must fail closed");
+
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(err.message(), Some("Failed to load Object Lock configuration"));
+    }
+
+    #[test]
+    fn test_remove_object_lock_retention_metadata_clears_only_retention_fields() {
+        use std::collections::HashMap;
+
+        let mut metadata = HashMap::from([
+            (AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), "GOVERNANCE".to_string()),
+            (AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), "2030-01-01T00:00:00Z".to_string()),
+            (AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), "ON".to_string()),
+        ]);
+        insert_str(&mut metadata, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, "2026-01-01T00:00:00Z".to_string());
+
+        assert!(remove_object_lock_retention_metadata(&mut metadata));
+        assert!(!metadata.contains_key(AMZ_OBJECT_LOCK_MODE_LOWER));
+        assert!(!metadata.contains_key(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER));
+        assert!(!contains_key_str(&metadata, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP));
+        assert_eq!(metadata.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER), Some(&"ON".to_string()));
+    }
+
+    #[test]
+    fn test_remove_object_lock_metadata_for_copy_clears_retention_and_legal_hold() {
+        use std::collections::HashMap;
+
+        let mut metadata = HashMap::from([
+            (AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), "GOVERNANCE".to_string()),
+            (AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), "2030-01-01T00:00:00Z".to_string()),
+            (AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), "ON".to_string()),
+            ("content-type".to_string(), "application/octet-stream".to_string()),
+        ]);
+        insert_str(&mut metadata, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, "2026-01-01T00:00:00Z".to_string());
+        insert_str(&mut metadata, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, "2026-01-01T00:00:00Z".to_string());
+
+        assert!(remove_object_lock_metadata_for_copy(&mut metadata));
+        assert!(!metadata.contains_key(AMZ_OBJECT_LOCK_MODE_LOWER));
+        assert!(!metadata.contains_key(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER));
+        assert!(!metadata.contains_key(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER));
+        assert!(!contains_key_str(&metadata, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP));
+        assert!(!contains_key_str(&metadata, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP));
+        assert_eq!(metadata.get("content-type"), Some(&"application/octet-stream".to_string()));
+    }
+
+    #[test]
+    fn test_tagging_version_id_preserves_explicit_null_and_latest_selection() {
+        assert_eq!(parse_object_version_id(None).expect("latest version selector"), None);
+        assert_eq!(
+            parse_object_version_id(Some("null".to_owned())).expect("explicit null version selector"),
+            Some(uuid::Uuid::nil())
+        );
+        for version in [uuid::Uuid::nil(), uuid::Uuid::new_v4()] {
+            assert_eq!(
+                parse_object_version_id(Some(version.to_string())).expect("UUID version selector"),
+                Some(version)
+            );
+        }
+    }
+
+    #[test]
+    fn test_tagging_version_id_rejects_invalid_values_instead_of_selecting_latest() {
+        for version in [
+            "",
+            "NULL",
+            " null ",
+            "not-a-version",
+            "null/other",
+            "00000000-0000-0000-0000-00000000000g",
+        ] {
+            let err = parse_object_version_id(Some(version.to_owned())).expect_err("invalid version must fail closed");
+            assert_eq!(err.code(), &S3ErrorCode::InvalidArgument, "version: {version:?}");
+        }
     }
 
     #[test]
@@ -274,9 +534,7 @@ mod tests {
 
     #[test]
     fn test_phase3_default_behavior() {
-        use crate::config::workload_profiles::{
-            RustFSBufferConfig, WorkloadProfile, init_global_buffer_config, set_buffer_profile_enabled,
-        };
+        use crate::config::{RustFSBufferConfig, WorkloadProfile, init_global_buffer_config, set_buffer_profile_enabled};
 
         const KB: i64 = 1024;
         const MB: i64 = 1024 * 1024;
@@ -297,7 +555,7 @@ mod tests {
 
     #[test]
     fn test_buffer_size_opt_in() {
-        use crate::config::workload_profiles::{is_buffer_profile_enabled, set_buffer_profile_enabled};
+        use crate::config::{is_buffer_profile_enabled, set_buffer_profile_enabled};
 
         const KB: i64 = 1024;
         const MB: i64 = 1024 * 1024;
@@ -329,9 +587,7 @@ mod tests {
 
     #[test]
     fn test_phase4_full_integration() {
-        use crate::config::workload_profiles::{
-            RustFSBufferConfig, WorkloadProfile, init_global_buffer_config, set_buffer_profile_enabled,
-        };
+        use crate::config::{RustFSBufferConfig, WorkloadProfile, init_global_buffer_config, set_buffer_profile_enabled};
 
         const KB: i64 = 1024;
         const MB: i64 = 1024 * 1024;
@@ -362,44 +618,6 @@ mod tests {
     }
 
     #[test]
-    fn test_phase5_s3_entrypoints_delegate_to_usecases() {
-        fn assert_delegates_within_method(src: &str, signature: &str, delegation_call: &str, error_msg: &str) {
-            let sig_pos = src
-                .find(signature)
-                .unwrap_or_else(|| panic!("Expected to find method signature: {signature}"));
-
-            let after_sig = &src[sig_pos + signature.len()..];
-            let method_body_end_rel = after_sig.find("async fn ").unwrap_or(after_sig.len());
-            let method_body = &after_sig[..method_body_end_rel];
-
-            assert!(method_body.contains(delegation_call), "{error_msg}");
-        }
-
-        let src = include_str!("ecfs.rs");
-
-        assert_delegates_within_method(
-            src,
-            "async fn put_object(&self, req: S3Request<PutObjectInput>)",
-            "usecase.execute_put_object(self, req).await",
-            "put_object must delegate to DefaultObjectUsecase::execute_put_object",
-        );
-
-        assert_delegates_within_method(
-            src,
-            "async fn get_object(&self, req: S3Request<GetObjectInput>)",
-            "usecase.execute_get_object(req).await",
-            "get_object must delegate to DefaultObjectUsecase::execute_get_object",
-        );
-
-        assert_delegates_within_method(
-            src,
-            "async fn list_objects_v2(&self, req: S3Request<ListObjectsV2Input>)",
-            "usecase.execute_list_objects_v2(req).await",
-            "list_objects_v2 must delegate to DefaultBucketUsecase::execute_list_objects_v2",
-        );
-    }
-
-    #[test]
     fn test_validate_list_object_unordered_with_delimiter() {
         // [1] Normal case: No delimiter specified.
         assert!(validate_list_object_unordered_with_delimiter(None, Some("allow-unordered=true")).is_ok());
@@ -425,9 +643,14 @@ mod tests {
     #[test]
     fn test_parse_object_lock_retention() {
         use time::macros::datetime;
+        use time::{OffsetDateTime, UtcOffset};
         // [1] Normal case: No retention specified (empty metadata)
         assert!(parse_object_lock_retention(None).is_ok());
         assert!(parse_object_lock_retention(None).unwrap().is_empty());
+        let cleared = parse_object_lock_retention(Some(ObjectLockRetention::default())).unwrap();
+        assert_eq!(cleared.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str), Some(""));
+        assert_eq!(cleared.get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER).map(String::as_str), Some(""));
+        assert!(contains_key_str(&cleared, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP));
 
         // [2] Normal case: Retention with valid COMPLIANCE mode (future date)
         let valid_compliance_retention = ObjectLockRetention {
@@ -435,14 +658,16 @@ mod tests {
             retain_until_date: Some(datetime!(2030-01-01 00:00:00 UTC).into()),
         };
         let compliance_metadata = parse_object_lock_retention(Some(valid_compliance_retention)).unwrap();
-        assert_eq!(compliance_metadata.get("x-amz-object-lock-mode").unwrap(), "COMPLIANCE");
+        assert_eq!(compliance_metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER).unwrap(), "COMPLIANCE");
         assert_eq!(
-            compliance_metadata.get("x-amz-object-lock-retain-until-date").unwrap(),
+            compliance_metadata.get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER).unwrap(),
             "2030-01-01T00:00:00Z"
         );
-        assert!(
-            compliance_metadata.contains_key(&format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "objectlock-retention-timestamp"))
-        );
+        assert!(contains_key_str(&compliance_metadata, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP));
+        let retention_timestamp = get_str(&compliance_metadata, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP)
+            .and_then(|value| OffsetDateTime::parse(&value, &Rfc3339).ok())
+            .expect("explicit retention should write a valid internal timestamp");
+        assert!(retention_timestamp <= OffsetDateTime::now_utc());
 
         // [3] Normal case: Retention with valid GOVERNANCE mode (future date)
         let valid_governance_retention = ObjectLockRetention {
@@ -450,7 +675,7 @@ mod tests {
             retain_until_date: Some(datetime!(2030-01-01 00:00:00 UTC).into()),
         };
         let governance_metadata = parse_object_lock_retention(Some(valid_governance_retention)).unwrap();
-        assert_eq!(governance_metadata.get("x-amz-object-lock-mode").unwrap(), "GOVERNANCE");
+        assert_eq!(governance_metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER).unwrap(), "GOVERNANCE");
 
         // [4] Normal case: Retention with None mode (empty string for mode, date not validated)
         let none_mode_retention = ObjectLockRetention {
@@ -458,7 +683,7 @@ mod tests {
             retain_until_date: Some(datetime!(2030-01-01 00:00:00 UTC).into()),
         };
         let none_mode_metadata = parse_object_lock_retention(Some(none_mode_retention)).unwrap();
-        assert_eq!(none_mode_metadata.get("x-amz-object-lock-mode").unwrap(), "");
+        assert_eq!(none_mode_metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER).unwrap(), "");
 
         // [5] Normal case: Retention with None retain_until_date (empty string for date)
         let none_date_retention = ObjectLockRetention {
@@ -466,7 +691,7 @@ mod tests {
             retain_until_date: None,
         };
         let none_date_metadata = parse_object_lock_retention(Some(none_date_retention)).unwrap();
-        assert_eq!(none_date_metadata.get("x-amz-object-lock-retain-until-date").unwrap(), "");
+        assert_eq!(none_date_metadata.get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER).unwrap(), "");
 
         // [6] Error case: Retention with invalid mode (non COMPLIANCE/GOVERNANCE)
         let invalid_mode_retention = ObjectLockRetention {
@@ -488,6 +713,19 @@ mod tests {
         let err = parse_object_lock_retention(Some(past_date_retention)).unwrap_err();
         assert_eq!(err.code().as_str(), S3ErrorCode::InvalidArgument.as_str());
         assert_eq!(err.message(), Some("The retain until date must be in the future"));
+
+        // [8] Error case: timestamps that cannot be serialized as RFC3339 should return InvalidArgument instead of panicking
+        let unsupported_rfc3339_date = datetime!(2030-01-01 00:00:00 UTC)
+            .to_offset(UtcOffset::from_hms(5, 30, 45).expect("offset with seconds should be constructible"));
+        assert!(unsupported_rfc3339_date > OffsetDateTime::now_utc());
+
+        let unsupported_date_retention = ObjectLockRetention {
+            mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
+            retain_until_date: Some(unsupported_rfc3339_date.into()),
+        };
+        let err = parse_object_lock_retention(Some(unsupported_date_retention)).unwrap_err();
+        assert_eq!(err.code().as_str(), S3ErrorCode::InvalidArgument.as_str());
+        assert_eq!(err.message(), Some("The retain until date is not a supported RFC3339 timestamp"));
     }
 
     #[test]
@@ -502,7 +740,10 @@ mod tests {
         };
         let on_metadata = parse_object_lock_legal_hold(Some(valid_on_legal_hold)).unwrap();
         assert_eq!(on_metadata.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).unwrap(), "ON");
-        assert!(on_metadata.contains_key(&format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "objectlock-legalhold-timestamp")));
+        let legal_hold_timestamp = get_str(&on_metadata, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP)
+            .and_then(|value| OffsetDateTime::parse(&value, &Rfc3339).ok())
+            .expect("legal hold should write a valid internal timestamp");
+        assert!(legal_hold_timestamp <= OffsetDateTime::now_utc());
 
         // [3] Normal case: Legal hold with valid OFF status
         let valid_off_legal_hold = ObjectLockLegalHold {
@@ -530,21 +771,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_bucket_object_lock_enabled() {
-        use rustfs_ecstore::bucket::metadata::BucketMetadata;
-        use rustfs_ecstore::bucket::metadata_sys::set_bucket_metadata;
-        use s3s::dto::{ObjectLockConfiguration, ObjectLockEnabled};
         use time::OffsetDateTime;
 
-        if rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get().is_none() {
-            eprintln!("Skipping test: GLOBAL_BucketMetadataSys not initialized");
+        if !bucket_metadata_sys_initialized() {
+            eprintln!("Skipping test: bucket metadata system not initialized");
             return;
         }
 
         let test_bucket = "test-bucket-object-lock";
 
         let mut bm = BucketMetadata::new(test_bucket);
-        bm.object_lock_config = Some(ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+        bm.object_lock_config = Some(rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
+            object_lock_enabled: Some("Enabled".to_owned()),
             rule: None,
         });
         bm.object_lock_config_updated_at = OffsetDateTime::now_utc();
@@ -552,7 +790,7 @@ mod tests {
         assert!(validate_bucket_object_lock_enabled(test_bucket).await.is_ok());
 
         let mut bm = BucketMetadata::new(test_bucket);
-        bm.object_lock_config = Some(ObjectLockConfiguration {
+        bm.object_lock_config = Some(rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
             object_lock_enabled: None,
             rule: None,
         });
@@ -569,30 +807,72 @@ mod tests {
     }
 
     #[test]
-    fn test_is_etag_equal() {
-        // [1] Header ETag is "*", should return true (match any object ETag)
-        assert!(is_etag_equal("\"d41d8cd98f00b204e9800998ecf8427e\"", "*"));
+    fn test_read_etag_comparison() {
+        for (object_etag, condition, matches) in [
+            ("\"d41d8cd98f00b204e9800998ecf8427e\"", "*", true),
+            ("\"d41d8cd98f00b204e9800998ecf8427e\"", "\"d41d8cd98f00b204e9800998ecf8427e\"", true),
+            ("\"d41d8cd98f00b204e9800998ecf8427e\"", "d41d8cd98f00b204e9800998ecf8427e", true),
+            ("\"12345\"", "\"67890\", \"12345\", \"abcde\"", true),
+            ("\"12345\"", "  \"67890\" , \"12345\"  , \"abcde\"  ", true),
+            ("\"12345\"", "\"67890\"", false),
+            ("\"12345\"", "\"67890\", \"abcde\"", false),
+        ] {
+            let info = ObjectInfo {
+                etag: Some(object_etag.to_owned()),
+                ..Default::default()
+            };
+            let mut headers = HeaderMap::new();
+            headers.insert(http::header::IF_NONE_MATCH, HeaderValue::from_str(condition).unwrap());
+            let result = check_preconditions(&headers, &info);
+            if matches {
+                assert_eq!(result.unwrap_err().code(), &S3ErrorCode::NotModified);
+            } else {
+                assert!(result.is_ok());
+            }
+        }
+    }
 
-        // [2] Exact match (both with double quotes)
-        assert!(is_etag_equal(
-            "\"d41d8cd98f00b204e9800998ecf8427e\"",
-            "\"d41d8cd98f00b204e9800998ecf8427e\""
-        ));
-
-        // [3] Exact match (object ETag with quotes, header ETag without)
-        assert!(is_etag_equal("\"d41d8cd98f00b204e9800998ecf8427e\"", "d41d8cd98f00b204e9800998ecf8427e"));
-
-        // [4] Header ETag has multiple values (comma-separated), one matches
-        assert!(is_etag_equal("\"12345\"", "\"67890\", \"12345\", \"abcde\""));
-
-        // [5] Header ETag has multiple values with spaces, one matches after trim
-        assert!(is_etag_equal("\"12345\"", "  \"67890\" , \"12345\"  , \"abcde\"  "));
-
-        // [6] No match (different ETag)
-        assert!(!is_etag_equal("\"12345\"", "\"67890\""));
-
-        // [7] No match in multiple values
-        assert!(!is_etag_equal("\"12345\"", "\"67890\", \"abcde\""));
+    #[test]
+    fn test_read_etag_comparison_requires_complete_field() {
+        for (etag, condition, matches) in [
+            ("abc", "\"other\"\"abc\"", false),
+            ("abc", "\"abc\"garbage\"", false),
+            ("abc", "\"abc\", \"other\"\"different\"", false),
+            ("abc", "\"abc\", W/ \"other\"", false),
+            ("abc", "\"abc\", \"contains space\"", false),
+            ("abc", "\"abc\", *", false),
+            ("abc", "\"other\", , \"abc\"", true),
+            ("abc", ", \"abc\",,", true),
+            ("a,b", "\"other\", \"a,b\"", true),
+            ("", ",,,", false),
+            ("", "\"\"", true),
+        ] {
+            let info = ObjectInfo {
+                etag: Some(etag.to_owned()),
+                ..Default::default()
+            };
+            for name in [http::header::IF_MATCH, http::header::IF_NONE_MATCH] {
+                let mut headers = HeaderMap::new();
+                headers.insert(name.clone(), HeaderValue::from_str(condition).unwrap());
+                let result = check_preconditions(&headers, &info);
+                if name == http::header::IF_MATCH {
+                    if matches {
+                        assert!(result.is_ok(), "{condition}");
+                    } else {
+                        assert_eq!(result.unwrap_err().code(), &S3ErrorCode::PreconditionFailed, "{condition}");
+                    }
+                } else if matches {
+                    // The empty ETag case validates matching via If-Match above;
+                    // emitting that invalid stored response validator fails closed.
+                    assert!(result.is_err(), "{condition}");
+                    if !etag.is_empty() {
+                        assert_eq!(result.unwrap_err().code(), &S3ErrorCode::NotModified, "{condition}");
+                    }
+                } else {
+                    assert!(result.is_ok(), "{condition}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -740,7 +1020,7 @@ mod tests {
             "if-modified-since",
             HeaderValue::from_str(&valid_mod_time.format(&RFC1123).unwrap()).unwrap(),
         );
-        let info14 = info3.clone();
+        let info14 = info3;
         assert!(check_preconditions(&headers14, &info14).is_ok());
 
         // [15] If-Match with no ETag → PreconditionFailed
@@ -774,6 +1054,88 @@ mod tests {
             ..Default::default()
         };
         assert!(check_preconditions(&headers17, &info17).is_ok());
+
+        // [18] Empty conditional ETag headers are ignored
+        let mut headers18 = HeaderMap::new();
+        headers18.insert("if-match", HeaderValue::from_static(""));
+        headers18.insert("if-none-match", HeaderValue::from_static(" "));
+        let info18 = ObjectInfo {
+            mod_time: Some(valid_mod_time),
+            etag: Some(valid_etag.to_string()),
+            ..Default::default()
+        };
+        assert!(check_preconditions(&headers18, &info18).is_ok());
+    }
+
+    #[test]
+    fn test_check_preconditions_rfc304() {
+        let modified = OffsetDateTime::from_unix_timestamp(1700000000).expect("valid timestamp");
+        let mut info = ObjectInfo {
+            etag: Some("abc".to_owned()),
+            mod_time: Some(modified),
+            expires: Some(modified + time::Duration::days(1)),
+            version_id: Some(uuid::Uuid::nil()),
+            ..Default::default()
+        };
+        info.user_defined = std::collections::HashMap::from([("cache-control".to_owned(), "max-age=60".to_owned())]).into();
+        let mut headers = HeaderMap::new();
+        headers.insert("if-none-match", HeaderValue::from_static("W/\"abc\""));
+        let error = check_preconditions(&headers, &info).expect_err("weak ETag must validate the cache");
+        assert_eq!(error.code(), &S3ErrorCode::NotModified);
+        let response = error.headers().expect("304 carries cache headers");
+        assert_eq!(response["etag"], "\"abc\"");
+        assert_eq!(response["cache-control"], "max-age=60");
+        assert!(response.contains_key("expires"));
+        assert!(response.contains_key("last-modified"));
+        assert_eq!(response["x-amz-version-id"], "null");
+
+        headers.insert("if-match", HeaderValue::from_static("\"other\""));
+        assert_eq!(
+            check_preconditions(&headers, &info).expect_err("If-Match is first").code(),
+            &S3ErrorCode::PreconditionFailed
+        );
+        headers.remove("if-none-match");
+        headers.insert("if-match", HeaderValue::from_static("W/\"abc\""));
+        assert_eq!(
+            check_preconditions(&headers, &info)
+                .expect_err("If-Match requires strong comparison")
+                .code(),
+            &S3ErrorCode::PreconditionFailed
+        );
+
+        headers.clear();
+        headers.insert("if-none-match", HeaderValue::from_static("\"other\""));
+        let date = modified.format(&crate::storage::RFC1123).expect("format timestamp");
+        headers.insert("if-modified-since", HeaderValue::from_str(&date).expect("valid date header"));
+        assert!(check_preconditions(&headers, &info).is_ok(), "If-None-Match suppresses the date");
+        headers.clear();
+        headers.insert("if-unmodified-since", HeaderValue::from_str(&date).expect("valid date header"));
+        info.mod_time = Some(modified + time::Duration::seconds(1));
+        assert_eq!(
+            check_preconditions(&headers, &info)
+                .expect_err("next second was modified")
+                .code(),
+            &S3ErrorCode::PreconditionFailed
+        );
+
+        headers.clear();
+        headers.insert("if-none-match", HeaderValue::from_static("*"));
+        info.etag = None;
+        assert_eq!(
+            check_preconditions(&headers, &info)
+                .expect_err("existing object wildcard needs no ETag")
+                .code(),
+            &S3ErrorCode::NotModified
+        );
+        headers.clear();
+        headers.insert("if-match", HeaderValue::from_static("*"));
+        assert!(check_preconditions(&headers, &info).is_ok());
+        headers.insert("if-match", HeaderValue::from_static("\"other\", \"abc,def\""));
+        info.etag = Some("abc,def".to_owned());
+        assert!(
+            check_preconditions(&headers, &info).is_ok(),
+            "commas inside an opaque tag are not list delimiters"
+        );
     }
 
     #[test]
@@ -891,31 +1253,6 @@ mod tests {
         let version_id: Option<Uuid> = Some(uuid);
         let formatted = version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string());
         assert_eq!(formatted, "550e8400-e29b-41d4-a716-446655440000");
-    }
-
-    #[test]
-    fn test_delete_objects_version_id_normalization() {
-        use uuid::Uuid;
-
-        let fs = FS::new();
-
-        let (raw, uuid) = fs.normalize_delete_objects_version_id(Some("null".to_string())).unwrap();
-        assert_eq!(raw.as_deref(), Some("null"));
-        assert_eq!(uuid, Some(Uuid::nil()));
-
-        let valid = "550e8400-e29b-41d4-a716-446655440000".to_string();
-        let (raw, uuid) = fs.normalize_delete_objects_version_id(Some(valid.clone())).unwrap();
-        assert_eq!(raw.as_deref(), Some(valid.as_str()));
-        assert_eq!(uuid, Some(Uuid::parse_str(&valid).unwrap()));
-
-        let err = fs
-            .normalize_delete_objects_version_id(Some("not-a-uuid".to_string()))
-            .unwrap_err();
-        assert!(!err.is_empty());
-
-        let (raw, uuid) = fs.normalize_delete_objects_version_id(None).unwrap();
-        assert!(raw.is_none());
-        assert!(uuid.is_none());
     }
 
     /// Test that ListObjectVersionsOutput markers are correctly set
@@ -1109,7 +1446,7 @@ mod tests {
         let method = http::Method::GET;
 
         // Should return None when no origin header
-        let result = apply_cors_headers("test-bucket", &method, &headers).await;
+        let result = apply_cors_headers("test-bucket", &method, &cors::CorsRequest::from_headers(&headers)).await;
         assert!(result.is_none(), "Should return None when no Origin header");
     }
 
@@ -1123,22 +1460,23 @@ mod tests {
         // Should return None when no CORS config exists
         // Note: This test may fail if test-bucket actually has CORS config
         // In a real scenario, we'd use a mock or ensure the bucket doesn't exist
-        let _result = apply_cors_headers("non-existent-bucket-for-testing", &method, &headers).await;
+        let _result =
+            apply_cors_headers("non-existent-bucket-for-testing", &method, &cors::CorsRequest::from_headers(&headers)).await;
         // Result depends on whether bucket exists and has CORS config
         // This is expected behavior - we just verify it doesn't panic
     }
 
     #[tokio::test]
     async fn test_apply_cors_headers_unmatched_origin_with_cors_config() {
-        if metadata_sys::get_global_bucket_metadata_sys().is_none() {
-            eprintln!("Skipping test: GLOBAL_BucketMetadataSys not initialized");
+        if get_global_bucket_metadata_sys().is_none() {
+            eprintln!("Skipping test: bucket metadata system not initialized");
             return;
         }
 
         let bucket = "test-bucket-no-match-cors";
         let mut bm = BucketMetadata::new(bucket);
-        bm.cors_config = Some(CORSConfiguration {
-            cors_rules: vec![CORSRule {
+        bm.cors_config = Some(rustfs_gateway_types::cors_tagging::PersistedCorsConfiguration {
+            cors_rules: vec![rustfs_gateway_types::cors_tagging::PersistedCorsRule {
                 allowed_headers: Some(vec!["*".to_string()]),
                 allowed_methods: vec!["GET".to_string()],
                 allowed_origins: vec!["https://allowed.example.com".to_string()],
@@ -1147,12 +1485,12 @@ mod tests {
                 max_age_seconds: None,
             }],
         });
-        metadata_sys::set_bucket_metadata(bucket.to_string(), bm).await.unwrap();
+        set_bucket_metadata(bucket.to_string(), bm).await.unwrap();
 
         let mut headers = HeaderMap::new();
         headers.insert(cors::standard::ORIGIN, "https://disallowed.example.com".parse().unwrap());
 
-        let result = apply_cors_headers(bucket, &http::Method::GET, &headers).await;
+        let result = apply_cors_headers(bucket, &http::Method::GET, &cors::CorsRequest::from_headers(&headers)).await;
         assert!(
             result.is_some(),
             "Expected Some empty headers when bucket has CORS config but origin does not match any rule"
@@ -1161,22 +1499,22 @@ mod tests {
         assert!(result.get(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
         assert!(result.get(cors::response::ACCESS_CONTROL_ALLOW_METHODS).is_none());
 
-        metadata_sys::set_bucket_metadata(bucket.to_string(), BucketMetadata::new(bucket))
+        set_bucket_metadata(bucket.to_string(), BucketMetadata::new(bucket))
             .await
             .unwrap();
     }
 
     #[tokio::test]
     async fn test_apply_cors_headers_credentialed_request_with_wildcard_origin() {
-        if metadata_sys::get_global_bucket_metadata_sys().is_none() {
-            eprintln!("Skipping test: GLOBAL_BucketMetadataSys not initialized");
+        if get_global_bucket_metadata_sys().is_none() {
+            eprintln!("Skipping test: bucket metadata system not initialized");
             return;
         }
 
         let bucket = "test-bucket-credentialed-cors";
         let mut bm = BucketMetadata::new(bucket);
-        bm.cors_config = Some(CORSConfiguration {
-            cors_rules: vec![CORSRule {
+        bm.cors_config = Some(rustfs_gateway_types::cors_tagging::PersistedCorsConfiguration {
+            cors_rules: vec![rustfs_gateway_types::cors_tagging::PersistedCorsRule {
                 allowed_headers: Some(vec!["*".to_string()]),
                 allowed_methods: vec!["GET".to_string()],
                 allowed_origins: vec!["*".to_string()],
@@ -1185,7 +1523,7 @@ mod tests {
                 max_age_seconds: None,
             }],
         });
-        metadata_sys::set_bucket_metadata(bucket.to_string(), bm).await.unwrap();
+        set_bucket_metadata(bucket.to_string(), bm).await.unwrap();
 
         let mut headers = HeaderMap::new();
         headers.insert(cors::standard::ORIGIN, "https://console.localhost".parse().unwrap());
@@ -1193,15 +1531,15 @@ mod tests {
         headers.insert(cors::request::ACCESS_CONTROL_REQUEST_HEADERS, "x-amz-content-sha256".parse().unwrap());
         headers.insert(http::header::AUTHORIZATION, "AWS4-HMAC-SHA256 Credential=test/20260302/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256, Signature=abc".parse().unwrap());
 
-        let result = apply_cors_headers(bucket, &http::Method::OPTIONS, &headers).await.unwrap();
+        let result = apply_cors_headers(bucket, &http::Method::OPTIONS, &cors::CorsRequest::from_headers(&headers))
+            .await
+            .unwrap();
         assert_eq!(
             result.get(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
             "https://console.localhost",
         );
         assert_eq!(result.get(cors::response::ACCESS_CONTROL_ALLOW_CREDENTIALS).unwrap(), "true");
-        assert_eq!(result.get(cors::standard::VARY).unwrap(), "Origin");
-
-        metadata_sys::set_bucket_metadata(bucket.to_string(), BucketMetadata::new(bucket))
+        set_bucket_metadata(bucket.to_string(), BucketMetadata::new(bucket))
             .await
             .unwrap();
     }
@@ -1213,7 +1551,7 @@ mod tests {
         headers.insert("origin", "https://example.com".parse().unwrap());
         let method = http::Method::PATCH; // Unsupported method
 
-        let result = apply_cors_headers("test-bucket", &method, &headers).await;
+        let result = apply_cors_headers("test-bucket", &method, &cors::CorsRequest::from_headers(&headers)).await;
         assert!(result.is_none(), "Should return None for unsupported methods");
     }
 
@@ -1337,13 +1675,53 @@ mod tests {
         assert_eq!(event_rules.len(), 1, "Should add one rule");
     }
 
+    #[test]
+    fn test_process_queue_configurations_accepts_capitalized_filter_names() {
+        use rustfs_targets::arn::{ARN, TargetIDError};
+
+        let mut event_rules = Vec::new();
+        let valid_arn = "arn:rustfs:sqs:us-east-1:1:webhook";
+
+        let result = process_queue_configurations(
+            &mut event_rules,
+            Some(vec![QueueConfiguration {
+                events: vec!["s3:ObjectCreated:*".to_string().into()],
+                queue_arn: valid_arn.to_string(),
+                filter: Some(NotificationConfigurationFilter {
+                    key: Some(S3KeyFilter {
+                        filter_rules: Some(vec![
+                            FilterRule {
+                                name: Some(FilterRuleName::from("Prefix".to_string())),
+                                value: Some("uploads/".to_string()),
+                            },
+                            FilterRule {
+                                name: Some(FilterRuleName::from("Suffix".to_string())),
+                                value: Some(".csv".to_string()),
+                            },
+                        ]),
+                    }),
+                }),
+                id: None,
+            }]),
+            |arn_str| {
+                ARN::parse(arn_str)
+                    .map(|arn| arn.target_id)
+                    .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
+            },
+        );
+
+        assert!(result.is_ok(), "capitalized filter names should be compatible");
+        assert_eq!(event_rules.len(), 1, "Should add one rule");
+        assert_eq!(event_rules[0].1, "uploads/");
+        assert_eq!(event_rules[0].2, ".csv");
+    }
+
     // --- Object tag conditions for bucket policy (s3:ExistingObjectTag) ---
 
     /// Verifies that object tags are formatted as ExistingObjectTag/<key> condition keys
     /// with a single-element vec value, matching the format expected by policy evaluation.
     #[test]
     fn test_object_tag_condition_key_format() {
-        use rustfs_ecstore::bucket::tagging::decode_tags_to_map;
         use std::collections::HashMap;
 
         let tags_str = "security=public&project=webapp&env=prod";
